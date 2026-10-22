@@ -1,0 +1,484 @@
+[
+  {
+    "full_name": "torvalds/linux",
+    "who": [
+      "torvalds"
+    ],
+    "event": "push",
+    "stars": 253175,
+    "language": "C",
+    "description": "Linux kernel source tree",
+    "url": "https://github.com/torvalds/linux"
+  },
+  {
+    "full_name": "google-deepmind/mujoco",
+    "who": [
+      "junhao-main"
+    ],
+    "event": "star",
+    "stars": 15828,
+    "language": "C++",
+    "description": "Multi-Joint dynamics with Contact. A general purpose physics simulator.",
+    "url": "https://github.com/google-deepmind/mujoco"
+  },
+  {
+    "full_name": "google-deepmind/alphafold",
+    "who": [
+      "leojacking-hub"
+    ],
+    "event": "star",
+    "stars": 14905,
+    "language": "Python",
+    "description": "Open source code for AlphaFold 2.",
+    "url": "https://github.com/google-deepmind/alphafold"
+  },
+  {
+    "full_name": "google-deepmind/alphafold3",
+    "who": [
+      "leojacking-hub"
+    ],
+    "event": "star",
+    "stars": 8669,
+    "language": "Python",
+    "description": "AlphaFold 3 inference pipeline.",
+    "url": "https://github.com/google-deepmind/alphafold3"
+  },
+  {
+    "full_name": "aqlaboratory/openfold",
+    "who": [
+      "ArkansV088"
+    ],
+    "event": "star",
+    "stars": 3441,
+    "language": "Python",
+    "description": "Trainable, memory-efficient, and GPU-friendly PyTorch reproduction of AlphaFold 2",
+    "url": "https://github.com/aqlaboratory/openfold"
+  },
+  {
+    "full_name": "sokrypton/ColabFold",
+    "who": [
+      "sokrypton"
+    ],
+    "event": "branch",
+    "stars": 2967,
+    "language": "Jupyter Notebook",
+    "description": "Making Protein folding accessible to all!",
+    "url": "https://github.com/sokrypton/ColabFold"
+  },
+  {
+    "full_name": "google-deepmind/mujoco_warp",
+    "who": [
+      "github-actions"
+    ],
+    "event": "other",
+    "stars": 1570,
+    "language": "Python",
+    "description": "GPU-optimized version of the MuJoCo physics simulator, designed for NVIDIA hardware.",
+    "url": "https://github.com/google-deepmind/mujoco_warp"
+  },
+  {
+    "full_name": "google-deepmind/formal-conjectures",
+    "who": [
+      "Multramate",
+      "VictorLiwentao",
+      "felixpernegger",
+      "mo271",
+      "veljjanoski"
+    ],
+    "event": "mixed",
+    "stars": 1332,
+    "language": "Lean",
+    "description": "A collection of formalized statements of conjectures in Lean.",
+    "url": "https://github.com/google-deepmind/formal-conjectures"
+  },
+  {
+    "full_name": "aqlaboratory/openfold-3",
+    "who": [
+      "GMNGeoffrey",
+      "christinaflo",
+      "dillonrmccarthy",
+      "jnwei"
+    ],
+    "event": "mixed",
+    "stars": 901,
+    "language": "Python",
+    "description": "A fully open source biomolecular structure prediction model based on AlphaFold3",
+    "url": "https://github.com/aqlaboratory/openfold-3"
+  },
+  {
+    "full_name": "luost26/academic-homepage",
+    "who": [
+      "luost26"
+    ],
+    "event": "mixed",
+    "stars": 720,
+    "language": "HTML",
+    "description": "🏡 GitHub Pages template for personal academic homepage",
+    "url": "https://github.com/luost26/academic-homepage"
+  },
+  {
+    "full_name": "JuliaMolSim/Molly.jl",
+    "who": [
+      "jgreener64"
+    ],
+    "event": "push",
+    "stars": 499,
+    "language": "Julia",
+    "description": "Molecular simulation in Julia",
+    "url": "https://github.com/JuliaMolSim/Molly.jl"
+  },
+  {
+    "full_name": "microsoft/bioemu2",
+    "who": [
+      "AspirinCode"
+    ],
+    "event": "star",
+    "stars": 390,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/microsoft/bioemu2"
+  },
+  {
+    "full_name": "RosettaCommons/RFD4-Proteina",
+    "who": [
+      "Junjie-Zhu",
+      "jsunn-y"
+    ],
+    "event": "star",
+    "stars": 348,
+    "language": "Python",
+    "description": "Generative protein design with rich conditioning. ",
+    "url": "https://github.com/RosettaCommons/RFD4-Proteina"
+  },
+  {
+    "full_name": "AspirinCode/awesome-AI4MolConformation-MD",
+    "who": [
+      "AspirinCode"
+    ],
+    "event": "push",
+    "stars": 306,
+    "language": "",
+    "description": "List of molecules (small molecules, RNA, peptide, protein, enzymes, antibody,  and PPIs)  conformations and molecular dynamics (force fields) using generative artificial intelligence and deep learning",
+    "url": "https://github.com/AspirinCode/awesome-AI4MolConformation-MD"
+  },
+  {
+    "full_name": "ai4protein/VenusFactory2",
+    "who": [
+      "Walnosimaj"
+    ],
+    "event": "fork",
+    "stars": 255,
+    "language": "Python",
+    "description": "🏭 AI agent platform with skills for protein engineering, the noob-friendly AI tutorial tool for life science professionals. (ACL Demo2025, arXiv 2026)",
+    "url": "https://github.com/ai4protein/VenusFactory2"
+  },
+  {
+    "full_name": "steineggerlab/folddisco",
+    "who": [
+      "ecoPrimal"
+    ],
+    "event": "star",
+    "stars": 221,
+    "language": "Rust",
+    "description": "Fast indexing and search of discontinuous motifs in protein structures",
+    "url": "https://github.com/steineggerlab/folddisco"
+  },
+  {
+    "full_name": "Graylab/IgLM",
+    "who": [
+      "SealTuch"
+    ],
+    "event": "star",
+    "stars": 200,
+    "language": "Python",
+    "description": "Generative Language Modeling for Antibody Design",
+    "url": "https://github.com/Graylab/IgLM"
+  },
+  {
+    "full_name": "aqlaboratory/genie2",
+    "who": [
+      "dillonrmccarthy"
+    ],
+    "event": "star",
+    "stars": 196,
+    "language": "Python",
+    "description": "Protein structure diffusion model for unconditional protein generation and motif scaffolding",
+    "url": "https://github.com/aqlaboratory/genie2"
+  },
+  {
+    "full_name": "aqlaboratory/genie",
+    "who": [
+      "Walnosimaj"
+    ],
+    "event": "fork",
+    "stars": 190,
+    "language": "Python",
+    "description": "De Novo Protein Design by Equivariantly Diffusing Oriented Residue Clouds",
+    "url": "https://github.com/aqlaboratory/genie"
+  },
+  {
+    "full_name": "ai4protein/ProSST",
+    "who": [
+      "Admire7494"
+    ],
+    "event": "star",
+    "stars": 165,
+    "language": "Python",
+    "description": "🧬 Advanced hybrid language model for directed protein evolution. (NeurIPS 2024)",
+    "url": "https://github.com/ai4protein/ProSST"
+  },
+  {
+    "full_name": "ai4protein/VenusREM",
+    "who": [
+      "Admire7494"
+    ],
+    "event": "star",
+    "stars": 148,
+    "language": "Python",
+    "description": "🧬 Augmenting zero-shot mutant prediction by retrieval-based logits fusion. (ISMB/ECCB 2025)",
+    "url": "https://github.com/ai4protein/VenusREM"
+  },
+  {
+    "full_name": "aqlaboratory/genie3",
+    "who": [
+      "dillonrmccarthy"
+    ],
+    "event": "star",
+    "stars": 138,
+    "language": "Python",
+    "description": "Genie 3 is a fast, all-atom SE(3)-equivariant diffusion model for protein design. It achieves state-of-the-art performance on unconditional generation, motif scaffolding, and binder design while retaining the computational efficiency of equivariant architectures.",
+    "url": "https://github.com/aqlaboratory/genie3"
+  },
+  {
+    "full_name": "sokrypton/py2Dmol",
+    "who": [
+      "sokrypton"
+    ],
+    "event": "push",
+    "stars": 111,
+    "language": "Jupyter Notebook",
+    "description": "",
+    "url": "https://github.com/sokrypton/py2Dmol"
+  },
+  {
+    "full_name": "bytedance/AnewOmni",
+    "who": [
+      "sirius777coder"
+    ],
+    "event": "star",
+    "stars": 109,
+    "language": "Python",
+    "description": "Codes for our paper \"Programming Biomolecular Interactions with All-Atom Generative Model\"",
+    "url": "https://github.com/bytedance/AnewOmni"
+  },
+  {
+    "full_name": "Graylab/AlphaRED",
+    "who": [
+      "ivybiosciences"
+    ],
+    "event": "star",
+    "stars": 96,
+    "language": "Python",
+    "description": "AlphaFold-initiated replica exchange protein docking",
+    "url": "https://github.com/Graylab/AlphaRED"
+  },
+  {
+    "full_name": "biomed-AI/Hist2ST",
+    "who": [
+      "ruyters"
+    ],
+    "event": "star",
+    "stars": 65,
+    "language": "Jupyter Notebook",
+    "description": "",
+    "url": "https://github.com/biomed-AI/Hist2ST"
+  },
+  {
+    "full_name": "AIDD-LiLab/Apo2Mol",
+    "who": [
+      "Xeloera"
+    ],
+    "event": "star",
+    "stars": 46,
+    "language": "Python",
+    "description": "Apo2Mol: 3D Molecule Generation via Dynamic Pocket-Aware Diffusion Models",
+    "url": "https://github.com/AIDD-LiLab/Apo2Mol"
+  },
+  {
+    "full_name": "pzs19/HarnessPro",
+    "who": [
+      "QizhiPei"
+    ],
+    "event": "star",
+    "stars": 25,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/pzs19/HarnessPro"
+  },
+  {
+    "full_name": "sokrypton/localfold",
+    "who": [
+      "sokrypton"
+    ],
+    "event": "push",
+    "stars": 21,
+    "language": "JavaScript",
+    "description": "",
+    "url": "https://github.com/sokrypton/localfold"
+  },
+  {
+    "full_name": "idptools/parrot",
+    "who": [
+      "ryanemenecker"
+    ],
+    "event": "push",
+    "stars": 21,
+    "language": "Python",
+    "description": "Python package for protein sequence-based bidirectional recurrent neural network. Generalizable to a variety of protein bioinformatic applications.",
+    "url": "https://github.com/idptools/parrot"
+  },
+  {
+    "full_name": "AspirinCode/awesome-ChemicalSpectraAI",
+    "who": [
+      "AspirinCode"
+    ],
+    "event": "push",
+    "stars": 20,
+    "language": "",
+    "description": "AI for Chemical Spectra",
+    "url": "https://github.com/AspirinCode/awesome-ChemicalSpectraAI"
+  },
+  {
+    "full_name": "mingchen-li/ThermoFormer",
+    "who": [
+      "Junjie-Zhu"
+    ],
+    "event": "star",
+    "stars": 9,
+    "language": "Python",
+    "description": "Source code of ThermoFormer (Foundation Models for Science Workshop, NeurIPS 2024.)",
+    "url": "https://github.com/mingchen-li/ThermoFormer"
+  },
+  {
+    "full_name": "AspirinCode/papers_for_protein_design_using_DL",
+    "who": [
+      "AspirinCode"
+    ],
+    "event": "push",
+    "stars": 3,
+    "language": "",
+    "description": "List of papers about Proteins Design using Deep Learning",
+    "url": "https://github.com/AspirinCode/papers_for_protein_design_using_DL"
+  },
+  {
+    "full_name": "steineggerlab/bfvd-analysis",
+    "who": [
+      "rachelse"
+    ],
+    "event": "mixed",
+    "stars": 2,
+    "language": "Shell",
+    "description": "Big Fantastic Virus Database (BFVD): Code used for analyses",
+    "url": "https://github.com/steineggerlab/bfvd-analysis"
+  },
+  {
+    "full_name": "sokrypton/BindCraft2",
+    "who": [
+      "sokrypton"
+    ],
+    "event": "push",
+    "stars": 1,
+    "language": "Python",
+    "description": "Easy to use suite for designing a wide range of protein binder modalities.",
+    "url": "https://github.com/sokrypton/BindCraft2"
+  },
+  {
+    "full_name": "aqlaboratory/ring-flash-attention",
+    "who": [
+      "eric-tc-wong"
+    ],
+    "event": "mixed",
+    "stars": 1,
+    "language": "Python",
+    "description": "Ring attention implementation with flash attention",
+    "url": "https://github.com/aqlaboratory/ring-flash-attention"
+  },
+  {
+    "full_name": "sokrypton/rfd4-proteina-webgpu",
+    "who": [
+      "sokrypton"
+    ],
+    "event": "push",
+    "stars": 0,
+    "language": "JavaScript",
+    "description": "",
+    "url": "https://github.com/sokrypton/rfd4-proteina-webgpu"
+  },
+  {
+    "full_name": "EDAPINENUT/contrast_gen.edapinenut.github.io",
+    "who": [
+      "EDAPINENUT"
+    ],
+    "event": "branch",
+    "stars": 0,
+    "language": "HTML",
+    "description": "",
+    "url": "https://github.com/EDAPINENUT/contrast_gen.edapinenut.github.io"
+  },
+  {
+    "full_name": "BioComputingUP/dome-tracking",
+    "who": [
+      "github-actions"
+    ],
+    "event": "push",
+    "stars": 0,
+    "language": "Python",
+    "description": "Uptime and code-activity tracking for the DOME ecosystem: DOME Registry, DOME-ML, DOME Copilot, OSAI, DOME Observatory",
+    "url": "https://github.com/BioComputingUP/dome-tracking"
+  },
+  {
+    "full_name": "BioComputingUP/OSAI_ecosystem",
+    "who": [
+      "dependabot",
+      "gavinf97"
+    ],
+    "event": "mixed",
+    "stars": 0,
+    "language": "HTML",
+    "description": "A community-curated list of Open and Sustainable AI (OSAI) ecosystem components mapped to practical recommendations to guide their use for research. ",
+    "url": "https://github.com/BioComputingUP/OSAI_ecosystem"
+  },
+  {
+    "full_name": "KULL-Centre/_2026_streit_hx",
+    "who": [
+      "julian-streit"
+    ],
+    "event": "other",
+    "stars": 0,
+    "language": "",
+    "description": "",
+    "url": "https://github.com/KULL-Centre/_2026_streit_hx"
+  },
+  {
+    "full_name": "KULL-Centre/HXEnsemble",
+    "who": [
+      "julian-streit"
+    ],
+    "event": "other",
+    "stars": 0,
+    "language": "",
+    "description": "",
+    "url": "https://github.com/KULL-Centre/HXEnsemble"
+  },
+  {
+    "full_name": "JingHuangLab/AFLF",
+    "who": [
+      "ZL-Song"
+    ],
+    "event": "star",
+    "stars": 0,
+    "language": "Jupyter Notebook",
+    "description": "AlphaFold Latent Flooding: Zero-shot Prediction of Protein Conformational Ensemble",
+    "url": "https://github.com/JingHuangLab/AFLF"
+  }
+]
