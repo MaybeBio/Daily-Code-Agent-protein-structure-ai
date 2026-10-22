@@ -1,16 +1,16 @@
-topic: idr-repos
-title: IDR 相关仓库追踪
+topic: protein-structure-ai
+title: 蛋白质结构 × AI
 # 课题词(领域定义)不在这里——它硬编码在 prompts.yaml 的 score/system 与 code_card/system 里。
 # 换课题时改 prompts.yaml 的这两处措辞,以及下面的 search.queries / 命名。
 # 抓取窗口长度(天)。窗口 = [运行日-window_days, 运行日-1](不含运行当天),
 # search/merge/cards/issue 四处同源;cards 会把它写进每条记录,站点据此分组。
 window_days: 7
-site_base_url: ""
+site_base_url: https://MaybeBio.github.io/Daily-Code-Agent-protein-structure-ai
 # 本模板仓库的 owner/name + 默认分支,用于构造 wiki 快照的 GitHub blob 链接
 # (指向 code/{repo}/wikis/{date}/{source}/llms.txt)。
-github_repo: MaybeBio/Daily-Code-Agent-Template
+github_repo: MaybeBio/Daily-Code-Agent-protein-structure-ai
 github_branch: main
-search_placeholder: 如 相分离、intrinsically disordered、Python
+search_placeholder: 如 蛋白结构预测、蛋白互作、蛋白功能、AlphaFold
 llm:
   concurrency: 8
   min_score: 5
@@ -35,28 +35,33 @@ search:
   #    `in:` 是字段限定、OR 是词间逻辑,两者可共存;`in:` 作用于整条查询(与位置无关)。
   # ⚠️ 每条查询都用「引号短语 + in:name,description,readme,topics」:
   #    裸词是 AND(单词都出现)而非固定词组,召回翻倍但多是噪声;
-  #    裸 3 字母缩写(IDR/IDP/LLPS)会被子串命中(如 Idris2/iDRAC/"Idrogeologica"),
-  #    且加引号也挡不住子串,故一律避开裸缩写;
-  #    含 readme:召回更高(实测 8 条短语并集 18→192 个候选),契合"宽召回 → 打分过滤";
-  #    代价是每周多 ~174 个候选进 LLM 打分,且多是"README 里顺带提一句"的蹭词噪声
-  #    (awesome 清单、黑洞/天体生物、CVE 复现等)。带 --updated 时间窗后 readme 不会超限
-  #    (单短语约几十~百余条)。想省 LLM 成本时,把 search.queries 里的 readme, 去掉即可。
+  #    裸 2~3 字母缩写(MD/PDB/AF)会被子串命中(如 "MD" 命中一堆无关词),故一律避开裸缩写;
+  #    含 readme:召回更高,契合"宽召回 → 打分过滤";代价是噪声变多、LLM 打分成本上升。
+  #    想省成本就从每行去掉 `,readme`。带 --updated 时间窗后 readme 不会超限。
   queries:
-    - '"intrinsically disordered" in:name,description,readme,topics'
-    - '"disordered protein" in:name,description,readme,topics'
-    - '"disordered proteins" in:name,description,readme,topics'
-    - '"disordered region" in:name,description,readme,topics'
-    - '"disordered regions" in:name,description,readme,topics'
-    - '"biomolecular condensate" in:name,description,readme,topics'
-    - '"biomolecular condensates" in:name,description,readme,topics'
-    - '"phase separation" in:name,description,readme,topics'
-    # topic: 是「仓库标签」精确匹配(非子串),是补充召回最稳的一路。但只能用全称 topic ——
-    # 缩写 topic 被别的含义占满(topic:idp=Identity Provider、topic:idr=印尼盾/Image Data
-    # Resource、topic:idps=入侵检测系统),加进来全是噪声。(具体命中数见 2026-10-06 探测。)
-    - 'topic:intrinsically-disordered-proteins'   # 18
-    - 'topic:intrinsically-disordered-regions'    # 4
-    - 'topic:disordered-proteins'                 # 6
-    - 'topic:protein-disorder'                    # 10
-    - 'topic:biomolecular-condensates'            # 7
-    - 'topic:llps'                                # 8
-    - 'topic:phase-separation'                    # 19(含少量软物质物理,由打分阶段过滤)
+    # 短语查询(蛋白结构 × AI/模拟 的核心术语)
+    - '"protein structure prediction" in:name,description,readme,topics'
+    - '"protein structure" in:name,description,readme,topics'
+    - '"structure prediction" in:name,description,readme,topics'
+    - '"protein folding" in:name,description,readme,topics'
+    - '"conformational sampling" in:name,description,readme,topics'
+    - '"molecular docking" in:name,description,readme,topics'
+    - '"molecular dynamics" in:name,description,readme,topics'
+    - '"protein language model" in:name,description,readme,topics'
+    - '"protein design" in:name,description,readme,topics'
+    - '"protein interaction" in:name,description,readme,topics'
+    - '"protein function" in:name,description,readme,topics'
+    # topic: 是「仓库标签」精确匹配(非子串),补充召回最稳的一路。命中数是 2026-10-23
+    # 全库总量(非周窗),仅作相对热度参考;带 --updated 时间窗后每周实际命中远小于此。
+    - 'topic:protein-structure'              # 881
+    - 'topic:protein-structure-prediction'   # 132
+    - 'topic:alphafold'                      # 255
+    - 'topic:protein-folding'                # 163
+    - 'topic:protein-design'                 # 356
+    - 'topic:protein-modeling'               # 22
+    - 'topic:structure-based-drug-design'    # 35
+    - 'topic:protein-engineering'            # 147
+    - 'topic:docking'                        # 302
+    - 'topic:molecular-dynamics'             # 1660(很宽,含材料/化学等,靠打分过滤)
+    - 'topic:protein-interaction'    # 244
+    - 'topic:protein-function'    # 66

@@ -1,2 +1,62 @@
-# 每行一个组织/实验室
-# example: holehouse-lab
+# https://github.com/kiharalab
+kiharalab
+
+# https://github.com/honig-lab
+honig-lab
+
+# https://github.com/ai4protein
+ai4protein
+
+# https://github.com/GENTEL-lab
+GENTEL-lab
+
+# https://github.com/steineggerlab
+steineggerlab
+
+# https://github.com/biomed-AI
+biomed-AI
+
+# https://github.com/BioComputingUP
+BioComputingUP
+
+# https://github.com/ProteinDesignLab
+ProteinDesignLab
+
+# https://github.com/sparks-lab-org
+sparks-lab-org
+
+# https://github.com/baker-laboratory
+baker-laboratory
+
+# https://github.com/Graylab
+Graylab
+
+# https://github.com/isblab
+isblab
+
+# https://github.com/THGLab
+THGLab
+
+# https://github.com/idptools
+idptools
+
+# https://github.com/holehouse-lab
+holehouse-lab
+
+# https://github.com/Pappulab
+Pappulab
+
+# https://github.com/KULL-Centre
+KULL-Centre
+
+# https://github.com/aqlaboratory
+aqlaboratory
+
+# https://github.com/JingHuangLab
+JingHuangLab
+
+# https://github.com/AIDD-LiLab
+AIDD-LiLab
+
+# https://github.com/kiharalab
+kiharalab

@@ -1,2 +1,207 @@
-# 每行一个 GitHub 用户名;替换为你关注的研究者
-# example: alexholehouse
+# 1️⃣ holehouse lab
+# https://github.com/alexholehouse
+alexholehouse
+
+
+#######################################
+# https://life.sjtu.edu.cn/T/Index/zc
+#######################################
+# 2️⃣ Chenlab
+# https://life.sjtu.edu.cn/teacher/HaifengChen
+
+# https://github.com/HFChenLab
+HFChenLab
+
+# https://github.com/Junjie-Zhu
+Junjie-Zhu
+
+# https://github.com/sirius777coder
+sirius777coder
+
+# https://github.com/Barakhsaana
+Barakhsaana
+
+# https://github.com/Zuricho
+Zuricho
+
+# https://github.com/Immortals-33
+Immortals-33
+
+# https://github.com/weitinging
+weitinging
+
+# https://github.com/ji-xiaoyue
+ji-xiaoyue
+
+# https://github.com/Zirui-Fan
+Zirui-Fan
+
+# https://github.com/borrytod
+borrytod
+
+
+# 3️⃣ Xionglab
+# https://life.sjtu.edu.cn/teacher/yxiong
+
+# https://github.com/xlab-BioAI
+xlab-BioAI
+
+# https://github.com/SII-ShenggengLin
+SII-ShenggengLin
+
+# https://github.com/xtanh
+xtanh
+
+# https://github.com/wangwrx
+wangwrx
+
+
+# 4️⃣ Shaolab
+# https://life.sjtu.edu.cn/teacher/shaowenguang
+
+# https://github.com/shaowenguang
+shaowenguang
+
+# 5️⃣ wangtaolab
+# https://github.com/mapleleaf6
+mapleleaf6
+
+
+#######################################
+# SJTU 电院
+#######################################
+# 5️⃣ Honglab
+# https://ins.sjtu.edu.cn/people/lhong/index.html
+
+# https://github.com/tyang816
+tyang816
+
+# https://github.com/mingchen-li
+mingchen-li
+
+# https://github.com/code4luck
+code4luck
+
+# https://github.com/zy-zhou
+zy-zhou
+
+# https://github.com/riacd
+riacd
+
+# https://github.com/terry-r123
+terry-r123
+
+# https://github.com/bzho3923
+bzho3923
+
+
+# 6️⃣ 上海药物所
+
+# https://github.com/Xinheng-He
+Xinheng-He
+
+# 6️⃣ Others
+# https://github.com/lujiarui
+lujiarui
+
+# https://github.com/ChenDdon
+ChenDdon
+
+# https://github.com/AspirinCode
+AspirinCode
+
+# https://github.com/bjing2016
+bjing2016
+
+# https://github.com/tyang816
+tyang816
+
+# https://github.com/prokia
+prokia
+
+# https://github.com/Gonglab-THU
+Gonglab-THU
+
+# https://github.com/meneshail
+meneshail
+
+# https://github.com/xinshi-chen
+xinshi-chen
+
+# https://github.com/amyxlu
+amyxlu
+
+# https://github.com/LirongWu
+LirongWu
+
+# https://github.com/OdinZhang
+OdinZhang
+
+# https://github.com/EDAPINENUT
+EDAPINENUT
+
+# https://github.com/QizhiPei
+QizhiPei
+
+# https://github.com/thematrixmaster
+thematrixmaster
+
+# https://github.com/zaixizhang
+zaixizhang
+
+# https://github.com/pascalnotin
+pascalnotin
+
+# https://github.com/jsunn-y
+jsunn-y
+
+# https://github.com/Leo-T-Zang
+Leo-T-Zang
+
+# https://github.com/WillHua127
+WillHua127
+
+# https://github.com/wenjiegroup
+wenjiegroup
+
+# https://github.com/Shenggan
+Shenggan
+
+# https://github.com/yangnianzu0515
+yangnianzu0515
+
+# https://github.com/chao1224
+chao1224
+
+# https://github.com/blt2114
+blt2114
+
+# https://github.com/Oxer11
+Oxer11
+
+# https://github.com/shichence
+shichence
+
+# https://github.com/ChrisAllenMing
+ChrisAllenMing
+
+# https://github.com/jchodera
+jchodera
+
+# https://github.com/jgreener64
+jgreener64
+
+# https://github.com/HannesStark
+HannesStark
+
+# https://github.com/Peldom
+Peldom
+
+# https://github.com/luost26
+luost26
+
+# https://github.com/sokrypton
+sokrypton
+
+# https://github.com/lmqfly
+lmqfly
