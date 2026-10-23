@@ -5,6 +5,13 @@ title: 蛋白质结构 × AI
 # 抓取窗口长度(天)。窗口 = [运行日-window_days, 运行日-1](不含运行当天),
 # search/merge/cards/issue 四处同源;cards 会把它写进每条记录,站点据此分组。
 window_days: 7
+# 本课题单周候选量约 2400(23 条查询,含 readme 匹配),weekly 集中打分约 1 小时,
+# 会撞满 timeout-minutes。故用 daily:每天只抓/打分「昨天」(~1/7 的量),
+# 周日只做 aggregate → archive → cards → issue。
+ingest:
+  mode: daily
+  # 某天 daily 失败时,weekly 最多补跑 2 天;调大容易重新退化成集中打分。
+  max_backfill_days: 2
 site_base_url: https://MaybeBio.github.io/Daily-Code-Agent-protein-structure-ai
 # 本模板仓库的 owner/name + 默认分支,用于构造 wiki 快照的 GitHub blob 链接
 # (指向 code/{repo}/wikis/{date}/{source}/llms.txt)。
