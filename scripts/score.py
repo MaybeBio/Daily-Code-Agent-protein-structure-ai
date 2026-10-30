@@ -13,18 +13,29 @@ def _score_one(row, client, prompts, model, fetch, fetch_tree):
 def run(cfg, date, client=None, fetch=None, fetch_tree=None):
     fetch = fetch or gh.fetch_readme
     fetch_tree = fetch_tree or gh.fetch_tree
+    cand_path = common.data_dir("candidates", f"{date}.json")
+    candidates = common.load_json(cand_path) if os.path.exists(cand_path) else []
+    if not bool(cfg.get("llm", {}).get("enabled", True)):
+        # noagent 降级:不打分,score=None、one_liner 用描述兜底(供站点搜索摘要)。
+        out = [{**row, "score": None,
+                "one_liner": (row.get("description") or "").strip()}
+               for row in candidates]
+        common.dump_json(common.data_dir("scored", f"{date}.json"), out)
+        return out
     client = client if client is not None else agent.make_client()
     prompts = load_prompts(os.path.join(common.ROOT, "prompts.yaml"))
     model = agent.model_name()
-    cand_path = common.data_dir("candidates", f"{date}.json")
-    candidates = common.load_json(cand_path) if os.path.exists(cand_path) else []
     out = []
     done, lock = 0, threading.Lock()
     def work(row):
         nonlocal done
         try:
             res = _score_one(row, client, prompts, model, fetch, fetch_tree)
-        except Exception:
+        except Exception as e:
+            # 只留一行原因:并发下每个失败都打会让日志爆炸,但完全吞掉又没法判断
+            # 是限流、超时还是模型名错。
+            print(f"[score failed] {row.get('full_name')}: {type(e).__name__}: {str(e)[:120]}",
+                  flush=True)
             res = {"score": None, "one_liner": "[llm failed]"}
         with lock:
             done += 1

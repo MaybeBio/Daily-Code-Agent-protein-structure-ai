@@ -21,7 +21,15 @@ search_placeholder: 如 蛋白结构预测、蛋白互作、蛋白功能、Alpha
 llm:
   concurrency: 8
   min_score: 5
+  # noagent 降级开关:false 时跳过 LLM(打分/Code Card)。issue 仍全量列仓库,
+  # 但站点/归档/wiki 只留 watchlist 来源;配合 archive.repo_copy: readme 一起用。
+  # api 欠费/不可用时手动切 false,重跑该周 action 即可。
+  enabled: true
 archive:
+  # 高分仓库落盘方式:code=只保留代码语料(源码/构建配置/README/文档;数据、
+  # 图片、权重、二进制、通用 txt/log/csv/json/xml 不留,普通源码>2 MB、文档/构建>1 MB 不留,README/ipynb 不设限),省略
+  # 清单写在该仓库的 MANIFEST.md;full=完整浅克隆;readme=只留 README + 目录树。
+  repo_copy: code
   # degit + repowiki-cli 的网络并发数。串行太慢(55 仓库 ~4h),太高会触发
   # repowiki(deepwiki/zread)限流 —— 实测串行时仍有 47/55 wiki 失败,故取低并发。
   concurrency: 4
@@ -40,24 +48,97 @@ search:
   #    单条 OR 会被拒绝,只能拆成多条(每条 ≤6 项)各自查询、按 full_name 取并集。
   #    (AI4Bio 那条 OR 是 5 个词=4 个 OR,恰好卡在上限内;再加一项就会挂。)
   #    `in:` 是字段限定、OR 是词间逻辑,两者可共存;`in:` 作用于整条查询(与位置无关)。
-  # ⚠️ 每条查询都用「引号短语 + in:name,description,readme,topics」:
+  # ⚠️ 每条查询都用「引号短语 + in:字段」:
   #    裸词是 AND(单词都出现)而非固定词组,召回翻倍但多是噪声;
-  #    裸 2~3 字母缩写(MD/PDB/AF)会被子串命中(如 "MD" 命中一堆无关词),故一律避开裸缩写;
-  #    含 readme:召回更高,契合"宽召回 → 打分过滤";代价是噪声变多、LLM 打分成本上升。
-  #    想省成本就从每行去掉 `,readme`。带 --updated 时间窗后 readme 不会超限。
+  #    裸 2~3 字母缩写(MD/PDB/AF)会被子串命中(如 "MD" 命中一堆无关词),故一律避开裸缩写。
+  # ⚠️ 检索策略(2026-10-23 调整):从「宽召回 → 打分过滤」改为「分层召回」。
+  #    原方案所有短语都搜 readme,单日 803 个候选,免费模型端点(6~77 次/分)根本跑不完。
+  #    现在按「这个字段能不能证明仓库身份」分两层:
+  #      1) 身份字段(name/description/topics):出现短语即收 —— 这些字段是仓库自我定位,噪声低;
+  #      2) 主题短语 × AI 词:两个词必须同时出现(AND),挡掉 README 里只顺带提一句
+  #         "protein structure"/"molecular dynamics" 的蹭词仓库,同时不丢真正做 AI+结构的项目。
+  #    实测 2026-10-22 单日:803 → 385 个(身份 73 + 网格 304 + topic 63,有重叠);
+  #    另一天(10-21)同一思路约 200 出头,单日量随科研活动波动。
+  #    ⚠️ 不要写成 `"A" "B" OR "C" in:...`:实测 OR 会丢掉前面的 AND 约束
+  #    (返回 72 条 > 两个单独查询之和),必须一个 AI 词一条查询。
+  #    ⚠️ 查询条数 77 条,search.py 每条间隔 3 秒,整体约 5 分钟;仍在 30 次/分的搜索限流内。
   queries:
-    # 短语查询(蛋白结构 × AI/模拟 的核心术语)
-    - '"protein structure prediction" in:name,description,readme,topics'
-    - '"protein structure" in:name,description,readme,topics'
-    - '"structure prediction" in:name,description,readme,topics'
-    - '"protein folding" in:name,description,readme,topics'
-    - '"conformational sampling" in:name,description,readme,topics'
-    - '"molecular docking" in:name,description,readme,topics'
-    - '"molecular dynamics" in:name,description,readme,topics'
-    - '"protein language model" in:name,description,readme,topics'
-    - '"protein design" in:name,description,readme,topics'
-    - '"protein interaction" in:name,description,readme,topics'
-    - '"protein function" in:name,description,readme,topics'
+    # ── 第 1 层:身份字段(name/description/topics),不看 readme
+    - '"protein structure prediction" in:name,description,topics'
+    - '"protein structure" in:name,description,topics'
+    - '"structure prediction" in:name,description,topics'
+    - '"protein folding" in:name,description,topics'
+    - '"conformational sampling" in:name,description,topics'
+    - '"molecular docking" in:name,description,topics'
+    - '"molecular dynamics" in:name,description,topics'
+    - '"protein language model" in:name,description,topics'
+    - '"protein design" in:name,description,topics'
+    - '"protein interaction" in:name,description,topics'
+    - '"protein function" in:name,description,topics'
+    # ── 第 2 层:主题短语 × AI 词(AND),两个词都要出现才收
+    #    词表刻意放宽:实测 6 个 AI 词已覆盖 grid 的 287 个,加到 9 个只多 11 个仓库
+    #    (2026-10-22),所以多列几个词的代价很小,但漏一个词(如 language model)会整类漏掉。
+    #    ⚠️ 一个 AI 词一条查询,不能写成 `"A" "B" OR "C"`:实测 OR 会丢掉前面的 AND 约束。
+    # protein structure × AI
+    - '"protein structure" "deep learning" in:name,description,readme,topics'
+    - '"protein structure" "machine learning" in:name,description,readme,topics'
+    - '"protein structure" "neural network" in:name,description,readme,topics'
+    - '"protein structure" "graph neural network" in:name,description,readme,topics'
+    - '"protein structure" "transformer" in:name,description,readme,topics'
+    - '"protein structure" "diffusion model" in:name,description,readme,topics'
+    - '"protein structure" "generative model" in:name,description,readme,topics'
+    - '"protein structure" "language model" in:name,description,readme,topics'
+    - '"protein structure" "alphafold" in:name,description,readme,topics'
+    # protein folding × AI
+    - '"protein folding" "deep learning" in:name,description,readme,topics'
+    - '"protein folding" "machine learning" in:name,description,readme,topics'
+    - '"protein folding" "neural network" in:name,description,readme,topics'
+    - '"protein folding" "graph neural network" in:name,description,readme,topics'
+    - '"protein folding" "transformer" in:name,description,readme,topics'
+    - '"protein folding" "diffusion model" in:name,description,readme,topics'
+    - '"protein folding" "generative model" in:name,description,readme,topics'
+    - '"protein folding" "language model" in:name,description,readme,topics'
+    - '"protein folding" "alphafold" in:name,description,readme,topics'
+    # molecular dynamics × AI
+    - '"molecular dynamics" "deep learning" in:name,description,readme,topics'
+    - '"molecular dynamics" "machine learning" in:name,description,readme,topics'
+    - '"molecular dynamics" "neural network" in:name,description,readme,topics'
+    - '"molecular dynamics" "graph neural network" in:name,description,readme,topics'
+    - '"molecular dynamics" "transformer" in:name,description,readme,topics'
+    - '"molecular dynamics" "diffusion model" in:name,description,readme,topics'
+    - '"molecular dynamics" "generative model" in:name,description,readme,topics'
+    - '"molecular dynamics" "language model" in:name,description,readme,topics'
+    - '"molecular dynamics" "alphafold" in:name,description,readme,topics'
+    # protein design × AI
+    - '"protein design" "deep learning" in:name,description,readme,topics'
+    - '"protein design" "machine learning" in:name,description,readme,topics'
+    - '"protein design" "neural network" in:name,description,readme,topics'
+    - '"protein design" "graph neural network" in:name,description,readme,topics'
+    - '"protein design" "transformer" in:name,description,readme,topics'
+    - '"protein design" "diffusion model" in:name,description,readme,topics'
+    - '"protein design" "generative model" in:name,description,readme,topics'
+    - '"protein design" "language model" in:name,description,readme,topics'
+    - '"protein design" "alphafold" in:name,description,readme,topics'
+    # protein interaction × AI
+    - '"protein interaction" "deep learning" in:name,description,readme,topics'
+    - '"protein interaction" "machine learning" in:name,description,readme,topics'
+    - '"protein interaction" "neural network" in:name,description,readme,topics'
+    - '"protein interaction" "graph neural network" in:name,description,readme,topics'
+    - '"protein interaction" "transformer" in:name,description,readme,topics'
+    - '"protein interaction" "diffusion model" in:name,description,readme,topics'
+    - '"protein interaction" "generative model" in:name,description,readme,topics'
+    - '"protein interaction" "language model" in:name,description,readme,topics'
+    - '"protein interaction" "alphafold" in:name,description,readme,topics'
+    # structure prediction × AI
+    - '"structure prediction" "deep learning" in:name,description,readme,topics'
+    - '"structure prediction" "machine learning" in:name,description,readme,topics'
+    - '"structure prediction" "neural network" in:name,description,readme,topics'
+    - '"structure prediction" "graph neural network" in:name,description,readme,topics'
+    - '"structure prediction" "transformer" in:name,description,readme,topics'
+    - '"structure prediction" "diffusion model" in:name,description,readme,topics'
+    - '"structure prediction" "generative model" in:name,description,readme,topics'
+    - '"structure prediction" "language model" in:name,description,readme,topics'
+    - '"structure prediction" "alphafold" in:name,description,readme,topics'
     # topic: 是「仓库标签」精确匹配(非子串),补充召回最稳的一路。命中数是 2026-10-23
     # 全库总量(非周窗),仅作相对热度参考;带 --updated 时间窗后每周实际命中远小于此。
     - 'topic:protein-structure'              # 881
