@@ -1,0 +1,233 @@
+[
+  {
+    "full_name": "lingyired/status-trio",
+    "who": [
+      "QizhiPei"
+    ],
+    "event": "star",
+    "stars": 978,
+    "language": "Swift",
+    "description": "Status Trio — a native macOS app that combines Wi-Fi, battery, and volume into one compact, configurable status icon for the menu bar, the Dock, or both, inspired by the iPhone Duo combined status bar.",
+    "url": "https://github.com/lingyired/status-trio"
+  },
+  {
+    "full_name": "Graylab/DL4Proteins-notebooks",
+    "who": [
+      "marui-usagi"
+    ],
+    "event": "star",
+    "stars": 733,
+    "language": "Jupyter Notebook",
+    "description": "Colab Notebooks covering deep learning tools for biomolecular structure prediction and design",
+    "url": "https://github.com/Graylab/DL4Proteins-notebooks"
+  },
+  {
+    "full_name": "jensengroup/propka",
+    "who": [
+      "jsunn-y"
+    ],
+    "event": "star",
+    "stars": 399,
+    "language": "Python",
+    "description": "PROPKA predicts the pKa values of ionizable groups in proteins and protein-ligand complexes based in the 3D structure.",
+    "url": "https://github.com/jensengroup/propka"
+  },
+  {
+    "full_name": "PDB-REDO/dssp",
+    "who": [
+      "npfernandes"
+    ],
+    "event": "star",
+    "stars": 279,
+    "language": "C++",
+    "description": "Application to assign secondary structure to proteins",
+    "url": "https://github.com/PDB-REDO/dssp"
+  },
+  {
+    "full_name": "GENTEL-lab/OriGene",
+    "who": [
+      "ZhangTian-creater"
+    ],
+    "event": "star",
+    "stars": 232,
+    "language": "Python",
+    "description": "OriGene: A Self-Evolving Virtual Disease Biologist for Mechanism-Guided Therapeutic Target Discovery",
+    "url": "https://github.com/GENTEL-lab/OriGene"
+  },
+  {
+    "full_name": "steineggerlab/folddisco",
+    "who": [
+      "dperez-Zzz"
+    ],
+    "event": "issue",
+    "stars": 221,
+    "language": "Rust",
+    "description": "Fast indexing and search of discontinuous motifs in protein structures",
+    "url": "https://github.com/steineggerlab/folddisco"
+  },
+  {
+    "full_name": "molence/Mol-1",
+    "who": [
+      "xinshi-chen"
+    ],
+    "event": "mixed",
+    "stars": 218,
+    "language": "Python",
+    "description": "Open Frontier Biomolecular Intelligence",
+    "url": "https://github.com/molence/Mol-1"
+  },
+  {
+    "full_name": "Graylab/IgLM",
+    "who": [
+      "bviggiano"
+    ],
+    "event": "star",
+    "stars": 201,
+    "language": "Python",
+    "description": "Generative Language Modeling for Antibody Design",
+    "url": "https://github.com/Graylab/IgLM"
+  },
+  {
+    "full_name": "aqlaboratory/genie3",
+    "who": [
+      "rabit232"
+    ],
+    "event": "star",
+    "stars": 140,
+    "language": "Python",
+    "description": "Genie 3 is a fast, all-atom SE(3)-equivariant diffusion model for protein design. It achieves state-of-the-art performance on unconditional generation, motif scaffolding, and binder design while retaining the computational efficiency of equivariant architectures.",
+    "url": "https://github.com/aqlaboratory/genie3"
+  },
+  {
+    "full_name": "KULL-Centre/CALVADOS",
+    "who": [
+      "MaybeBio"
+    ],
+    "event": "star",
+    "stars": 104,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/KULL-Centre/CALVADOS"
+  },
+  {
+    "full_name": "THGLab/LP-PDBBind",
+    "who": [
+      "MTVarman"
+    ],
+    "event": "issue",
+    "stars": 75,
+    "language": "Jupyter Notebook",
+    "description": "",
+    "url": "https://github.com/THGLab/LP-PDBBind"
+  },
+  {
+    "full_name": "ai4protein/VenusMine",
+    "who": [
+      "Jacci2970"
+    ],
+    "event": "fork",
+    "stars": 43,
+    "language": "Jupyter Notebook",
+    "description": "",
+    "url": "https://github.com/ai4protein/VenusMine"
+  },
+  {
+    "full_name": "baker-laboratory/Metallohydrolase_Enzyme_Design",
+    "who": [
+      "SethWoodbury"
+    ],
+    "event": "pr",
+    "stars": 31,
+    "language": "Jupyter Notebook",
+    "description": "Official GitHub repository for the manuscript entitled \"Computational Design of Metallohydrolases\" by Kim, Woodbury, & Ahern et al. published in Nature. This notebook contains (1) tutorials on how to use RFdiffusion2 for enzyme design, (2) a demo pipeline for metallohydrolase design, and (3) data, sequences, and design models from the manuscript. ",
+    "url": "https://github.com/baker-laboratory/Metallohydrolase_Enzyme_Design"
+  },
+  {
+    "full_name": "magnusross/pgd-hallucination",
+    "who": [
+      "sirius777coder"
+    ],
+    "event": "star",
+    "stars": 10,
+    "language": "Python",
+    "description": "Code for the paper \"Projected Gradient Descent for Hallucination-Based Protein Binder Design\"",
+    "url": "https://github.com/magnusross/pgd-hallucination"
+  },
+  {
+    "full_name": "THGLab/KinConfBench",
+    "who": [
+      "mseok"
+    ],
+    "event": "star",
+    "stars": 7,
+    "language": "Python",
+    "description": "Official Repo for KinConfBench",
+    "url": "https://github.com/THGLab/KinConfBench"
+  },
+  {
+    "full_name": "GENTEL-lab/PhaseFlow",
+    "who": [
+      "nicetone9"
+    ],
+    "event": "star",
+    "stars": 5,
+    "language": "Python",
+    "description": "PhaseFlow: Multi-Scale Modeling and Design of Phase-Separating Proteins",
+    "url": "https://github.com/GENTEL-lab/PhaseFlow"
+  },
+  {
+    "full_name": "weizhang-ustc/ProtChord",
+    "who": [
+      "QizhiPei"
+    ],
+    "event": "star",
+    "stars": 3,
+    "language": "Python",
+    "description": "Public Repo for ProtChord",
+    "url": "https://github.com/weizhang-ustc/ProtChord"
+  },
+  {
+    "full_name": "kiharalab/Emap2lig",
+    "who": [
+      "github-actions"
+    ],
+    "event": "mixed",
+    "stars": 3,
+    "language": "Python",
+    "description": "Official Emap2lig inference pipeline for finding ligand density blobs and building atomic ligand structures in cryo-EM maps.",
+    "url": "https://github.com/kiharalab/Emap2lig"
+  },
+  {
+    "full_name": "weizhang-ustc/PuzzleCodeBench",
+    "who": [
+      "QizhiPei"
+    ],
+    "event": "star",
+    "stars": 2,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/weizhang-ustc/PuzzleCodeBench"
+  },
+  {
+    "full_name": "kennethreitz/requeststoken.org",
+    "who": [
+      "kennethreitz"
+    ],
+    "event": "push",
+    "stars": 1,
+    "language": "Python",
+    "description": "requests coin site — built with Responder",
+    "url": "https://github.com/kennethreitz/requeststoken.org"
+  },
+  {
+    "full_name": "idptools/tadatorch",
+    "who": [
+      "ryanemenecker"
+    ],
+    "event": "issue",
+    "stars": 0,
+    "language": "Python",
+    "description": "tadatorch is a PyTorch implementation of the TADA activation domain predictor that uses sparrow for parameter predictions. ",
+    "url": "https://github.com/idptools/tadatorch"
+  }
+]
