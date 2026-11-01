@@ -1,0 +1,1910 @@
+[
+  {
+    "full_name": "pytorch/ignite",
+    "url": "https://github.com/pytorch/ignite",
+    "language": "Python",
+    "stars": 4798,
+    "description": "High-level library to help with training and evaluating neural networks in PyTorch flexibly and transparently.",
+    "pushed_at": "2026-10-27T20:04:26Z",
+    "source": "search"
+  },
+  {
+    "full_name": "LMD0311/Awesome-World-Model",
+    "url": "https://github.com/LMD0311/Awesome-World-Model",
+    "language": "",
+    "stars": 2294,
+    "description": "Collect some World Models for Autonomous Driving (and Robotic, etc.) papers. ",
+    "pushed_at": "2026-10-27T04:30:36Z",
+    "source": "search"
+  },
+  {
+    "full_name": "chaidiscovery/chai-lab",
+    "url": "https://github.com/chaidiscovery/chai-lab",
+    "language": "Python",
+    "stars": 2008,
+    "description": "Chai-1, SOTA model for biomolecular structure prediction",
+    "pushed_at": "2026-10-27T01:22:40Z",
+    "source": "search"
+  },
+  {
+    "full_name": "choderalab/openmmtools",
+    "url": "https://github.com/choderalab/openmmtools",
+    "language": "Python",
+    "stars": 342,
+    "description": "A batteries-included toolkit for the GPU-accelerated OpenMM molecular simulation engine.",
+    "pushed_at": "2026-10-27T14:55:53Z",
+    "source": "search"
+  },
+  {
+    "full_name": "mosdef-hub/mbuild",
+    "url": "https://github.com/mosdef-hub/mbuild",
+    "language": "Python",
+    "stars": 231,
+    "description": "A hierarchical, component based molecule builder",
+    "pushed_at": "2026-10-27T11:11:54Z",
+    "source": "search"
+  },
+  {
+    "full_name": "learningmatter-mit/AtomisticSkills",
+    "url": "https://github.com/learningmatter-mit/AtomisticSkills",
+    "language": "Python",
+    "stars": 186,
+    "description": "Integrating AtomisticSkills into Agentic IDEs (Cursor, Claude Code, Codex, Google Antigravity, Hermes Agent, etc)",
+    "pushed_at": "2026-10-27T05:21:04Z",
+    "source": "search"
+  },
+  {
+    "full_name": "mosdef-hub/foyer",
+    "url": "https://github.com/mosdef-hub/foyer",
+    "language": "Python",
+    "stars": 149,
+    "description": "A package for atom-typing as well as applying and disseminating forcefields",
+    "pushed_at": "2026-10-27T11:13:09Z",
+    "source": "search"
+  },
+  {
+    "full_name": "BioJulia/BioStructures.jl",
+    "url": "https://github.com/BioJulia/BioStructures.jl",
+    "language": "Julia",
+    "stars": 106,
+    "description": "A Julia package to read, write and manipulate macromolecular structures",
+    "pushed_at": "2026-10-27T10:59:38Z",
+    "source": "search"
+  },
+  {
+    "full_name": "js-lee-AI/awesome-llm-agent-papers",
+    "url": "https://github.com/js-lee-AI/awesome-llm-agent-papers",
+    "language": "Python",
+    "stars": 105,
+    "description": "LLM agents: curated papers on planning, memory, tool use, multi-agent systems, evaluation, and safety.",
+    "pushed_at": "2026-10-27T22:50:43Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Omni-Scientist/Awesome-AI-Scientist",
+    "url": "https://github.com/Omni-Scientist/Awesome-AI-Scientist",
+    "language": "Python",
+    "stars": 103,
+    "description": "🧪 Awesome list of AI Scientist papers, systems, benchmarks, datasets and open-source platforms.",
+    "pushed_at": "2026-10-27T16:46:06Z",
+    "source": "search"
+  },
+  {
+    "full_name": "tgraphite/reax_tools",
+    "url": "https://github.com/tgraphite/reax_tools",
+    "language": "C++",
+    "stars": 90,
+    "description": "A high performace ReaxFF/AIMD trajectory analysis tool based on graph theory.",
+    "pushed_at": "2026-10-27T18:39:28Z",
+    "source": "search"
+  },
+  {
+    "full_name": "rwmontalvao/Melodia_py",
+    "url": "https://github.com/rwmontalvao/Melodia_py",
+    "language": "Python",
+    "stars": 87,
+    "description": "Protein Structure Analysis",
+    "pushed_at": "2026-10-27T14:30:39Z",
+    "source": "search"
+  },
+  {
+    "full_name": "paduagroup/clandp",
+    "url": "https://github.com/paduagroup/clandp",
+    "language": "",
+    "stars": 84,
+    "description": "Force field for ionic liquids",
+    "pushed_at": "2026-10-27T18:08:18Z",
+    "source": "search"
+  },
+  {
+    "full_name": "immortal71/openoncology",
+    "url": "https://github.com/immortal71/openoncology",
+    "language": "Python",
+    "stars": 68,
+    "description": "Open-source precision oncology platform that ranks FDA-approved and repurposing drug candidates from a patient's variant profile using OncoKB, AlphaMissense, OpenTargets and ChEMBL evidence. Blinded 50-case oncologist holdout: Hit@3 0.900, zero false positives.",
+    "pushed_at": "2026-10-27T12:09:29Z",
+    "source": "search"
+  },
+  {
+    "full_name": "ssinder/bioinformatics-agent-skills",
+    "url": "https://github.com/ssinder/bioinformatics-agent-skills",
+    "language": "Python",
+    "stars": 67,
+    "description": "Agent Skills for computational biology — RNA-seq, single-cell, protein structure, molecular dynamics, peptide design, literature mining and publication figures. Turn any AI coding agent into a computational biology assistant.",
+    "pushed_at": "2026-10-27T13:53:40Z",
+    "source": "search"
+  },
+  {
+    "full_name": "RaulPPelaez/UAMMD",
+    "url": "https://github.com/RaulPPelaez/UAMMD",
+    "language": "Cuda",
+    "stars": 67,
+    "description": "A CUDA project for Molecular Dynamics, Brownian Dynamics, Hydrodynamics... intended to simulate a very generic system constructing a simulation with modules.",
+    "pushed_at": "2026-10-27T15:36:44Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Shenggan/xfold",
+    "url": "https://github.com/Shenggan/xfold",
+    "language": "Python",
+    "stars": 59,
+    "description": "Democratizing AlphaFold3: an PyTorch reimplementation to accelerate protein structure prediction",
+    "pushed_at": "2026-10-27T15:33:29Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Degiacomi-Lab/molearn",
+    "url": "https://github.com/Degiacomi-Lab/molearn",
+    "language": "Python",
+    "stars": 52,
+    "description": "protein conformational spaces meet machine learning",
+    "pushed_at": "2026-10-27T20:53:36Z",
+    "source": "search"
+  },
+  {
+    "full_name": "hongzhonglu/AlphaGEM",
+    "url": "https://github.com/hongzhonglu/AlphaGEM",
+    "language": "Python",
+    "stars": 29,
+    "description": "",
+    "pushed_at": "2026-10-27T11:24:58Z",
+    "source": "search"
+  },
+  {
+    "full_name": "bio-phys/BioEn",
+    "url": "https://github.com/bio-phys/BioEn",
+    "language": "Python",
+    "stars": 25,
+    "description": "BioEn - Bayesian Inference Of ENsembles",
+    "pushed_at": "2026-10-27T21:01:28Z",
+    "source": "search"
+  },
+  {
+    "full_name": "link89/oh-my-batch",
+    "url": "https://github.com/link89/oh-my-batch",
+    "language": "Python",
+    "stars": 23,
+    "description": "A command line toolkit to simplify batch tasks generation and execution.",
+    "pushed_at": "2026-10-27T07:51:07Z",
+    "source": "search"
+  },
+  {
+    "full_name": "ullahsamee/proteindesigngroups",
+    "url": "https://github.com/ullahsamee/proteindesigngroups",
+    "language": "JavaScript",
+    "stars": 20,
+    "description": "A curated, interactive directory of protein design research groups worldwide.",
+    "pushed_at": "2026-10-27T07:31:30Z",
+    "source": "search"
+  },
+  {
+    "full_name": "zeleny-ondrej/STNN-Weekly-Arxiv",
+    "url": "https://github.com/zeleny-ondrej/STNN-Weekly-Arxiv",
+    "language": "Python",
+    "stars": 20,
+    "description": "Scraping repository of the most relevant topics with regards to Spatio-Temporal Neural Networks available in the arXiv archive. The repository and workflow is based on https://github.com/SpikingChen/SNN-Daily-Arxiv.",
+    "pushed_at": "2026-10-27T01:00:14Z",
+    "source": "search"
+  },
+  {
+    "full_name": "AtharvaTilewale/boltz2-notebook",
+    "url": "https://github.com/AtharvaTilewale/boltz2-notebook",
+    "language": "Python",
+    "stars": 19,
+    "description": "Boltz2 Notebook – A streamlined Colab-based pipeline for protein structure prediction and binding affinity analysis using the Boltz2 deep learning model.",
+    "pushed_at": "2026-10-27T15:55:45Z",
+    "source": "search"
+  },
+  {
+    "full_name": "ZZhangsm/Awesome-Virtual-Spatial-Omics-Generation",
+    "url": "https://github.com/ZZhangsm/Awesome-Virtual-Spatial-Omics-Generation",
+    "language": "",
+    "stars": 19,
+    "description": "",
+    "pushed_at": "2026-10-27T06:53:16Z",
+    "source": "search"
+  },
+  {
+    "full_name": "roitberg-group/torchani-amber",
+    "url": "https://github.com/roitberg-group/torchani-amber",
+    "language": "Fortran",
+    "stars": 18,
+    "description": "Interface enabling use of ANI-style, and other NN-IPs in the Amber molecular dynamics software suite. Works with both Amber engines, sander and pmemd.",
+    "pushed_at": "2026-10-27T05:55:35Z",
+    "source": "search"
+  },
+  {
+    "full_name": "moldyn/dcTMD",
+    "url": "https://github.com/moldyn/dcTMD",
+    "language": "Python",
+    "stars": 17,
+    "description": "Analysis framework of dissipation-corrected targeted molecular dynamics (dcTMD) simulations.",
+    "pushed_at": "2026-10-27T16:04:25Z",
+    "source": "search"
+  },
+  {
+    "full_name": "wallnerlab/afsample3",
+    "url": "https://github.com/wallnerlab/afsample3",
+    "language": "Python",
+    "stars": 17,
+    "description": "Modelling protein conformations with Alphafold3",
+    "pushed_at": "2026-10-27T09:45:51Z",
+    "source": "search"
+  },
+  {
+    "full_name": "volkamerlab/so3lr-sf",
+    "url": "https://github.com/volkamerlab/so3lr-sf",
+    "language": "Jupyter Notebook",
+    "stars": 14,
+    "description": "",
+    "pushed_at": "2026-10-27T10:56:05Z",
+    "source": "search"
+  },
+  {
+    "full_name": "salilab/pmi",
+    "url": "https://github.com/salilab/pmi",
+    "language": "Python",
+    "stars": 14,
+    "description": "Python Modeling Interface",
+    "pushed_at": "2026-10-27T17:37:50Z",
+    "source": "search"
+  },
+  {
+    "full_name": "cddlab/rgi_toolkit",
+    "url": "https://github.com/cddlab/rgi_toolkit",
+    "language": "Python",
+    "stars": 13,
+    "description": "⛓️ RGI-Toolkit: Restraint-Guided-Inference toolkit, Differentiable Restraints for Controllable  Biomolecular Structure Prediction",
+    "pushed_at": "2026-10-27T07:22:35Z",
+    "source": "search"
+  },
+  {
+    "full_name": "m3g/MolSimToolkit.jl",
+    "url": "https://github.com/m3g/MolSimToolkit.jl",
+    "language": "Julia",
+    "stars": 13,
+    "description": "A set of tools for analyzing molecular dynamics simulations",
+    "pushed_at": "2026-10-27T18:45:42Z",
+    "source": "search"
+  },
+  {
+    "full_name": "matentzn/awesome-resources-for-rare-disease",
+    "url": "https://github.com/matentzn/awesome-resources-for-rare-disease",
+    "language": "Just",
+    "stars": 12,
+    "description": "A collection of resources useful for Rare Disease research",
+    "pushed_at": "2026-10-27T08:24:17Z",
+    "source": "search"
+  },
+  {
+    "full_name": "UAMCAntwerpen/2040FBDBIC",
+    "url": "https://github.com/UAMCAntwerpen/2040FBDBIC",
+    "language": "Jupyter Notebook",
+    "stars": 11,
+    "description": "This repository contains all the course materials that are used in the \"Chemo-informatics and computational drug design\" course teaches at the University of Antwerp (Belgium)",
+    "pushed_at": "2026-10-27T14:35:17Z",
+    "source": "search"
+  },
+  {
+    "full_name": "kaka-zuumi/VENUSpy",
+    "url": "https://github.com/kaka-zuumi/VENUSpy",
+    "language": "Python",
+    "stars": 10,
+    "description": "Initial Sampling and Molecular Dynamics for Unimolecular and Bimolecular Reactions",
+    "pushed_at": "2026-10-27T19:37:26Z",
+    "source": "search"
+  },
+  {
+    "full_name": "xinh03/UniDTI",
+    "url": "https://github.com/xinh03/UniDTI",
+    "language": "Jupyter Notebook",
+    "stars": 9,
+    "description": "A Multi-modal and Multi-scale Unified Deep Learning Framework for Drug-Target Interaction Prediction",
+    "pushed_at": "2026-10-27T03:10:15Z",
+    "source": "search"
+  },
+  {
+    "full_name": "satiricalguru/Agents-skills",
+    "url": "https://github.com/satiricalguru/Agents-skills",
+    "language": "Python",
+    "stars": 9,
+    "description": "A curated collection of powerful agentic skills for automation, development, reverse engineering, productivity, and AI-assisted workflows — designed to extend Claude into a smarter autonomous engineering companion ⚡",
+    "pushed_at": "2026-10-27T17:30:11Z",
+    "source": "search"
+  },
+  {
+    "full_name": "LopezGroup-ICIQ/ATLAS",
+    "url": "https://github.com/LopezGroup-ICIQ/ATLAS",
+    "language": "Python",
+    "stars": 8,
+    "description": "An automatic workflow for streamlining training and data generation for MLIPs via active learning",
+    "pushed_at": "2026-10-27T17:49:08Z",
+    "source": "search"
+  },
+  {
+    "full_name": "meringlab/string-mcp",
+    "url": "https://github.com/meringlab/string-mcp",
+    "language": "Python",
+    "stars": 8,
+    "description": "STRING MCP server",
+    "pushed_at": "2026-10-27T16:18:38Z",
+    "source": "search"
+  },
+  {
+    "full_name": "adaptyvbio/binder-prescreen",
+    "url": "https://github.com/adaptyvbio/binder-prescreen",
+    "language": "Python",
+    "stars": 7,
+    "description": "Sequence-level prior-art and known-binder prescreen for protein-design binder competitions",
+    "pushed_at": "2026-10-27T15:33:55Z",
+    "source": "search"
+  },
+  {
+    "full_name": "shahram-boshra/MILIA",
+    "url": "https://github.com/shahram-boshra/MILIA",
+    "language": "Python",
+    "stars": 7,
+    "description": "Molecular Graph Processing and Machine Learning Framework for Molecular Sciences",
+    "pushed_at": "2026-10-27T14:36:41Z",
+    "source": "search"
+  },
+  {
+    "full_name": "myung-group/BAM-torch",
+    "url": "https://github.com/myung-group/BAM-torch",
+    "language": "Python",
+    "stars": 7,
+    "description": "",
+    "pushed_at": "2026-10-27T01:16:14Z",
+    "source": "search"
+  },
+  {
+    "full_name": "neutrons/inspired",
+    "url": "https://github.com/neutrons/inspired",
+    "language": "Python",
+    "stars": 6,
+    "description": "",
+    "pushed_at": "2026-10-27T14:44:49Z",
+    "source": "search"
+  },
+  {
+    "full_name": "elviorodriguez/MultimerMapper",
+    "url": "https://github.com/elviorodriguez/MultimerMapper",
+    "language": "Python",
+    "stars": 5,
+    "description": "MultimerMapper is a bioinformatics tool designed for the generation, integration, analysis, and visualization of AlphaFold interaction landscapes based on the novel concept of \"context-dependent protein structure prediction\" and the implementation of a stoichiometric space exploration algorithm. Multimer Mapper.",
+    "pushed_at": "2026-10-27T18:14:54Z",
+    "source": "search"
+  },
+  {
+    "full_name": "klxuyfk/VPMDK",
+    "url": "https://github.com/klxuyfk/VPMDK",
+    "language": "Python",
+    "stars": 5,
+    "description": "Run machine-learning potentials using VASP style inputs.",
+    "pushed_at": "2026-10-27T01:42:13Z",
+    "source": "search"
+  },
+  {
+    "full_name": "agiliopadua/md",
+    "url": "https://github.com/agiliopadua/md",
+    "language": "Jupyter Notebook",
+    "stars": 4,
+    "description": "Course on molecular dynamics, 1st yr Masters in Physical Sciences (Sciences de la Matière)",
+    "pushed_at": "2026-10-27T21:02:50Z",
+    "source": "search"
+  },
+  {
+    "full_name": "IRL2/nanover-imd-xr",
+    "url": "https://github.com/IRL2/nanover-imd-xr",
+    "language": "C#",
+    "stars": 4,
+    "description": "Interactive Molecular Dynamics (iMD) in XR",
+    "pushed_at": "2026-10-27T11:05:33Z",
+    "source": "search"
+  },
+  {
+    "full_name": "yueming521/LNGCN_main",
+    "url": "https://github.com/yueming521/LNGCN_main",
+    "language": "Python",
+    "stars": 4,
+    "description": " A Distance-Aware Dynamics Network for Protein-Protein Interaction Prediction",
+    "pushed_at": "2026-10-27T02:31:59Z",
+    "source": "search"
+  },
+  {
+    "full_name": "data-helix-lab/pymdkit",
+    "url": "https://github.com/data-helix-lab/pymdkit",
+    "language": "Python",
+    "stars": 3,
+    "description": "Modular Python toolkit for running OpenMM molecular dynamics simulations and automated trajectory analysis (RMSD, PCA, FEL, DSSP, H-bonds, SASA, contact maps)",
+    "pushed_at": "2026-10-27T18:11:15Z",
+    "source": "search"
+  },
+  {
+    "full_name": "seqcode/TPCAV",
+    "url": "https://github.com/seqcode/TPCAV",
+    "language": "Jupyter Notebook",
+    "stars": 3,
+    "description": "Testing with PCA projected Concept Activation Vectors",
+    "pushed_at": "2026-10-27T05:47:21Z",
+    "source": "search"
+  },
+  {
+    "full_name": "URK23CS7048Rohan/Old-Drug-New-Diseases",
+    "url": "https://github.com/URK23CS7048Rohan/Old-Drug-New-Diseases",
+    "language": "",
+    "stars": 3,
+    "description": "AI drug repurposing for rare & neglected diseases: a GNN over PrimeKG, multi-agent evidence, real AlphaFold proteins in 3D/4D.",
+    "pushed_at": "2026-10-27T14:30:20Z",
+    "source": "search"
+  },
+  {
+    "full_name": "elviorodriguez/BiotrAIn_MultimerMapper",
+    "url": "https://github.com/elviorodriguez/BiotrAIn_MultimerMapper",
+    "language": "Python",
+    "stars": 3,
+    "description": "",
+    "pushed_at": "2026-10-27T23:09:46Z",
+    "source": "search"
+  },
+  {
+    "full_name": "KarelBerka/Alphafoldology",
+    "url": "https://github.com/KarelBerka/Alphafoldology",
+    "language": "Python",
+    "stars": 3,
+    "description": "",
+    "pushed_at": "2026-10-27T16:29:15Z",
+    "source": "search"
+  },
+  {
+    "full_name": "ciyalabs/bio_dreamer",
+    "url": "https://github.com/ciyalabs/bio_dreamer",
+    "language": "Python",
+    "stars": 3,
+    "description": "World Models for Biological Design",
+    "pushed_at": "2026-10-27T03:32:31Z",
+    "source": "search"
+  },
+  {
+    "full_name": "cookieyu2000/ai-agent-portable",
+    "url": "https://github.com/cookieyu2000/ai-agent-portable",
+    "language": "Shell",
+    "stars": 3,
+    "description": "",
+    "pushed_at": "2026-10-27T15:23:35Z",
+    "source": "search"
+  },
+  {
+    "full_name": "salilab/npctransport",
+    "url": "https://github.com/salilab/npctransport",
+    "language": "C++",
+    "stars": 3,
+    "description": "IMP module for simulating transport through the NPC",
+    "pushed_at": "2026-10-27T17:55:28Z",
+    "source": "search"
+  },
+  {
+    "full_name": "smaniches/uniprot-mcp",
+    "url": "https://github.com/smaniches/uniprot-mcp",
+    "language": "Python",
+    "stars": 3,
+    "description": "Auditable UniProt MCP server with per-response SHA-256 provenance, release pinning, verification, and offline replay.",
+    "pushed_at": "2026-10-27T03:58:33Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Computational-Materials-Research-Group/Molecular-Dynamics-Simulation-of-Tension-Induced-Pop-Up-and-Fracture-in-Graphene-Kirigami",
+    "url": "https://github.com/Computational-Materials-Research-Group/Molecular-Dynamics-Simulation-of-Tension-Induced-Pop-Up-and-Fracture-in-Graphene-Kirigami",
+    "language": "Python",
+    "stars": 2,
+    "description": "",
+    "pushed_at": "2026-10-27T20:43:09Z",
+    "source": "search"
+  },
+  {
+    "full_name": "yourh/CLAlign",
+    "url": "https://github.com/yourh/CLAlign",
+    "language": "Python",
+    "stars": 2,
+    "description": "",
+    "pushed_at": "2026-10-27T05:59:59Z",
+    "source": "search"
+  },
+  {
+    "full_name": "netbiolab/LoGoPPI",
+    "url": "https://github.com/netbiolab/LoGoPPI",
+    "language": "Python",
+    "stars": 2,
+    "description": "",
+    "pushed_at": "2026-10-27T07:33:44Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Jeffrey-Inyang/WTA-odds-predictor",
+    "url": "https://github.com/Jeffrey-Inyang/WTA-odds-predictor",
+    "language": "Python",
+    "stars": 2,
+    "description": "A desktop application that predicts tennis odds using linear regression. Built with Python, it allows users to upload CSV files, train a machine learning model, make predictions, and visualize results. Integrated a user-friendly GUI with tkinter, data processing with pandas, model building with scikit-learn, and result plotting with matplotlib.",
+    "pushed_at": "2026-10-27T08:58:54Z",
+    "source": "search"
+  },
+  {
+    "full_name": "ProkopK/PoreReax",
+    "url": "https://github.com/ProkopK/PoreReax",
+    "language": "Python",
+    "stars": 2,
+    "description": "Tool for analysing and generating reactive simulations using ReaxFF, LAMMPS and Python.",
+    "pushed_at": "2026-10-27T17:15:07Z",
+    "source": "search"
+  },
+  {
+    "full_name": "VoltLabs-Research/opendxa",
+    "url": "https://github.com/VoltLabs-Research/opendxa",
+    "language": "C++",
+    "stars": 2,
+    "description": "Modular DXA-implementation. Supports multiple lattice types and structure identification methods including PTM, CNA, and Diamond structure analysis. Identifies dislocation lines, computes Burgers vectors, constructs dislocation networks, and exports results for visualization.",
+    "pushed_at": "2026-10-27T14:33:04Z",
+    "source": "search"
+  },
+  {
+    "full_name": "annaspac/Comparison-of-transport-tunnels-in-experimental-and-AlphaFill-protein-structures",
+    "url": "https://github.com/annaspac/Comparison-of-transport-tunnels-in-experimental-and-AlphaFill-protein-structures",
+    "language": "Python",
+    "stars": 1,
+    "description": "",
+    "pushed_at": "2026-10-27T16:37:22Z",
+    "source": "search"
+  },
+  {
+    "full_name": "PDBeurope/ner_for_protein_structures",
+    "url": "https://github.com/PDBeurope/ner_for_protein_structures",
+    "language": "Python",
+    "stars": 1,
+    "description": "",
+    "pushed_at": "2026-10-27T16:07:27Z",
+    "source": "search"
+  },
+  {
+    "full_name": "virtualscreenlab/Gomboc",
+    "url": "https://github.com/virtualscreenlab/Gomboc",
+    "language": "Wolfram Language",
+    "stars": 1,
+    "description": " We introduce a novel computational model inspired by the Gömböc, a convex shape with exactly one stable equilibrium, as an analogy for protein folding energy landscapes, systematically varying landscape ruggedness across seven orders of magnitude to reveal how minimal increases in frustration can dramatically reduce folding efficiency.",
+    "pushed_at": "2026-10-27T05:38:19Z",
+    "source": "search"
+  },
+  {
+    "full_name": "asimbepari/domeeko",
+    "url": "https://github.com/asimbepari/domeeko",
+    "language": "Shell",
+    "stars": 1,
+    "description": "Molecular docking pipeline with Open Babel, Meeko, RDKit, and Autodock Vina",
+    "pushed_at": "2026-10-27T11:27:14Z",
+    "source": "search"
+  },
+  {
+    "full_name": "YangLab-BUPT/tsAMP",
+    "url": "https://github.com/YangLab-BUPT/tsAMP",
+    "language": "Python",
+    "stars": 1,
+    "description": "a comprehensive framework combining the ESM1v protein language model with multidimensional feature extraction for accurate and generalizable AMP identification and strain-specific MIC prediction",
+    "pushed_at": "2026-10-27T07:57:20Z",
+    "source": "search"
+  },
+  {
+    "full_name": "rhemamfrancis/ML-Guided-CDK2-Drug-Repositioning",
+    "url": "https://github.com/rhemamfrancis/ML-Guided-CDK2-Drug-Repositioning",
+    "language": "Jupyter Notebook",
+    "stars": 1,
+    "description": "",
+    "pushed_at": "2026-10-27T17:47:56Z",
+    "source": "search"
+  },
+  {
+    "full_name": "miss-classification/boltz2-openbind-ray",
+    "url": "https://github.com/miss-classification/boltz2-openbind-ray",
+    "language": "Python",
+    "stars": 1,
+    "description": "Benchmark AI co-folding models (Boltz-2, OpenBind-0, fine-tuned OpenFold3) against 2,147 crystal structures from three antiviral drug discovery campaigns, end to end on Ray: batch prediction with Ray Data, fine-tuning with Ray Train, live predictions with Ray Serve",
+    "pushed_at": "2026-10-27T05:34:52Z",
+    "source": "search"
+  },
+  {
+    "full_name": "martinezjenmarie9/Muscle-Contractility-STAC3",
+    "url": "https://github.com/martinezjenmarie9/Muscle-Contractility-STAC3",
+    "language": "R",
+    "stars": 1,
+    "description": "",
+    "pushed_at": "2026-10-27T08:18:54Z",
+    "source": "search"
+  },
+  {
+    "full_name": "DeepTrackAI/ASAP",
+    "url": "https://github.com/DeepTrackAI/ASAP",
+    "language": "Jupyter Notebook",
+    "stars": 1,
+    "description": "",
+    "pushed_at": "2026-10-27T01:48:22Z",
+    "source": "search"
+  },
+  {
+    "full_name": "E1582271-dotcom/MLIP-fine-tune",
+    "url": "https://github.com/E1582271-dotcom/MLIP-fine-tune",
+    "language": "Python",
+    "stars": 1,
+    "description": "How close do universal and DFT-fine-tuned MACE potentials come to DFT for Li transport in Li6PS5Cl? 42 MD trajectories benchmarked against DFT forces and AIMD diffusion.",
+    "pushed_at": "2026-10-27T11:32:19Z",
+    "source": "search"
+  },
+  {
+    "full_name": "alinelena/ai-rules",
+    "url": "https://github.com/alinelena/ai-rules",
+    "language": "Python",
+    "stars": 1,
+    "description": "",
+    "pushed_at": "2026-10-27T10:14:28Z",
+    "source": "search"
+  },
+  {
+    "full_name": "SlippyRicky/LinChainLMS",
+    "url": "https://github.com/SlippyRicky/LinChainLMS",
+    "language": "TeX",
+    "stars": 1,
+    "description": "",
+    "pushed_at": "2026-10-27T21:46:33Z",
+    "source": "search"
+  },
+  {
+    "full_name": "David-OConnor/bio_tools",
+    "url": "https://github.com/David-OConnor/bio_tools",
+    "language": "Rust",
+    "stars": 1,
+    "description": "Install and run structural bio and drug design tools easily",
+    "pushed_at": "2026-10-27T21:57:33Z",
+    "source": "search"
+  },
+  {
+    "full_name": "BioITHackathons/Visible-Neural-Networks-for-Drug-Response-in-Cancer-CellMap-VNN-",
+    "url": "https://github.com/BioITHackathons/Visible-Neural-Networks-for-Drug-Response-in-Cancer-CellMap-VNN-",
+    "language": "HTML",
+    "stars": 1,
+    "description": "",
+    "pushed_at": "2026-10-27T21:33:04Z",
+    "source": "search"
+  },
+  {
+    "full_name": "flyark/livia-atlas",
+    "url": "https://github.com/flyark/livia-atlas",
+    "language": "JavaScript",
+    "stars": 1,
+    "description": "LIVIA Atlas",
+    "pushed_at": "2026-10-27T13:28:37Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Harshh-itt/phisguard",
+    "url": "https://github.com/Harshh-itt/phisguard",
+    "language": "Python",
+    "stars": 1,
+    "description": "",
+    "pushed_at": "2026-10-27T18:12:24Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Sambhu69/AI-Based-Smart-Agriculture-Crop-Disease-Intelligence-Platform",
+    "url": "https://github.com/Sambhu69/AI-Based-Smart-Agriculture-Crop-Disease-Intelligence-Platform",
+    "language": "Python",
+    "stars": 1,
+    "description": "An end-to-end AI-based agriculture intelligence and crop disease classification platform.",
+    "pushed_at": "2026-10-27T10:41:23Z",
+    "source": "search"
+  },
+  {
+    "full_name": "jtmckinley4/multimodal-bio-fusion",
+    "url": "https://github.com/jtmckinley4/multimodal-bio-fusion",
+    "language": "Jupyter Notebook",
+    "stars": 1,
+    "description": "Research pipeline for aligning and fusing frozen RNA/protein foundation models (Nucleotide Transformer, ESM-2) — MSDA capstone project at UCF.",
+    "pushed_at": "2026-10-27T20:25:10Z",
+    "source": "search"
+  },
+  {
+    "full_name": "huldachen/antibody-plm-benchmark",
+    "url": "https://github.com/huldachen/antibody-plm-benchmark",
+    "language": "Python",
+    "stars": 1,
+    "description": "Leakage- and budget-aware evaluation of PLMs, inverse folding, and supervised models for antibody affinity maturation",
+    "pushed_at": "2026-10-27T16:33:08Z",
+    "source": "search"
+  },
+  {
+    "full_name": "VoltLabs-Research/VOLT",
+    "url": "https://github.com/VoltLabs-Research/VOLT",
+    "language": "TypeScript",
+    "stars": 1,
+    "description": "The next-generation platform designed for high-performance research teams and enthusiastic materials scientists!",
+    "pushed_at": "2026-10-27T14:30:53Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Hery21/Secondary-protein-structure-prediction-using-SVM",
+    "url": "https://github.com/Hery21/Secondary-protein-structure-prediction-using-SVM",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T19:29:13Z",
+    "source": "search"
+  },
+  {
+    "full_name": "mesdaghi/genome_annotation_quality_nextflow_pipeline",
+    "url": "https://github.com/mesdaghi/genome_annotation_quality_nextflow_pipeline",
+    "language": "Python",
+    "stars": 0,
+    "description": "Nextflow pipeline for large-scale protein structure prediction using Protenix, with automated chunking, model processing, and pLDDT distribution analysis against reference organism datasets. Also Metapredict and PSAURON analysis",
+    "pushed_at": "2026-10-27T10:49:48Z",
+    "source": "search"
+  },
+  {
+    "full_name": "galvezwillhelm-pixel/Muscle-Contractility-MYBPC3",
+    "url": "https://github.com/galvezwillhelm-pixel/Muscle-Contractility-MYBPC3",
+    "language": "R",
+    "stars": 0,
+    "description": "Protein structure and mutation analysis of MYBPC3 and the p.Arg502Trp variant in muscle contractility.",
+    "pushed_at": "2026-10-27T15:07:43Z",
+    "source": "search"
+  },
+  {
+    "full_name": "gordonrix/quicklook-structure",
+    "url": "https://github.com/gordonrix/quicklook-structure",
+    "language": "HTML",
+    "stars": 0,
+    "description": "macOS Quick Look preview for .pdb / .cif protein structures (3Dmol cartoon, colored by chain)",
+    "pushed_at": "2026-10-27T13:17:41Z",
+    "source": "search"
+  },
+  {
+    "full_name": "nehal96/protein-structure-figures",
+    "url": "https://github.com/nehal96/protein-structure-figures",
+    "language": "TypeScript",
+    "stars": 0,
+    "description": "Figures and interactives from the essay Solving the First Protein Structures",
+    "pushed_at": "2026-10-27T10:31:43Z",
+    "source": "search"
+  },
+  {
+    "full_name": "susanzehra/Decision_Tree_Dealership_Challenge",
+    "url": "https://github.com/susanzehra/Decision_Tree_Dealership_Challenge",
+    "language": "HTML",
+    "stars": 0,
+    "description": "Features, Labels, Training and Test Data, Tree Structure, Prediction, and Accuracy",
+    "pushed_at": "2026-10-27T18:06:43Z",
+    "source": "search"
+  },
+  {
+    "full_name": "platforma-open/3d-structure-prediction",
+    "url": "https://github.com/platforma-open/3d-structure-prediction",
+    "language": "TypeScript",
+    "stars": 0,
+    "description": "Predict 3D structures of antibody and nanobody variable domains directly from sequence.",
+    "pushed_at": "2026-10-27T14:23:23Z",
+    "source": "search"
+  },
+  {
+    "full_name": "MPensa/protein-ss-prediction",
+    "url": "https://github.com/MPensa/protein-ss-prediction",
+    "language": "Python",
+    "stars": 0,
+    "description": "Protein secondary structure prediction with baseline and residual 1D CNNs",
+    "pushed_at": "2026-10-27T11:25:56Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Charliserein/MHC-alphafold",
+    "url": "https://github.com/Charliserein/MHC-alphafold",
+    "language": "Python",
+    "stars": 0,
+    "description": "MHCalphafold is a standalone pipeline for peptide-MHC structure prediction built on AlphaFold2. It combines pMHC templates, anchor-guided initial coordinates, and confidence-based model selection. It provides reproducible setup and inference workflows while retaining the original AlphaFold2 weights.",
+    "pushed_at": "2026-10-27T09:41:14Z",
+    "source": "search"
+  },
+  {
+    "full_name": "mbote-droid/precision-onco-africa",
+    "url": "https://github.com/mbote-droid/precision-onco-africa",
+    "language": "Python",
+    "stars": 0,
+    "description": "Local-first multi-agent AI for precision oncology (TP53): AlphaFold/ESMFold structures, ESM-2 variant scoring, ΔΔG stability, AutoDock Vina molecular docking and a per-agent reasoning audit benchmarked against ClinVar/IARC. Offline on 8 GB RAM; HL7 FHIR R4; 566 tests. Research use only.",
+    "pushed_at": "2026-10-27T22:49:40Z",
+    "source": "search"
+  },
+  {
+    "full_name": "tommaso-corti/qaoa-molecular-docking",
+    "url": "https://github.com/tommaso-corti/qaoa-molecular-docking",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "QAOA and LR-QAOA for molecular docking — gate-based quantum optimization on a 12-qubit statevector simulator",
+    "pushed_at": "2026-10-27T09:47:27Z",
+    "source": "search"
+  },
+  {
+    "full_name": "GazalBhargava/MS-dual-target-docking",
+    "url": "https://github.com/GazalBhargava/MS-dual-target-docking",
+    "language": "Python",
+    "stars": 0,
+    "description": "An automated 2-phase molecular docking pipeline which not only targets HLA-DRB1, but also the co-stimulatory mechanisms via (CD80/CD86) for Multiple Sclerosis..",
+    "pushed_at": "2026-10-27T07:03:04Z",
+    "source": "search"
+  },
+  {
+    "full_name": "vivarium-collective/viva-lammps",
+    "url": "https://github.com/vivarium-collective/viva-lammps",
+    "language": "Python",
+    "stars": 0,
+    "description": "Process-bigraph wrapper for the LAMMPS molecular dynamics simulator",
+    "pushed_at": "2026-10-27T23:42:42Z",
+    "source": "search"
+  },
+  {
+    "full_name": "zacharychristopherlee-create/p53-Y220C-MD-inputs",
+    "url": "https://github.com/zacharychristopherlee-create/p53-Y220C-MD-inputs",
+    "language": "Python",
+    "stars": 0,
+    "description": "P53 Mutant Structures Predicted by AlphaFold and Molecular Dynamics Simulations of Candidate Stabilizing Compounds",
+    "pushed_at": "2026-10-27T22:51:48Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Peace7122/laguna-gromacs-slurm-workflow",
+    "url": "https://github.com/Peace7122/laguna-gromacs-slurm-workflow",
+    "language": "Shell",
+    "stars": 0,
+    "description": "Reusable CHARMM-GUI → GROMACS → SLURM workflow for running molecular dynamics simulations on USC CARC Laguna.",
+    "pushed_at": "2026-10-27T21:28:12Z",
+    "source": "search"
+  },
+  {
+    "full_name": "hanzhizhu12/Lennard-Jones-Molecular-Dynamics-Model",
+    "url": "https://github.com/hanzhizhu12/Lennard-Jones-Molecular-Dynamics-Model",
+    "language": "C++",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T18:52:02Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Ata-Azizi/molecular-dynamics",
+    "url": "https://github.com/Ata-Azizi/molecular-dynamics",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "Copy Molecular dynamics simulation of Lennard-Jones particles using the Velocity Verlet algorithm, periodic boundary conditions, and energy conservation analysis.",
+    "pushed_at": "2026-10-27T16:14:26Z",
+    "source": "search"
+  },
+  {
+    "full_name": "MicheleScattola/molecular-dynamics",
+    "url": "https://github.com/MicheleScattola/molecular-dynamics",
+    "language": "C++",
+    "stars": 0,
+    "description": "Molecular dynamics simulation in C++ using OOP",
+    "pushed_at": "2026-10-27T16:11:18Z",
+    "source": "search"
+  },
+  {
+    "full_name": "belalsh45/AlphaFold-assisted-MD-analysis",
+    "url": "https://github.com/belalsh45/AlphaFold-assisted-MD-analysis",
+    "language": "",
+    "stars": 0,
+    "description": "Exploratory protein–ligand molecular dynamics analysis using an established simulation workflow, including RMSD, RMSF, radius of gyration, and residue contact occupancy.",
+    "pushed_at": "2026-10-27T14:20:48Z",
+    "source": "search"
+  },
+  {
+    "full_name": "LiberoP/LCPB_2026",
+    "url": "https://github.com/LiberoP/LCPB_2026",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "Coursework for Laboratory of Computational Physics B (UniPD, Physics of Data): boosted models paper, MACE molecular dynamics project, ML/NN exercises.",
+    "pushed_at": "2026-10-27T14:17:56Z",
+    "source": "search"
+  },
+  {
+    "full_name": "usnistgov/LNA",
+    "url": "https://github.com/usnistgov/LNA",
+    "language": "",
+    "stars": 0,
+    "description": "A repository for the data in article: Which DNA Force Field and Method Gets Energetics Right? Benchmarking Oligonucleotide Hybridization Enthalpies by Molecular Dynamics",
+    "pushed_at": "2026-10-27T13:46:47Z",
+    "source": "search"
+  },
+  {
+    "full_name": "willowyololyx/willowyololyx",
+    "url": "https://github.com/willowyololyx/willowyololyx",
+    "language": "",
+    "stars": 0,
+    "description": "M.Eng. student at Tianjin University | Molecular dynamics & solid–liquid interfaces | Exploring AI for Science",
+    "pushed_at": "2026-10-27T13:20:35Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Al3xBarbe/A_5-Molecular_dynamics",
+    "url": "https://github.com/Al3xBarbe/A_5-Molecular_dynamics",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T12:46:06Z",
+    "source": "search"
+  },
+  {
+    "full_name": "DEEPTHIVM/MD-simulation-OpenMM",
+    "url": "https://github.com/DEEPTHIVM/MD-simulation-OpenMM",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "Molecular dynamics simulation using OpenMM in Colab",
+    "pushed_at": "2026-10-27T10:44:49Z",
+    "source": "search"
+  },
+  {
+    "full_name": "estebancea/lysozyme_stability",
+    "url": "https://github.com/estebancea/lysozyme_stability",
+    "language": "Shell",
+    "stars": 0,
+    "description": "Molecular dynamics input files (GROMACS, CHARMM36m) for hen egg-white lysozyme in osmolyte-based deep eutectic solvents: force-field parameters, structures, .mdp files and an example workflow. Accompanies the paper “Stable but silent: osmolyte-based deep eutectic solvents rigidify lysozyme without dehydrating its active site”",
+    "pushed_at": "2026-10-27T10:02:52Z",
+    "source": "search"
+  },
+  {
+    "full_name": "henriasv/fys2160_simple_md",
+    "url": "https://github.com/henriasv/fys2160_simple_md",
+    "language": "Python",
+    "stars": 0,
+    "description": "Simple molecular dynamics for FYS2160: native C engine, Python systems, notebooks and trajectory playback",
+    "pushed_at": "2026-10-27T08:19:09Z",
+    "source": "search"
+  },
+  {
+    "full_name": "MMLabCodes/iPHAsimulator",
+    "url": "https://github.com/MMLabCodes/iPHAsimulator",
+    "language": "Python",
+    "stars": 0,
+    "description": "Computational platform for PHA polymer structure generation, stereochemistry validation, force-field parameterisation, and molecular dynamics simulations",
+    "pushed_at": "2026-10-27T08:17:34Z",
+    "source": "search"
+  },
+  {
+    "full_name": "VoltLabs-Research/CoreToolkit",
+    "url": "https://github.com/VoltLabs-Research/CoreToolkit",
+    "language": "C++",
+    "stars": 0,
+    "description": "Core C++ library providing math primitives (Vector3, Matrix3, Quaternion), spatial data structures (KD-trees, octrees), simulation cell handling, and parallel algorithms for molecular dynamics analysis. Foundation for all VOLT packages.",
+    "pushed_at": "2026-10-27T06:48:13Z",
+    "source": "search"
+  },
+  {
+    "full_name": "alexmplastow/HMMM_library",
+    "url": "https://github.com/alexmplastow/HMMM_library",
+    "language": "Python",
+    "stars": 0,
+    "description": "A set of objects I've found handy for analyzing HMMM (Highly Mobile Membrane-Mimetic) molecular dynamics simulations",
+    "pushed_at": "2026-10-27T02:34:41Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Sidrah-H/The-Bio-BERT-Protein-Language-Model-PLM-Featurizer",
+    "url": "https://github.com/Sidrah-H/The-Bio-BERT-Protein-Language-Model-PLM-Featurizer",
+    "language": "Python",
+    "stars": 0,
+    "description": "A bioinformatics pipeline and Jupyter Notebook for extracting residue and sequence-level protein embeddings using ESM-2 / Bio-BERT transformer models, featuring automated UniProt/PDB data fetching, RDKit novelty filtering, and pharmacokinetic profiling.",
+    "pushed_at": "2026-10-27T19:46:06Z",
+    "source": "search"
+  },
+  {
+    "full_name": "platforma-open/sequence-embeddings",
+    "url": "https://github.com/platforma-open/sequence-embeddings",
+    "language": "Python",
+    "stars": 0,
+    "description": "Compute learned per-sequence vector representations for peptide and antibody/TCR datasets. Runs protein language models over your dataset so you can compare, cluster, and map a repertoire by learned similarity",
+    "pushed_at": "2026-10-27T15:14:30Z",
+    "source": "search"
+  },
+  {
+    "full_name": "AreebJan/Autoregressive-Protein-Language-Model",
+    "url": "https://github.com/AreebJan/Autoregressive-Protein-Language-Model",
+    "language": "",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T14:35:44Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Zahra-Alavi/ESMfluc",
+    "url": "https://github.com/Zahra-Alavi/ESMfluc",
+    "language": "Python",
+    "stars": 0,
+    "description": "Protein language-model prediction of Protein Block variability, with exact per-residue contribution analysis",
+    "pushed_at": "2026-10-27T16:16:09Z",
+    "source": "search"
+  },
+  {
+    "full_name": "LixinhaoYang/Protein-design-evaluation",
+    "url": "https://github.com/LixinhaoYang/Protein-design-evaluation",
+    "language": "Python",
+    "stars": 0,
+    "description": "Protein design evaluation through sequence screening, Rosetta scoring, and AlphaFold3 recovery analysis, with experimental MD setup tools.",
+    "pushed_at": "2026-10-27T22:59:01Z",
+    "source": "search"
+  },
+  {
+    "full_name": "paulruijgrok/prodesy",
+    "url": "https://github.com/paulruijgrok/prodesy",
+    "language": "Python",
+    "stars": 0,
+    "description": "Knowledge base of protein design",
+    "pushed_at": "2026-10-27T22:12:41Z",
+    "source": "search"
+  },
+  {
+    "full_name": "ALdqvt/PD-Cookbook",
+    "url": "https://github.com/ALdqvt/PD-Cookbook",
+    "language": "Python",
+    "stars": 0,
+    "description": "Protein Design Cookbook with snippets, python- and bash scripts for easier handling between models, files and scores.",
+    "pushed_at": "2026-10-27T16:12:52Z",
+    "source": "search"
+  },
+  {
+    "full_name": "leowan7/llm-proteinDesigner",
+    "url": "https://github.com/leowan7/llm-proteinDesigner",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T15:47:14Z",
+    "source": "search"
+  },
+  {
+    "full_name": "RPDGroup/.github",
+    "url": "https://github.com/RPDGroup/.github",
+    "language": "",
+    "stars": 0,
+    "description": "Public organization profile for Ren Protein Design Group",
+    "pushed_at": "2026-10-27T11:01:59Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Wriju-Mitra/ProteinDesign",
+    "url": "https://github.com/Wriju-Mitra/ProteinDesign",
+    "language": "Python",
+    "stars": 0,
+    "description": "Chroma scripts ",
+    "pushed_at": "2026-10-27T03:23:46Z",
+    "source": "search"
+  },
+  {
+    "full_name": "hongsong-wang/Protein_Design",
+    "url": "https://github.com/hongsong-wang/Protein_Design",
+    "language": "HTML",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T00:55:38Z",
+    "source": "search"
+  },
+  {
+    "full_name": "ItunuAjiboye/Tutorial_Host_Pathogen_Protein_Protein_Interaction_Prediction",
+    "url": "https://github.com/ItunuAjiboye/Tutorial_Host_Pathogen_Protein_Protein_Interaction_Prediction",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "A step-by-step, easy-to-follow tutorial for machine-learning–based host–pathogen protein–protein interaction prediction.",
+    "pushed_at": "2026-10-27T22:06:25Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Nithinkumarseeloju/CPI",
+    "url": "https://github.com/Nithinkumarseeloju/CPI",
+    "language": "",
+    "stars": 0,
+    "description": "The Attention-Based Compound–Protein Interaction (CPI) Prediction for Drug Discovery project focuses on developing a deep learning model that predicts whether a chemical compound (drug molecule) can effectively interact with a target protein. ",
+    "pushed_at": "2026-10-27T05:08:37Z",
+    "source": "search"
+  },
+  {
+    "full_name": "BioJazz-Lab/BioJazz_tools",
+    "url": "https://github.com/BioJazz-Lab/BioJazz_tools",
+    "language": "",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T19:33:11Z",
+    "source": "search"
+  },
+  {
+    "full_name": "engineer-work/engineer-work",
+    "url": "https://github.com/engineer-work/engineer-work",
+    "language": "",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T15:20:57Z",
+    "source": "search"
+  },
+  {
+    "full_name": "zoidpuff/pocket-detect-agents",
+    "url": "https://github.com/zoidpuff/pocket-detect-agents",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T14:40:58Z",
+    "source": "search"
+  },
+  {
+    "full_name": "zhanxw/Literature",
+    "url": "https://github.com/zhanxw/Literature",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T14:17:52Z",
+    "source": "search"
+  },
+  {
+    "full_name": "abdallahyassein-dev/ai-papers-explained",
+    "url": "https://github.com/abdallahyassein-dev/ai-papers-explained",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T11:15:20Z",
+    "source": "search"
+  },
+  {
+    "full_name": "wtbxsjy/my_skills",
+    "url": "https://github.com/wtbxsjy/my_skills",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T09:54:05Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Sifato5/DeepNABind-MM",
+    "url": "https://github.com/Sifato5/DeepNABind-MM",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T08:49:03Z",
+    "source": "search"
+  },
+  {
+    "full_name": "francisfa/AI-Drug-Discovery-Learning",
+    "url": "https://github.com/francisfa/AI-Drug-Discovery-Learning",
+    "language": "",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T08:01:38Z",
+    "source": "search"
+  },
+  {
+    "full_name": "sudhishgupta/FUN-FoldUNet",
+    "url": "https://github.com/sudhishgupta/FUN-FoldUNet",
+    "language": "Python",
+    "stars": 0,
+    "description": "FUN is a deep learning based framework which is built for unconditional generation of protein/peptide backbones",
+    "pushed_at": "2026-10-27T06:54:37Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Vishu1197/Vishu1197",
+    "url": "https://github.com/Vishu1197/Vishu1197",
+    "language": "",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T19:53:19Z",
+    "source": "search"
+  },
+  {
+    "full_name": "jiyashinde56-commits/Drug-bioinfometrics_project",
+    "url": "https://github.com/jiyashinde56-commits/Drug-bioinfometrics_project",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T17:57:44Z",
+    "source": "search"
+  },
+  {
+    "full_name": "suta09/teacher_scraper",
+    "url": "https://github.com/suta09/teacher_scraper",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T00:06:16Z",
+    "source": "search"
+  },
+  {
+    "full_name": "zoidpuff/burrow",
+    "url": "https://github.com/zoidpuff/burrow",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T17:28:25Z",
+    "source": "search"
+  },
+  {
+    "full_name": "TingBai1028/Literature-review-agent",
+    "url": "https://github.com/TingBai1028/Literature-review-agent",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T19:28:25Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Yu-Lab-Genomics/HemeAtlas_code",
+    "url": "https://github.com/Yu-Lab-Genomics/HemeAtlas_code",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "For HemeAtlas paper",
+    "pushed_at": "2026-10-27T07:18:44Z",
+    "source": "search"
+  },
+  {
+    "full_name": "HxLord/ai-petase-optimizer",
+    "url": "https://github.com/HxLord/ai-petase-optimizer",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T13:50:16Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Arnab28122000/talindrew-mcp",
+    "url": "https://github.com/Arnab28122000/talindrew-mcp",
+    "language": "",
+    "stars": 0,
+    "description": "Talindrew MCP server: 90 molecular biology tools (plasmid maps, digests, primers, CRISPR, cloning, PubMed) for Claude, ChatGPT, Codex and Cursor",
+    "pushed_at": "2026-10-27T22:14:52Z",
+    "source": "search"
+  },
+  {
+    "full_name": "jakob-steuer/splisoforms",
+    "url": "https://github.com/jakob-steuer/splisoforms",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T16:16:23Z",
+    "source": "search"
+  },
+  {
+    "full_name": "rohit-ravi2/substrate-anatomy",
+    "url": "https://github.com/rohit-ravi2/substrate-anatomy",
+    "language": "Python",
+    "stars": 0,
+    "description": "Interactive 3D anatomy of a 300-cell C. elegans Brian2 model, generated from the model code with the integration status of every component.",
+    "pushed_at": "2026-10-27T15:31:54Z",
+    "source": "search"
+  },
+  {
+    "full_name": "intelyoungway/xfold_shenggan",
+    "url": "https://github.com/intelyoungway/xfold_shenggan",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T15:03:21Z",
+    "source": "search"
+  },
+  {
+    "full_name": "raygeelisondra-ship-it/Muscle-Contractility-GENE",
+    "url": "https://github.com/raygeelisondra-ship-it/Muscle-Contractility-GENE",
+    "language": "R",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T14:13:05Z",
+    "source": "search"
+  },
+  {
+    "full_name": "guillaumerosin/alphafold",
+    "url": "https://github.com/guillaumerosin/alphafold",
+    "language": "TeX",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T13:29:36Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Thanh-Ly66235/phys7440-week07-ly",
+    "url": "https://github.com/Thanh-Ly66235/phys7440-week07-ly",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T05:43:15Z",
+    "source": "search"
+  },
+  {
+    "full_name": "kapombe-k/Biostat",
+    "url": "https://github.com/kapombe-k/Biostat",
+    "language": "Go",
+    "stars": 0,
+    "description": "A demo repo for the biostat concept",
+    "pushed_at": "2026-10-27T04:43:45Z",
+    "source": "search"
+  },
+  {
+    "full_name": "sourish69/CCIC_MLIP-",
+    "url": "https://github.com/sourish69/CCIC_MLIP-",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T18:33:45Z",
+    "source": "search"
+  },
+  {
+    "full_name": "ivanqkk/ivanqkk.github.io",
+    "url": "https://github.com/ivanqkk/ivanqkk.github.io",
+    "language": "HTML",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T16:22:39Z",
+    "source": "search"
+  },
+  {
+    "full_name": "ShamsElham422/Refrences",
+    "url": "https://github.com/ShamsElham422/Refrences",
+    "language": "",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T15:49:35Z",
+    "source": "search"
+  },
+  {
+    "full_name": "sd3ph/sd3ph.github.io",
+    "url": "https://github.com/sd3ph/sd3ph.github.io",
+    "language": "HTML",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T08:16:55Z",
+    "source": "search"
+  },
+  {
+    "full_name": "oussamaazaroual79-dot/plt-thin-films-mlip",
+    "url": "https://github.com/oussamaazaroual79-dot/plt-thin-films-mlip",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T23:31:29Z",
+    "source": "search"
+  },
+  {
+    "full_name": "ProfessorDong/mehf-ligand-ensembles",
+    "url": "https://github.com/ProfessorDong/mehf-ligand-ensembles",
+    "language": "Python",
+    "stars": 0,
+    "description": "Ligand conformational ensembles by flow matching with stiffness-aware noise: code, checkpoints and pre-registered result record",
+    "pushed_at": "2026-10-27T20:34:21Z",
+    "source": "search"
+  },
+  {
+    "full_name": "ankitmathanker/ankitmathanker",
+    "url": "https://github.com/ankitmathanker/ankitmathanker",
+    "language": "",
+    "stars": 0,
+    "description": "Personal Page",
+    "pushed_at": "2026-10-27T18:59:47Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Eswar-mse/Eswar-mse",
+    "url": "https://github.com/Eswar-mse/Eswar-mse",
+    "language": "",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T18:26:53Z",
+    "source": "search"
+  },
+  {
+    "full_name": "abdsim/Li3OClBr-MACE-Active-Learning-MLIP",
+    "url": "https://github.com/abdsim/Li3OClBr-MACE-Active-Learning-MLIP",
+    "language": "Python",
+    "stars": 0,
+    "description": "Datasets and workflows for the paper “Machine-Learning-Potential-Driven Volcano Relationship in Grain Boundary Amorphicity and Ionic Transport of Antiperovskite Solid Electrolytes\"",
+    "pushed_at": "2026-10-27T17:56:20Z",
+    "source": "search"
+  },
+  {
+    "full_name": "haddocking/molmod-education",
+    "url": "https://github.com/haddocking/molmod-education",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T16:17:49Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Jeppe-thybo/Computational-Physics",
+    "url": "https://github.com/Jeppe-thybo/Computational-Physics",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "Work and notebooks from  the course, Computational Physics, completed in the fall of 2024 during my Masters in Physics. ",
+    "pushed_at": "2026-10-27T09:58:20Z",
+    "source": "search"
+  },
+  {
+    "full_name": "zeyizhang-berkeley/homepage",
+    "url": "https://github.com/zeyizhang-berkeley/homepage",
+    "language": "Python",
+    "stars": 0,
+    "description": "Zeyi Zhang's academic homepage — quantum chemistry, electronic structure, and AI for science.",
+    "pushed_at": "2026-10-27T08:07:00Z",
+    "source": "search"
+  },
+  {
+    "full_name": "zenggs05/zenggs05",
+    "url": "https://github.com/zenggs05/zenggs05",
+    "language": "",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T02:24:42Z",
+    "source": "search"
+  },
+  {
+    "full_name": "dmeklund/learnanything",
+    "url": "https://github.com/dmeklund/learnanything",
+    "language": "HTML",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T02:05:59Z",
+    "source": "search"
+  },
+  {
+    "full_name": "dominicvarghese/polymer-property-prediction",
+    "url": "https://github.com/dominicvarghese/polymer-property-prediction",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T19:25:23Z",
+    "source": "search"
+  },
+  {
+    "full_name": "UW-Madison-CBML/SPINET",
+    "url": "https://github.com/UW-Madison-CBML/SPINET",
+    "language": "Python",
+    "stars": 0,
+    "description": "Sheaf neural network for protein inverse folding",
+    "pushed_at": "2026-10-27T16:38:39Z",
+    "source": "search"
+  },
+  {
+    "full_name": "nanogchen/nanogchen",
+    "url": "https://github.com/nanogchen/nanogchen",
+    "language": "",
+    "stars": 0,
+    "description": "Config files for my GitHub profile.",
+    "pushed_at": "2026-10-27T16:27:46Z",
+    "source": "search"
+  },
+  {
+    "full_name": "jonatas/teaflon",
+    "url": "https://github.com/jonatas/teaflon",
+    "language": "Python",
+    "stars": 0,
+    "description": "Aspiring to design a protein that breaks down the teflon into bio ceramic.",
+    "pushed_at": "2026-10-27T23:53:12Z",
+    "source": "search"
+  },
+  {
+    "full_name": "NUSstronger/DFCA",
+    "url": "https://github.com/NUSstronger/DFCA",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T10:06:49Z",
+    "source": "search"
+  },
+  {
+    "full_name": "BackofenLab/De-novo-design-of-antibacterial-cell-penetrating-peptides-using-structure-aware-generative-modelling",
+    "url": "https://github.com/BackofenLab/De-novo-design-of-antibacterial-cell-penetrating-peptides-using-structure-aware-generative-modelling",
+    "language": "Python",
+    "stars": 0,
+    "description": "model to design cell penetrating proteins",
+    "pushed_at": "2026-10-27T15:15:09Z",
+    "source": "search"
+  },
+  {
+    "full_name": "brineylab/toolshed-dev",
+    "url": "https://github.com/brineylab/toolshed-dev",
+    "language": "Python",
+    "stars": 0,
+    "description": "Scratch shed for flyloft's tier two: the toolshed's workflow, not a place for real tools",
+    "pushed_at": "2026-10-27T21:11:25Z",
+    "source": "search"
+  },
+  {
+    "full_name": "brineylab/toolshed",
+    "url": "https://github.com/brineylab/toolshed",
+    "language": "Python",
+    "stars": 0,
+    "description": "The lab's toolshed: published models and pipelines as self-contained container images, with a skill per tool",
+    "pushed_at": "2026-10-27T21:11:11Z",
+    "source": "search"
+  },
+  {
+    "full_name": "cynthia-wen/disordered-materials-fe-al-alloy",
+    "url": "https://github.com/cynthia-wen/disordered-materials-fe-al-alloy",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "Workflow for modeling local disorder in a Fe–20 at.% Al single crystal",
+    "pushed_at": "2026-10-27T03:31:24Z",
+    "source": "search"
+  },
+  {
+    "full_name": "sunghunbae/mdworks",
+    "url": "https://github.com/sunghunbae/mdworks",
+    "language": "Python",
+    "stars": 0,
+    "description": "MD toolbox",
+    "pushed_at": "2026-10-27T20:39:21Z",
+    "source": "search"
+  },
+  {
+    "full_name": "cidoimo/Zn-MCPB-MD-tutorial",
+    "url": "https://github.com/cidoimo/Zn-MCPB-MD-tutorial",
+    "language": "Python",
+    "stars": 0,
+    "description": "MCPB.py bonded Zn sites with ORCA/PySCF, Mg 12-6-4 and GaMD (pmemd.cuda) – config-driven pipeline.",
+    "pushed_at": "2026-10-27T16:29:17Z",
+    "source": "search"
+  },
+  {
+    "full_name": "denizirban/incognita",
+    "url": "https://github.com/denizirban/incognita",
+    "language": "HTML",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T06:45:27Z",
+    "source": "search"
+  },
+  {
+    "full_name": "jonatas/amazonzyme_poc",
+    "url": "https://github.com/jonatas/amazonzyme_poc",
+    "language": "Python",
+    "stars": 0,
+    "description": "In-silico enzyme bioprospecting, 3D Z-order active-site indexing, LC-MS/MS proteomics & 3D globular discovery swarm powered by PostgreSQL + pg_bio for AmazonZyme (UFAM)",
+    "pushed_at": "2026-10-27T04:37:06Z",
+    "source": "search"
+  },
+  {
+    "full_name": "nboyd/jrfd4-proteina",
+    "url": "https://github.com/nboyd/jrfd4-proteina",
+    "language": "Python",
+    "stars": 0,
+    "description": "JAX/Equinox port of RFD4-Proteina inference (flow network, sampler, AE decoder)",
+    "pushed_at": "2026-10-27T16:50:19Z",
+    "source": "search"
+  },
+  {
+    "full_name": "donRumata03/donRumata03.github.io",
+    "url": "https://github.com/donRumata03/donRumata03.github.io",
+    "language": "HTML",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T13:09:28Z",
+    "source": "search"
+  },
+  {
+    "full_name": "analeonescu/awesome-chemical-safety",
+    "url": "https://github.com/analeonescu/awesome-chemical-safety",
+    "language": "",
+    "stars": 0,
+    "description": "A curated collection of open resources for chemical security, dual-use chemistry, chemical risk, and chemical safety.",
+    "pushed_at": "2026-10-27T14:44:38Z",
+    "source": "search"
+  },
+  {
+    "full_name": "IshrakHamim/Bioinformatica",
+    "url": "https://github.com/IshrakHamim/Bioinformatica",
+    "language": "TypeScript",
+    "stars": 0,
+    "description": "Interactive, gamified bioinformatics study site: algorithms you can play with, quizzes, flashcards, knowledge graph, exam prep and AlphaFold-era frontiers",
+    "pushed_at": "2026-10-27T13:12:46Z",
+    "source": "search"
+  },
+  {
+    "full_name": "yangcao2311/BioSafety_neurips2026",
+    "url": "https://github.com/yangcao2311/BioSafety_neurips2026",
+    "language": "Python",
+    "stars": 0,
+    "description": "Archival code release for BioSafetyBench: Agentic Cascade Evaluation for the Bio-AI Ecosystem (NeurIPS 2026). Submission snapshot plus rebuttal-period additions.",
+    "pushed_at": "2026-10-27T02:19:53Z",
+    "source": "search"
+  },
+  {
+    "full_name": "eulaliobqi/design-inibidores",
+    "url": "https://github.com/eulaliobqi/design-inibidores",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T01:17:27Z",
+    "source": "search"
+  },
+  {
+    "full_name": "stardust-452/portfolio",
+    "url": "https://github.com/stardust-452/portfolio",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "A portfolio of Nupur Upadhyay, a BS-MS student at IISER Thiruvananthapuram, Kerala, India.",
+    "pushed_at": "2026-10-27T13:15:44Z",
+    "source": "search"
+  },
+  {
+    "full_name": "aftab3866/aftab3866.github.io",
+    "url": "https://github.com/aftab3866/aftab3866.github.io",
+    "language": "JavaScript",
+    "stars": 0,
+    "description": "Dr. Aftab’s Personal Website & Professional Portfolio",
+    "pushed_at": "2026-10-27T09:46:22Z",
+    "source": "search"
+  },
+  {
+    "full_name": "safarafique/GExPipe",
+    "url": "https://github.com/safarafique/GExPipe",
+    "language": "R",
+    "stars": 0,
+    "description": "Gene Expression Pipeline",
+    "pushed_at": "2026-10-27T23:48:56Z",
+    "source": "search"
+  },
+  {
+    "full_name": "mderakh3/ml_uc_anti-tnf",
+    "url": "https://github.com/mderakh3/ml_uc_anti-tnf",
+    "language": "R",
+    "stars": 0,
+    "description": "R code for our Heliyon 2023 study predicting anti-TNF therapy failure in ulcerative colitis using a five-mRNA panel and ensemble machine learning.",
+    "pushed_at": "2026-10-27T02:41:12Z",
+    "source": "search"
+  },
+  {
+    "full_name": "ashishmeshram229/GNN-IMPLEMENTATION-EXPERIMENTATION",
+    "url": "https://github.com/ashishmeshram229/GNN-IMPLEMENTATION-EXPERIMENTATION",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T06:13:52Z",
+    "source": "search"
+  },
+  {
+    "full_name": "setiawantirta/MARLIN",
+    "url": "https://github.com/setiawantirta/MARLIN",
+    "language": "Python",
+    "stars": 0,
+    "description": "Marine AI for Glioma Network-based screening",
+    "pushed_at": "2026-10-27T04:07:47Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Maverick0708/shivporfolio",
+    "url": "https://github.com/Maverick0708/shivporfolio",
+    "language": "",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T16:43:24Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Biodyn-AI/topology-biomechinterp1",
+    "url": "https://github.com/Biodyn-AI/topology-biomechinterp1",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T09:34:17Z",
+    "source": "search"
+  },
+  {
+    "full_name": "zhaoxiaoha/github-trending",
+    "url": "https://github.com/zhaoxiaoha/github-trending",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T07:11:15Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Girikumaresan007/Nutri",
+    "url": "https://github.com/Girikumaresan007/Nutri",
+    "language": "TypeScript",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T06:32:05Z",
+    "source": "search"
+  },
+  {
+    "full_name": "krishnagaikwad99/AI-based-water-born-disease-prediction",
+    "url": "https://github.com/krishnagaikwad99/AI-based-water-born-disease-prediction",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T06:25:13Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Jaya-devi/StudyMentor-AI",
+    "url": "https://github.com/Jaya-devi/StudyMentor-AI",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T16:41:52Z",
+    "source": "search"
+  },
+  {
+    "full_name": "zhanglizi971-crypto/public-apis",
+    "url": "https://github.com/zhanglizi971-crypto/public-apis",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T12:57:26Z",
+    "source": "search"
+  },
+  {
+    "full_name": "harshilsiddharth27/molecular-solubility-predictor",
+    "url": "https://github.com/harshilsiddharth27/molecular-solubility-predictor",
+    "language": "TypeScript",
+    "stars": 0,
+    "description": "n",
+    "pushed_at": "2026-10-27T08:33:44Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Rashid-imam/Applied_AI_ML_Capstone",
+    "url": "https://github.com/Rashid-imam/Applied_AI_ML_Capstone",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "End-to-End House Price Prediction using Machine Learning, Ensemble Models, and LLM-based Prediction Explanation with OpenRouter API.",
+    "pushed_at": "2026-10-27T07:16:56Z",
+    "source": "search"
+  },
+  {
+    "full_name": "MuzraFatima/Prediction-to-Smartphone-Addiction",
+    "url": "https://github.com/MuzraFatima/Prediction-to-Smartphone-Addiction",
+    "language": "JavaScript",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T07:35:50Z",
+    "source": "search"
+  },
+  {
+    "full_name": "uc-derisilab/pairis",
+    "url": "https://github.com/uc-derisilab/pairis",
+    "language": "Python",
+    "stars": 0,
+    "description": "PAIRIS, a pipeline for the Prediction of Antibody-Antigen Interactions at High Resolution In Silico",
+    "pushed_at": "2026-10-27T18:44:43Z",
+    "source": "search"
+  },
+  {
+    "full_name": "eightmm/FoldJAX",
+    "url": "https://github.com/eightmm/FoldJAX",
+    "language": "Python",
+    "stars": 0,
+    "description": "",
+    "pushed_at": "2026-10-27T20:56:28Z",
+    "source": "search"
+  },
+  {
+    "full_name": "ComputationTime/MANGO-pipeline",
+    "url": "https://github.com/ComputationTime/MANGO-pipeline",
+    "language": "Python",
+    "stars": 0,
+    "description": "Snakemake pipeline for antigen-conditioned heavy-chain generation with modular antigen embedders",
+    "pushed_at": "2026-10-27T17:45:22Z",
+    "source": "search"
+  },
+  {
+    "full_name": "grigorovich-sergey/WISER_Challenge_2026",
+    "url": "https://github.com/grigorovich-sergey/WISER_Challenge_2026",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "WISER-Moderna Challenge for WISER Summer School 2026",
+    "pushed_at": "2026-10-27T16:57:23Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Denver-A7/churn-llm-comparison",
+    "url": "https://github.com/Denver-A7/churn-llm-comparison",
+    "language": "Jupyter Notebook",
+    "stars": 0,
+    "description": "Comparing a trained churn model with Claude Haiku on the Telco churn dataset, with a review of the AI's stated reasons.",
+    "pushed_at": "2026-10-27T07:29:30Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Chris-Hamid/Bio-IDE",
+    "url": "https://github.com/Chris-Hamid/Bio-IDE",
+    "language": "TypeScript",
+    "stars": 0,
+    "description": "Open-source Biological IDE - for DNA/RNA (React + Python + Biopython)",
+    "pushed_at": "2026-10-27T21:12:27Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Zhuoyang-Ye/alphafold3-interactive-UI",
+    "url": "https://github.com/Zhuoyang-Ye/alphafold3-interactive-UI",
+    "language": "Python",
+    "stars": 0,
+    "description": "AlphaFold 3 with macOS (Apple Silicon) run scripts and a local interaction explorer",
+    "pushed_at": "2026-10-27T20:43:19Z",
+    "source": "search"
+  },
+  {
+    "full_name": "malihakhan1512/PhyloLoom-AI",
+    "url": "https://github.com/malihakhan1512/PhyloLoom-AI",
+    "language": "Python",
+    "stars": 0,
+    "description": "PhyloLoom AI, an agentic computational genomics workspace that processes raw FASTA sequences to evaluate zero-shot mutation impacts and reconstruct phylogenetic trees using Meta's open-weights biological models.",
+    "pushed_at": "2026-10-27T13:16:40Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Wanyingbear/local_magnitude_algorithm",
+    "url": "https://github.com/Wanyingbear/local_magnitude_algorithm",
+    "language": "Python",
+    "stars": 0,
+    "description": "Global/local C-alpha weighting and B-factor prediction experiments",
+    "pushed_at": "2026-10-27T04:35:19Z",
+    "source": "search"
+  },
+  {
+    "full_name": "evanyoung1022-oss/Bio-Python-sequence-alignment",
+    "url": "https://github.com/evanyoung1022-oss/Bio-Python-sequence-alignment",
+    "language": "Python",
+    "stars": 0,
+    "description": "Interactive Streamlit app that compares a protein across species with Biopython: NCBI retrieval, FAMSA alignment, conservation scores, evolutionary trees and 3D structures colored by conservation.",
+    "pushed_at": "2026-10-27T19:17:35Z",
+    "source": "search"
+  },
+  {
+    "full_name": "joecampdb/pronerv_MTNerv",
+    "url": "https://github.com/joecampdb/pronerv_MTNerv",
+    "language": "Python",
+    "stars": 0,
+    "description": "MD-derived molecular landscapes and categorical nerves for alanine dipeptide and chignolin CLN025; illustrated paper by Joseph Campagna, PSM.",
+    "pushed_at": "2026-10-27T18:44:28Z",
+    "source": "search"
+  },
+  {
+    "full_name": "ZengLLQ/molecul-lab",
+    "url": "https://github.com/ZengLLQ/molecul-lab",
+    "language": "Julia",
+    "stars": 0,
+    "description": "Desktop computational chemistry workbench in Julia: 3D molecular modeling, Lennard-Jones geometry optimization, Velocity-Verlet MD, and reproducible experiments.",
+    "pushed_at": "2026-10-27T13:49:41Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Tsumura-m/PySCIVR",
+    "url": "https://github.com/Tsumura-m/PySCIVR",
+    "language": "Python",
+    "stars": 0,
+    "description": "Python package for on-the-fly semiclassical (Herman–Kluk / SC-IVR) wavepacket dynamics and vibrational spectra in curvilinear coordinates",
+    "pushed_at": "2026-10-27T05:59:15Z",
+    "source": "search"
+  },
+  {
+    "full_name": "Tran-ky-thanh/hENT3-pH-dcor",
+    "url": "https://github.com/Tran-ky-thanh/hENT3-pH-dcor",
+    "language": "Python",
+    "stars": 0,
+    "description": "Alignment-independent distance correlation (dCor) analysis for pH-dependent activation of hENT3 (Tran & Lin, Biophys. J. 2026)",
+    "pushed_at": "2026-10-27T04:04:17Z",
+    "source": "search"
+  }
+]
