@@ -1,0 +1,5 @@
+Fetching events for target(s): alexholehouse, Junjie-Zhu, Zuricho...
+
+2026-11-02 08:14:58 | 🐛 universe2explorer opened issue in google-deepmind/formal-conjectures: 'Erdős 329 `converse_implication` reversed into a vacuous statement in the conjectures.io pin (upstream main is correct)'
+2026-11-02 08:14:16 | 💬 kowen9024AI created issue 'Add BB(6) stack, odometer, and transducer reductions and 20 open accelerations' in google-deepmind/cryptids
+2026-11-02 08:11:52 | ⭐️ guog starred google-deepmind/mujoco

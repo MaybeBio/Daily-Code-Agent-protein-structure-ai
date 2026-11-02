@@ -1,0 +1,136 @@
+[
+  {
+    "full_name": "google-deepmind/mujoco",
+    "who": [
+      "guog"
+    ],
+    "event": "star",
+    "stars": 16022,
+    "language": "C++",
+    "description": "Multi-Joint dynamics with Contact. A general purpose physics simulator.",
+    "url": "https://github.com/google-deepmind/mujoco"
+  },
+  {
+    "full_name": "google-deepmind/formal-conjectures",
+    "who": [
+      "universe2explorer"
+    ],
+    "event": "issue",
+    "stars": 1341,
+    "language": "Lean",
+    "description": "A collection of formalized statements of conjectures in Lean.",
+    "url": "https://github.com/google-deepmind/formal-conjectures"
+  },
+  {
+    "full_name": "steineggerlab/foldseek",
+    "who": [
+      "julianzaugg"
+    ],
+    "event": "star",
+    "stars": 1324,
+    "language": "C",
+    "description": "Foldseek enables fast and sensitive comparisons of large structure sets.",
+    "url": "https://github.com/steineggerlab/foldseek"
+  },
+  {
+    "full_name": "HannesStark/boltzgen",
+    "who": [
+      "HannesStark"
+    ],
+    "event": "mixed",
+    "stars": 1093,
+    "language": "Python",
+    "description": "BoltzGen: Toward Universal Binder Design",
+    "url": "https://github.com/HannesStark/boltzgen"
+  },
+  {
+    "full_name": "steineggerlab/folddisco",
+    "who": [
+      "NatureGeorge"
+    ],
+    "event": "star",
+    "stars": 222,
+    "language": "Rust",
+    "description": "Fast indexing and search of discontinuous motifs in protein structures",
+    "url": "https://github.com/steineggerlab/folddisco"
+  },
+  {
+    "full_name": "google-deepmind/cryptids",
+    "who": [
+      "kowen9024AI"
+    ],
+    "event": "issue",
+    "stars": 70,
+    "language": "Lean",
+    "description": "Some Cryptids and Lean proofs",
+    "url": "https://github.com/google-deepmind/cryptids"
+  },
+  {
+    "full_name": "THGLab/IDPForge",
+    "who": [
+      "philipptrepte",
+      "truong128",
+      "ts387"
+    ],
+    "event": "mixed",
+    "stars": 19,
+    "language": "Python",
+    "description": "Disordered protein ensemble prediction",
+    "url": "https://github.com/THGLab/IDPForge"
+  },
+  {
+    "full_name": "asapdiscovery/asapdiscovery.github.io",
+    "who": [
+      "jchodera"
+    ],
+    "event": "pr",
+    "stars": 4,
+    "language": "HTML",
+    "description": "",
+    "url": "https://github.com/asapdiscovery/asapdiscovery.github.io"
+  },
+  {
+    "full_name": "jiaxianyan/BioDataLab",
+    "who": [
+      "QizhiPei"
+    ],
+    "event": "star",
+    "stars": 4,
+    "language": "Python",
+    "description": "Benchmarking LLM Agents on Real-World Biological Database Curation for Data-Driven Scientific Discovery",
+    "url": "https://github.com/jiaxianyan/BioDataLab"
+  },
+  {
+    "full_name": "steineggerlab/foldmason-analysis",
+    "who": [
+      "filipetessaro"
+    ],
+    "event": "mixed",
+    "stars": 4,
+    "language": "R",
+    "description": "",
+    "url": "https://github.com/steineggerlab/foldmason-analysis"
+  },
+  {
+    "full_name": "CladeTeam/TurboComplex-Website",
+    "who": [
+      "terry-r123"
+    ],
+    "event": "star",
+    "stars": 1,
+    "language": "JavaScript",
+    "description": "Project website for TurboComplex: a unified accelerator for biomolecular complex prediction",
+    "url": "https://github.com/CladeTeam/TurboComplex-Website"
+  },
+  {
+    "full_name": "CladeTeam/PolyQ",
+    "who": [
+      "terry-r123"
+    ],
+    "event": "star",
+    "stars": 1,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/CladeTeam/PolyQ"
+  }
+]
