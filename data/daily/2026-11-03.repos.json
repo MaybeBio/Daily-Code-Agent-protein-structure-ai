@@ -1,0 +1,419 @@
+[
+  {
+    "full_name": "anomalyco/opencode",
+    "who": [
+      "code4luck"
+    ],
+    "event": "star",
+    "stars": 224135,
+    "language": "TypeScript",
+    "description": "The open source coding agent.",
+    "url": "https://github.com/anomalyco/opencode"
+  },
+  {
+    "full_name": "eternity4719/HowToLiveBetter",
+    "who": [
+      "lujiarui"
+    ],
+    "event": "star",
+    "stars": 72777,
+    "language": "HTML",
+    "description": "高性价比人生指南: 长寿防病、急救、省钱理财、法律红线、失业与工伤、医保社保、恋爱婚育、怀孕育儿、创业与做平台合规、出国与技能。每条写明成本、收益、证据等级和原始出处，只引期刊论文与官方文件。",
+    "url": "https://github.com/eternity4719/HowToLiveBetter"
+  },
+  {
+    "full_name": "google-deepmind/mujoco",
+    "who": [
+      "Child-pi",
+      "Emptope",
+      "theveks-cell"
+    ],
+    "event": "mixed",
+    "stars": 16038,
+    "language": "C++",
+    "description": "Multi-Joint dynamics with Contact. A general purpose physics simulator.",
+    "url": "https://github.com/google-deepmind/mujoco"
+  },
+  {
+    "full_name": "deepseek-ai/dsh-superagent-prototype",
+    "who": [
+      "mingchen-li"
+    ],
+    "event": "star",
+    "stars": 13640,
+    "language": "TypeScript",
+    "description": "Towards a More Autonomous Agent System",
+    "url": "https://github.com/deepseek-ai/dsh-superagent-prototype"
+  },
+  {
+    "full_name": "google-deepmind/mujoco_menagerie",
+    "who": [
+      "oceanyangjs"
+    ],
+    "event": "star",
+    "stars": 4306,
+    "language": "Python",
+    "description": "A collection of high-quality models for the MuJoCo physics engine, curated by Google DeepMind.",
+    "url": "https://github.com/google-deepmind/mujoco_menagerie"
+  },
+  {
+    "full_name": "google-deepmind/tapnet",
+    "who": [
+      "XiiiiaoT"
+    ],
+    "event": "issue",
+    "stars": 2247,
+    "language": "Jupyter Notebook",
+    "description": "Tracking Any Point (TAP)",
+    "url": "https://github.com/google-deepmind/tapnet"
+  },
+  {
+    "full_name": "google-deepmind/mujoco_warp",
+    "who": [
+      "JiaCheng310"
+    ],
+    "event": "fork",
+    "stars": 1595,
+    "language": "Python",
+    "description": "GPU-optimized version of the MuJoCo physics simulator, designed for NVIDIA hardware.",
+    "url": "https://github.com/google-deepmind/mujoco_warp"
+  },
+  {
+    "full_name": "google-deepmind/formal-conjectures",
+    "who": [
+      "ProblemHunter",
+      "Sanexxxx777",
+      "Stayfoool",
+      "bocowgill",
+      "github-actions",
+      "google-cla",
+      "ukniusanqian-alt"
+    ],
+    "event": "mixed",
+    "stars": 1345,
+    "language": "Lean",
+    "description": "A collection of formalized statements of conjectures in Lean.",
+    "url": "https://github.com/google-deepmind/formal-conjectures"
+  },
+  {
+    "full_name": "steineggerlab/foldseek",
+    "who": [
+      "ioChris",
+      "xiongxu"
+    ],
+    "event": "star",
+    "stars": 1326,
+    "language": "C",
+    "description": "Foldseek enables fast and sensitive comparisons of large structure sets.",
+    "url": "https://github.com/steineggerlab/foldseek"
+  },
+  {
+    "full_name": "google-deepmind/materials_discovery",
+    "who": [
+      "sheenkd1"
+    ],
+    "event": "star",
+    "stars": 1252,
+    "language": "Jupyter Notebook",
+    "description": "",
+    "url": "https://github.com/google-deepmind/materials_discovery"
+  },
+  {
+    "full_name": "HannesStark/boltzgen",
+    "who": [
+      "HannesStark"
+    ],
+    "event": "branch",
+    "stars": 1094,
+    "language": "Python",
+    "description": "BoltzGen: Toward Universal Binder Design",
+    "url": "https://github.com/HannesStark/boltzgen"
+  },
+  {
+    "full_name": "google-deepmind/torax",
+    "who": [
+      "copybara-service"
+    ],
+    "event": "pr",
+    "stars": 747,
+    "language": "Python",
+    "description": "TORAX: Tokamak transport simulation in JAX",
+    "url": "https://github.com/google-deepmind/torax"
+  },
+  {
+    "full_name": "JuliaMolSim/Molly.jl",
+    "who": [
+      "jgreener64"
+    ],
+    "event": "mixed",
+    "stars": 501,
+    "language": "Julia",
+    "description": "Molecular simulation in Julia",
+    "url": "https://github.com/JuliaMolSim/Molly.jl"
+  },
+  {
+    "full_name": "PacesaLab/BindCraft2",
+    "who": [
+      "weitinging"
+    ],
+    "event": "star",
+    "stars": 470,
+    "language": "Python",
+    "description": "Easy to use suite for designing a wide range of protein binder modalities.",
+    "url": "https://github.com/PacesaLab/BindCraft2"
+  },
+  {
+    "full_name": "google-deepmind/detectorscope",
+    "who": [
+      "COaffection",
+      "Haouo",
+      "HuahaiNo1",
+      "YuLuo-yy",
+      "fangfangshen39-ops",
+      "ji0eeeee",
+      "mbclub77",
+      "plumLee211"
+    ],
+    "event": "star",
+    "stars": 369,
+    "language": "Python",
+    "description": "Build AI text detectors whose decisions are mechanistically grounded and human-auditable (EMNLP 2026)",
+    "url": "https://github.com/google-deepmind/detectorscope"
+  },
+  {
+    "full_name": "Valdes-Tresanco-MS/gmx_MMPBSA",
+    "who": [
+      "Junjie-Zhu"
+    ],
+    "event": "star",
+    "stars": 332,
+    "language": "Python",
+    "description": "gmx_MMPBSA is a new tool based on AMBER's MMPBSA.py aiming to perform end-state free energy calculations with GROMACS files.",
+    "url": "https://github.com/Valdes-Tresanco-MS/gmx_MMPBSA"
+  },
+  {
+    "full_name": "ai4protein/VenusFactory2",
+    "who": [
+      "github-actions",
+      "tyang816"
+    ],
+    "event": "push",
+    "stars": 255,
+    "language": "Python",
+    "description": "🏭 AI agent platform with skills for protein engineering, the noob-friendly AI tutorial tool for life science professionals. (ACL Demo2025, arXiv 2026)",
+    "url": "https://github.com/ai4protein/VenusFactory2"
+  },
+  {
+    "full_name": "GENTEL-lab/OriGene",
+    "who": [
+      "Lmmfff"
+    ],
+    "event": "star",
+    "stars": 233,
+    "language": "Python",
+    "description": "OriGene: A Self-Evolving Virtual Disease Biologist for Mechanism-Guided Therapeutic Target Discovery",
+    "url": "https://github.com/GENTEL-lab/OriGene"
+  },
+  {
+    "full_name": "steineggerlab/folddisco",
+    "who": [
+      "dohyun-jose-kim"
+    ],
+    "event": "star",
+    "stars": 223,
+    "language": "Rust",
+    "description": "Fast indexing and search of discontinuous motifs in protein structures",
+    "url": "https://github.com/steineggerlab/folddisco"
+  },
+  {
+    "full_name": "PDB-REDO/alphafill",
+    "who": [
+      "dependabot"
+    ],
+    "event": "pr",
+    "stars": 126,
+    "language": "C++",
+    "description": "AlphaFill is an algorithm based on sequence and structure similarity that “transplants” missing compounds to the AlphaFold models. By adding the molecular context to the protein structures, the models can be more easily appreciated in terms of function and structure integrity.",
+    "url": "https://github.com/PDB-REDO/alphafill"
+  },
+  {
+    "full_name": "lgwrightlab/schematic-figure",
+    "who": [
+      "jsunn-y"
+    ],
+    "event": "star",
+    "stars": 110,
+    "language": "JavaScript",
+    "description": "Skill for AI agents that draws publication-quality scientific schematic figures as vector code",
+    "url": "https://github.com/lgwrightlab/schematic-figure"
+  },
+  {
+    "full_name": "KULL-Centre/CALVADOS",
+    "who": [
+      "AtharvaTilewale",
+      "Copilot",
+      "markbujehein"
+    ],
+    "event": "mixed",
+    "stars": 105,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/KULL-Centre/CALVADOS"
+  },
+  {
+    "full_name": "ai4protein/ProtSSN",
+    "who": [
+      "GorkSS"
+    ],
+    "event": "star",
+    "stars": 98,
+    "language": "Python",
+    "description": "🧬 Fusion of protein sequence and structural information, using denoising pre-training network for zero-shot protein engineering (eLife 2025).",
+    "url": "https://github.com/ai4protein/ProtSSN"
+  },
+  {
+    "full_name": "JuliaMath/FFTA.jl",
+    "who": [
+      "jgreener64"
+    ],
+    "event": "issue",
+    "stars": 76,
+    "language": "Julia",
+    "description": "FFTA: Fastest Fourier Transform in my Apartment",
+    "url": "https://github.com/JuliaMath/FFTA.jl"
+  },
+  {
+    "full_name": "google-deepmind/proeval",
+    "who": [
+      "abhishekaich27"
+    ],
+    "event": "star",
+    "stars": 47,
+    "language": "Python",
+    "description": "GenAI evaluation framework, optimized for 100x lower cost 🚀.",
+    "url": "https://github.com/google-deepmind/proeval"
+  },
+  {
+    "full_name": "biomed-AI/DiffDec",
+    "who": [
+      "lilian-qin"
+    ],
+    "event": "star",
+    "stars": 43,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/biomed-AI/DiffDec"
+  },
+  {
+    "full_name": "steineggerlab/StrucTTY",
+    "who": [
+      "julianzaugg"
+    ],
+    "event": "star",
+    "stars": 32,
+    "language": "C++",
+    "description": "An Interactive, Terminal-Native Protein Structure Viewer",
+    "url": "https://github.com/steineggerlab/StrucTTY"
+  },
+  {
+    "full_name": "THGLab/IDPForge",
+    "who": [
+      "truong128",
+      "ts387"
+    ],
+    "event": "mixed",
+    "stars": 19,
+    "language": "Python",
+    "description": "Disordered protein ensemble prediction",
+    "url": "https://github.com/THGLab/IDPForge"
+  },
+  {
+    "full_name": "delalamo/SAbR",
+    "who": [
+      "delalamo"
+    ],
+    "event": "push",
+    "stars": 17,
+    "language": "Python",
+    "description": "Structure-based antibody renumbering",
+    "url": "https://github.com/delalamo/SAbR"
+  },
+  {
+    "full_name": "Graylab/picap",
+    "who": [
+      "rclune",
+      "woodsh17"
+    ],
+    "event": "mixed",
+    "stars": 16,
+    "language": "Jupyter Notebook",
+    "description": "CAPSIF2 and PiCAP",
+    "url": "https://github.com/Graylab/picap"
+  },
+  {
+    "full_name": "isblab/disobind",
+    "who": [
+      "Junjie-Zhu"
+    ],
+    "event": "star",
+    "stars": 14,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/isblab/disobind"
+  },
+  {
+    "full_name": "evocellnet/ai-hackathon",
+    "who": [
+      "Immortals-33"
+    ],
+    "event": "star",
+    "stars": 4,
+    "language": "",
+    "description": "",
+    "url": "https://github.com/evocellnet/ai-hackathon"
+  },
+  {
+    "full_name": "matteo-cagiada/mmcif-tools",
+    "who": [
+      "jgreener64"
+    ],
+    "event": "star",
+    "stars": 4,
+    "language": "Python",
+    "description": "mmcif-tools is a package that allows you to quickly read, parse, edit and write biomolecular structures in the MMcif format.",
+    "url": "https://github.com/matteo-cagiada/mmcif-tools"
+  },
+  {
+    "full_name": "GENTEL-lab/AlphaEnzyme",
+    "who": [
+      "KingGugu"
+    ],
+    "event": "star",
+    "stars": 1,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/GENTEL-lab/AlphaEnzyme"
+  },
+  {
+    "full_name": "Ser/Thr",
+    "who": [
+      "AtharvaTilewale"
+    ],
+    "event": "issue",
+    "stars": 0,
+    "language": "",
+    "description": "",
+    "url": ""
+  },
+  {
+    "full_name": "baker-laboratory/CaGE",
+    "who": [
+      "Walnosimaj"
+    ],
+    "event": "fork",
+    "stars": 0,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/baker-laboratory/CaGE"
+  }
+]
