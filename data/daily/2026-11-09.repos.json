@@ -1,0 +1,261 @@
+[
+  {
+    "full_name": "torvalds/linux",
+    "who": [
+      "torvalds"
+    ],
+    "event": "push",
+    "stars": 254897,
+    "language": "C",
+    "description": "Linux kernel source tree",
+    "url": "https://github.com/torvalds/linux"
+  },
+  {
+    "full_name": "google-deepmind/mujoco",
+    "who": [
+      "gaoypChina",
+      "mcurcio"
+    ],
+    "event": "star",
+    "stars": 16408,
+    "language": "C++",
+    "description": "Multi-Joint dynamics with Contact. A general purpose physics simulator.",
+    "url": "https://github.com/google-deepmind/mujoco"
+  },
+  {
+    "full_name": "aqlaboratory/openfold",
+    "who": [
+      "Ramtinhoss"
+    ],
+    "event": "star",
+    "stars": 3453,
+    "language": "Python",
+    "description": "Trainable, memory-efficient, and GPU-friendly PyTorch reproduction of AlphaFold 2",
+    "url": "https://github.com/aqlaboratory/openfold"
+  },
+  {
+    "full_name": "kennethreitz/pytheory",
+    "who": [
+      "kennethreitz"
+    ],
+    "event": "push",
+    "stars": 1661,
+    "language": "Python",
+    "description": "Music Theory for Humans.",
+    "url": "https://github.com/kennethreitz/pytheory"
+  },
+  {
+    "full_name": "google-deepmind/formal-conjectures",
+    "who": [
+      "github-actions",
+      "zblore"
+    ],
+    "event": "pr",
+    "stars": 1356,
+    "language": "Lean",
+    "description": "A collection of formalized statements of conjectures in Lean.",
+    "url": "https://github.com/google-deepmind/formal-conjectures"
+  },
+  {
+    "full_name": "aqlaboratory/openfold-3",
+    "who": [
+      "jnwei"
+    ],
+    "event": "push",
+    "stars": 912,
+    "language": "Python",
+    "description": "A fully open source biomolecular structure prediction model based on AlphaFold3",
+    "url": "https://github.com/aqlaboratory/openfold-3"
+  },
+  {
+    "full_name": "Graylab/DL4Proteins-notebooks",
+    "who": [
+      "luisgarcez37-alt"
+    ],
+    "event": "star",
+    "stars": 735,
+    "language": "Jupyter Notebook",
+    "description": "Colab Notebooks covering deep learning tools for biomolecular structure prediction and design",
+    "url": "https://github.com/Graylab/DL4Proteins-notebooks"
+  },
+  {
+    "full_name": "ai4protein/VenusFactory2",
+    "who": [
+      "dependabot",
+      "tyang816"
+    ],
+    "event": "push",
+    "stars": 253,
+    "language": "Python",
+    "description": "🏭 AI agent platform with skills for protein engineering, the noob-friendly AI tutorial tool for life science professionals. (ACL Demo2025, arXiv 2026)",
+    "url": "https://github.com/ai4protein/VenusFactory2"
+  },
+  {
+    "full_name": "sokrypton/py2Dmol",
+    "who": [
+      "sokrypton"
+    ],
+    "event": "push",
+    "stars": 111,
+    "language": "Jupyter Notebook",
+    "description": "",
+    "url": "https://github.com/sokrypton/py2Dmol"
+  },
+  {
+    "full_name": "ai4protein/ProtSSN",
+    "who": [
+      "ranas-mukminov"
+    ],
+    "event": "mixed",
+    "stars": 98,
+    "language": "Python",
+    "description": "🧬 Fusion of protein sequence and structural information, using denoising pre-training network for zero-shot protein engineering (eLife 2025).",
+    "url": "https://github.com/ai4protein/ProtSSN"
+  },
+  {
+    "full_name": "idptools/finches",
+    "who": [
+      "alexholehouse"
+    ],
+    "event": "push",
+    "stars": 52,
+    "language": "Jupyter Notebook",
+    "description": "FINCHES (First-principle Interactions via CHEmical Specificity) - Python package for predicting chemically-specific molecular interactions for IDRs",
+    "url": "https://github.com/idptools/finches"
+  },
+  {
+    "full_name": "sokrypton/localfold",
+    "who": [
+      "sokrypton"
+    ],
+    "event": "push",
+    "stars": 44,
+    "language": "JavaScript",
+    "description": "",
+    "url": "https://github.com/sokrypton/localfold"
+  },
+  {
+    "full_name": "Junjie-Zhu/IDPFold2",
+    "who": [
+      "ayushd718"
+    ],
+    "event": "star",
+    "stars": 31,
+    "language": "Python",
+    "description": "Code for generating ensembles with IDPFold2",
+    "url": "https://github.com/Junjie-Zhu/IDPFold2"
+  },
+  {
+    "full_name": "zaixizhang/FoldMark",
+    "who": [
+      "zaixizhang"
+    ],
+    "event": "mixed",
+    "stars": 27,
+    "language": "Python",
+    "description": "Implementation of FoldMark: Safeguarding Protein Structure Generative Models with Distributional and Evolutionary Watermarking",
+    "url": "https://github.com/zaixizhang/FoldMark"
+  },
+  {
+    "full_name": "holehouse-lab/xdrf",
+    "who": [
+      "alexholehouse"
+    ],
+    "event": "push",
+    "stars": 7,
+    "language": "M4",
+    "description": "This directory contains source of the portable data compression  library xdrf, which was developed for EUROPORT.",
+    "url": "https://github.com/holehouse-lab/xdrf"
+  },
+  {
+    "full_name": "GENTEL-lab/AlphaEnzyme",
+    "who": [
+      "ChrisAllenMing",
+      "Walnosimaj",
+      "Xinchunran",
+      "jsunn-y"
+    ],
+    "event": "mixed",
+    "stars": 7,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/GENTEL-lab/AlphaEnzyme"
+  },
+  {
+    "full_name": "aqlaboratory/openfold3-finetuning-example",
+    "who": [
+      "Birkinshaw"
+    ],
+    "event": "star",
+    "stars": 2,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/aqlaboratory/openfold3-finetuning-example"
+  },
+  {
+    "full_name": "Graylab/ProtAff",
+    "who": [
+      "luckylululu"
+    ],
+    "event": "fork",
+    "stars": 2,
+    "language": "Python",
+    "description": "Protein Binding Affinity Prediction via LoRA-Finetuned ESM-2",
+    "url": "https://github.com/Graylab/ProtAff"
+  },
+  {
+    "full_name": "gitesei/MEM-CALVADOS",
+    "who": [
+      "gitesei"
+    ],
+    "event": "push",
+    "stars": 2,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/gitesei/MEM-CALVADOS"
+  },
+  {
+    "full_name": "kennethreitz/cannoli",
+    "who": [
+      "kennethreitz"
+    ],
+    "event": "branch",
+    "stars": 1,
+    "language": "Kotlin",
+    "description": "A frontend with just the right amount of filling!",
+    "url": "https://github.com/kennethreitz/cannoli"
+  },
+  {
+    "full_name": "SII-ShenggengLin/RNADesignAgent",
+    "who": [
+      "SII-ShenggengLin"
+    ],
+    "event": "mixed",
+    "stars": 0,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/SII-ShenggengLin/RNADesignAgent"
+  },
+  {
+    "full_name": "BioComputingUP/BioComp_resource_monitor",
+    "who": [
+      "github-actions"
+    ],
+    "event": "push",
+    "stars": 0,
+    "language": "Python",
+    "description": "Uptime and backend-API monitoring of the BioComputing UP resources (DisProt, MobiDB, RepeatsDB, PED, RING, APICURON…), every 20 minutes on GitHub Actions",
+    "url": "https://github.com/BioComputingUP/BioComp_resource_monitor"
+  },
+  {
+    "full_name": "kennethreitz/gen1recomp-mod-index",
+    "who": [
+      "kennethreitz"
+    ],
+    "event": "branch",
+    "stars": 0,
+    "language": "",
+    "description": "",
+    "url": "https://github.com/kennethreitz/gen1recomp-mod-index"
+  }
+]
