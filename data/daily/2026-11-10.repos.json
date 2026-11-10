@@ -1,0 +1,540 @@
+[
+  {
+    "full_name": "google-deepmind/mujoco",
+    "who": [
+      "0xBEEBAD",
+      "23xxCh",
+      "Andres0258",
+      "BGFGB",
+      "Banana-llama8686",
+      "GaolengYan",
+      "KeyWaveTree",
+      "OpenSesh95",
+      "RamiliRindra",
+      "TranquilityTech",
+      "Zlorideee",
+      "alexisvalentino",
+      "closiy",
+      "connorburgess",
+      "dagang2017",
+      "halthinks",
+      "hsaeed3",
+      "ink7412",
+      "jhonypachecop",
+      "mcallzbl",
+      "netxfly",
+      "ontichiscwit",
+      "southwestCat",
+      "tool-jx3"
+    ],
+    "event": "mixed",
+    "stars": 16968,
+    "language": "C++",
+    "description": "Multi-Joint dynamics with Contact. A general purpose physics simulator.",
+    "url": "https://github.com/google-deepmind/mujoco"
+  },
+  {
+    "full_name": "kennethreitz/responder",
+    "who": [
+      "kennethreitz"
+    ],
+    "event": "mixed",
+    "stars": 3617,
+    "language": "Python",
+    "description": "A familiar HTTP Service Framework for Python.",
+    "url": "https://github.com/kennethreitz/responder"
+  },
+  {
+    "full_name": "kennethreitz/pytheory",
+    "who": [
+      "kennethreitz"
+    ],
+    "event": "mixed",
+    "stars": 1664,
+    "language": "Python",
+    "description": "Music Theory for Humans.",
+    "url": "https://github.com/kennethreitz/pytheory"
+  },
+  {
+    "full_name": "google-deepmind/formal-conjectures",
+    "who": [
+      "felixpernegger"
+    ],
+    "event": "other",
+    "stars": 1356,
+    "language": "Lean",
+    "description": "A collection of formalized statements of conjectures in Lean.",
+    "url": "https://github.com/google-deepmind/formal-conjectures"
+  },
+  {
+    "full_name": "aqlaboratory/openfold-3",
+    "who": [
+      "Eren-Jeager123",
+      "jnwei"
+    ],
+    "event": "mixed",
+    "stars": 912,
+    "language": "Python",
+    "description": "A fully open source biomolecular structure prediction model based on AlphaFold3",
+    "url": "https://github.com/aqlaboratory/openfold-3"
+  },
+  {
+    "full_name": "Graylab/DL4Proteins-notebooks",
+    "who": [
+      "0xmsu"
+    ],
+    "event": "star",
+    "stars": 736,
+    "language": "Jupyter Notebook",
+    "description": "Colab Notebooks covering deep learning tools for biomolecular structure prediction and design",
+    "url": "https://github.com/Graylab/DL4Proteins-notebooks"
+  },
+  {
+    "full_name": "google-deepmind/detectorscope",
+    "who": [
+      "ghghghasdf"
+    ],
+    "event": "star",
+    "stars": 460,
+    "language": "Python",
+    "description": "Build AI text detectors whose decisions are mechanistically grounded and human-auditable (EMNLP 2026)",
+    "url": "https://github.com/google-deepmind/detectorscope"
+  },
+  {
+    "full_name": "aqlaboratory/rgn",
+    "who": [
+      "robertoatila"
+    ],
+    "event": "star",
+    "stars": 325,
+    "language": "Python",
+    "description": "Recurrent Geometric Networks for end-to-end differentiable learning of protein structure",
+    "url": "https://github.com/aqlaboratory/rgn"
+  },
+  {
+    "full_name": "r-lib/httr2",
+    "who": [
+      "hadley"
+    ],
+    "event": "push",
+    "stars": 274,
+    "language": "R",
+    "description": "Make HTTP requests and process their responses. A modern reimagining of httr.",
+    "url": "https://github.com/r-lib/httr2"
+  },
+  {
+    "full_name": "ai4protein/VenusFactory2",
+    "who": [
+      "tyang816"
+    ],
+    "event": "push",
+    "stars": 253,
+    "language": "Python",
+    "description": "🏭 AI agent platform with skills for protein engineering, the noob-friendly AI tutorial tool for life science professionals. (ACL Demo2025, arXiv 2026)",
+    "url": "https://github.com/ai4protein/VenusFactory2"
+  },
+  {
+    "full_name": "tidyverse/data-dict",
+    "who": [
+      "hadley"
+    ],
+    "event": "issue",
+    "stars": 113,
+    "language": "Rust",
+    "description": "",
+    "url": "https://github.com/tidyverse/data-dict"
+  },
+  {
+    "full_name": "BioJulia/BioStructures.jl",
+    "who": [
+      "jgreener64"
+    ],
+    "event": "push",
+    "stars": 106,
+    "language": "Julia",
+    "description": "A Julia package to read, write and manipulate macromolecular structures",
+    "url": "https://github.com/BioJulia/BioStructures.jl"
+  },
+  {
+    "full_name": "baker-laboratory/NA-MPNN",
+    "who": [
+      "dslv3y"
+    ],
+    "event": "star",
+    "stars": 72,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/baker-laboratory/NA-MPNN"
+  },
+  {
+    "full_name": "steineggerlab/riboseek",
+    "who": [
+      "pskvins"
+    ],
+    "event": "push",
+    "stars": 55,
+    "language": "C",
+    "description": "RNA search",
+    "url": "https://github.com/steineggerlab/riboseek"
+  },
+  {
+    "full_name": "MarksLab-DasLab/RNAGym",
+    "who": [
+      "Leo-T-Zang"
+    ],
+    "event": "pr",
+    "stars": 44,
+    "language": "Python",
+    "description": "RNAGym is an extensive benchmark suite and resource for RNA fitness and structure prediction",
+    "url": "https://github.com/MarksLab-DasLab/RNAGym"
+  },
+  {
+    "full_name": "sokrypton/localfold",
+    "who": [
+      "sokrypton"
+    ],
+    "event": "push",
+    "stars": 44,
+    "language": "JavaScript",
+    "description": "",
+    "url": "https://github.com/sokrypton/localfold"
+  },
+  {
+    "full_name": "jgreener64/Bio3DView.jl",
+    "who": [
+      "jgreener64"
+    ],
+    "event": "push",
+    "stars": 36,
+    "language": "Julia",
+    "description": "A Julia package to view macromolecular structures in the REPL, in a Jupyter notebook/JupyterLab or in Pluto",
+    "url": "https://github.com/jgreener64/Bio3DView.jl"
+  },
+  {
+    "full_name": "AIDD-LiLab/GatorAffinity",
+    "who": [
+      "lkalmar"
+    ],
+    "event": "issue",
+    "stars": 36,
+    "language": "Python",
+    "description": "GatorAffinity: Boosting Protein-Ligand Binding Affinity Prediction with Large-Scale Synthetic Structural Data",
+    "url": "https://github.com/AIDD-LiLab/GatorAffinity"
+  },
+  {
+    "full_name": "baker-laboratory/Metallohydrolase_Enzyme_Design",
+    "who": [
+      "CharlesDDD"
+    ],
+    "event": "star",
+    "stars": 32,
+    "language": "Jupyter Notebook",
+    "description": "Official GitHub repository for the manuscript entitled \"Computational Design of Metallohydrolases\" by Kim, Woodbury, & Ahern et al. published in Nature. This notebook contains (1) tutorials on how to use RFdiffusion2 for enzyme design, (2) a demo pipeline for metallohydrolase design, and (3) data, sequences, and design models from the manuscript. ",
+    "url": "https://github.com/baker-laboratory/Metallohydrolase_Enzyme_Design"
+  },
+  {
+    "full_name": "kennethreitz/fetch.py",
+    "who": [
+      "kennethreitz"
+    ],
+    "event": "push",
+    "stars": 18,
+    "language": "Python",
+    "description": "Requests energy for when the dependency is the problem.",
+    "url": "https://github.com/kennethreitz/fetch.py"
+  },
+  {
+    "full_name": "kennethreitz/kennethreitz.org",
+    "who": [
+      "kennethreitz"
+    ],
+    "event": "pr",
+    "stars": 16,
+    "language": "Python",
+    "description": "The source code of kennethreitz.org.",
+    "url": "https://github.com/kennethreitz/kennethreitz.org"
+  },
+  {
+    "full_name": "tsubo-lab/monoyield-predictor",
+    "who": [
+      "Junjie-Zhu"
+    ],
+    "event": "star",
+    "stars": 14,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/tsubo-lab/monoyield-predictor"
+  },
+  {
+    "full_name": "kiharalab/PathFold",
+    "who": [
+      "shuaizengMU"
+    ],
+    "event": "star",
+    "stars": 13,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/kiharalab/PathFold"
+  },
+  {
+    "full_name": "GENTEL-lab/AlphaEnzyme",
+    "who": [
+      "KasperBuskPedersen",
+      "Vedasheersh",
+      "Walnosimaj",
+      "Xinchunran",
+      "YamanAlJ",
+      "almeida85",
+      "moranlin",
+      "sflores14"
+    ],
+    "event": "mixed",
+    "stars": 11,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/GENTEL-lab/AlphaEnzyme"
+  },
+  {
+    "full_name": "kiharalab/CryoZeta",
+    "who": [
+      "WBennett003"
+    ],
+    "event": "star",
+    "stars": 11,
+    "language": "Python",
+    "description": "CryoZeta Inference Pipeline",
+    "url": "https://github.com/kiharalab/CryoZeta"
+  },
+  {
+    "full_name": "THGLab/CAFE",
+    "who": [
+      "dingye18"
+    ],
+    "event": "star",
+    "stars": 11,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/THGLab/CAFE"
+  },
+  {
+    "full_name": "biomed-AI/DeltaCata",
+    "who": [
+      "kssrikar4"
+    ],
+    "event": "star",
+    "stars": 8,
+    "language": "Jupyter Notebook",
+    "description": "Predicting enzyme kinetic parameter changes upon mutations with geometric deep learning",
+    "url": "https://github.com/biomed-AI/DeltaCata"
+  },
+  {
+    "full_name": "kennethreitz/noodler",
+    "who": [
+      "kennethreitz"
+    ],
+    "event": "mixed",
+    "stars": 7,
+    "language": "Python",
+    "description": "A modular music environment where theory itself is patchable. Eurorack-inspired, built in Python around PyTheory.",
+    "url": "https://github.com/kennethreitz/noodler"
+  },
+  {
+    "full_name": "OpenFreeEnergy/openfe-failure-cases",
+    "who": [
+      "jchodera"
+    ],
+    "event": "star",
+    "stars": 6,
+    "language": "Python",
+    "description": "A collection of reproducible openfe protocol failure cases resulting in NaN results.",
+    "url": "https://github.com/OpenFreeEnergy/openfe-failure-cases"
+  },
+  {
+    "full_name": "kennethreitz/rhymepad.org",
+    "who": [
+      "kennethreitz"
+    ],
+    "event": "mixed",
+    "stars": 6,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/kennethreitz/rhymepad.org"
+  },
+  {
+    "full_name": "asapdiscovery/asapdiscovery.github.io",
+    "who": [
+      "jchodera"
+    ],
+    "event": "mixed",
+    "stars": 4,
+    "language": "HTML",
+    "description": "",
+    "url": "https://github.com/asapdiscovery/asapdiscovery.github.io"
+  },
+  {
+    "full_name": "aqlaboratory/openfold3-finetuning-example",
+    "who": [
+      "Birkinshaw",
+      "meet45452"
+    ],
+    "event": "mixed",
+    "stars": 3,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/aqlaboratory/openfold3-finetuning-example"
+  },
+  {
+    "full_name": "biomed-AI/DeltaCata-AL",
+    "who": [
+      "kssrikar4"
+    ],
+    "event": "star",
+    "stars": 3,
+    "language": "Python",
+    "description": "Prioritizing beneficial mutations using DeltaCata and active learning",
+    "url": "https://github.com/biomed-AI/DeltaCata-AL"
+  },
+  {
+    "full_name": "KULL-Centre/_2024_yasuda_RNA",
+    "who": [
+      "iyasuda"
+    ],
+    "event": "issue",
+    "stars": 2,
+    "language": "Jupyter Notebook",
+    "description": "",
+    "url": "https://github.com/KULL-Centre/_2024_yasuda_RNA"
+  },
+  {
+    "full_name": "kennethreitz/pytheory-playground",
+    "who": [
+      "kennethreitz"
+    ],
+    "event": "pr",
+    "stars": 2,
+    "language": "JavaScript",
+    "description": "Interactive music theory toolbox powered by pytheory",
+    "url": "https://github.com/kennethreitz/pytheory-playground"
+  },
+  {
+    "full_name": "kennethreitz/requeststoken.org",
+    "who": [
+      "kennethreitz"
+    ],
+    "event": "pr",
+    "stars": 2,
+    "language": "Python",
+    "description": "requests coin site — built with Responder",
+    "url": "https://github.com/kennethreitz/requeststoken.org"
+  },
+  {
+    "full_name": "EDAPINENUT/fewsteprl-sd35",
+    "who": [
+      "EDAPINENUT"
+    ],
+    "event": "push",
+    "stars": 1,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/EDAPINENUT/fewsteprl-sd35"
+  },
+  {
+    "full_name": "EDAPINENUT/fewsteprl.page",
+    "who": [
+      "EDAPINENUT"
+    ],
+    "event": "push",
+    "stars": 0,
+    "language": "JavaScript",
+    "description": "project page of fewsteprl",
+    "url": "https://github.com/EDAPINENUT/fewsteprl.page"
+  },
+  {
+    "full_name": "HannesStark/fold-club-quiz",
+    "who": [
+      "HannesStark"
+    ],
+    "event": "branch",
+    "stars": 0,
+    "language": "JavaScript",
+    "description": "120 protein structure puzzles with hints, diagrams, and shared-screen play.",
+    "url": "https://github.com/HannesStark/fold-club-quiz"
+  },
+  {
+    "full_name": "EDAPINENUT/fewsteprl-wan21",
+    "who": [
+      "EDAPINENUT"
+    ],
+    "event": "push",
+    "stars": 0,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/EDAPINENUT/fewsteprl-wan21"
+  },
+  {
+    "full_name": "xtanh/BioFig-Studio",
+    "who": [
+      "xtanh"
+    ],
+    "event": "push",
+    "stars": 0,
+    "language": "",
+    "description": "",
+    "url": "https://github.com/xtanh/BioFig-Studio"
+  },
+  {
+    "full_name": "jsunn-y/jsunn-y.github.io",
+    "who": [
+      "jsunn-y"
+    ],
+    "event": "push",
+    "stars": 0,
+    "language": "HTML",
+    "description": "",
+    "url": "https://github.com/jsunn-y/jsunn-y.github.io"
+  },
+  {
+    "full_name": "HannesStark/common-room-quiz",
+    "who": [
+      "HannesStark"
+    ],
+    "event": "mixed",
+    "stars": 0,
+    "language": "JavaScript",
+    "description": "216 course-inspired questions across six subjects, including probability puzzles. Play together on one screen.",
+    "url": "https://github.com/HannesStark/common-room-quiz"
+  },
+  {
+    "full_name": "BioComputingUP/BioComp_resource_monitor",
+    "who": [
+      "github-actions"
+    ],
+    "event": "push",
+    "stars": 0,
+    "language": "Python",
+    "description": "Uptime and backend-API monitoring of the BioComputing UP resources (DisProt, MobiDB, RepeatsDB, PED, RING, APICURON…), every 20 minutes on GitHub Actions",
+    "url": "https://github.com/BioComputingUP/BioComp_resource_monitor"
+  },
+  {
+    "full_name": "BioComputingUP/dome-tracking",
+    "who": [
+      "github-actions"
+    ],
+    "event": "push",
+    "stars": 0,
+    "language": "Python",
+    "description": "Uptime and code-activity tracking for the DOME ecosystem: DOME Registry, DOME-ML, DOME Copilot, OSAI, DOME Observatory",
+    "url": "https://github.com/BioComputingUP/dome-tracking"
+  },
+  {
+    "full_name": "kennethreitz/responder-httpbin",
+    "who": [
+      "kennethreitz"
+    ],
+    "event": "pr",
+    "stars": 0,
+    "language": "Python",
+    "description": "HTTP Request & Response Service, written in Python + Responder.",
+    "url": "https://github.com/kennethreitz/responder-httpbin"
+  }
+]
