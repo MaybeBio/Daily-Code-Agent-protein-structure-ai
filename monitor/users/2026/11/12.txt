@@ -1,0 +1,12 @@
+Fetching events for target(s): alexholehouse, HFChenLab, Junjie-Zhu, sirius777coder, Barakhsaana, Zuricho, Immortals-33, weitinging, ji-xiaoyue, Zirui-Fan, borrytod, xlab-BioAI, SII-ShenggengLin, xtanh, wangwrx, shaowenguang, mapleleaf6, tyang816, mingchen-li, code4luck, zy-zhou, riacd, terry-r123, bzho3923, Xinheng-He, lujiarui, ChenDdon, AspirinCode, bjing2016, prokia, Gonglab-THU, meneshail, xinshi-chen, amyxlu, LirongWu, OdinZhang, EDAPINENUT, QizhiPei, thematrixmaster, zaixizhang, pascalnotin, jsunn-y, Leo-T-Zang, WillHua127, wenjiegroup, Shenggan, yangnianzu0515, chao1224, blt2114, Oxer11, shichence, ChrisAllenMing, jchodera, jgreener64, HannesStark, Peldom, luost26, sokrypton, lmqfly...
+
+2026-11-12 06:12:37 | 💬 alexholehouse created issue 'Cannot import vectorized from sparrow.patterning' in idptools/tadatorch
+2026-11-11 23:12:38 | ⭐️ Shenggan starred huawei-csl/MACaQ
+2026-11-11 22:07:31 | ⭐️ sirius777coder starred hegelab/AF-TM-Dimers-QC
+2026-11-11 10:41:57 | 🚀 sokrypton pushed to sokrypton/localfold
+    - [5c31de7] (expanded) docs/DESIGN.md, CLAUDE.md: RFD4-Proteina's weight terms read - BSD 3-Clause (the Institute for Protein Design), accepted by the user
+2026-11-11 07:11:35 | 🚀 sokrypton pushed to sokrypton/localfold
+    - [06d462e] (expanded) Simpler native side: one weights home, the wheel's commands named as the binaries, the native traps moved out
+2026-11-11 06:07:59 | 🚀 sokrypton pushed to sokrypton/localfold
+    - [a5ee64e] (expanded) README: folding on your own GPU or on Colab, through colabfold-cuda and colabfold-metal
+2026-11-11 05:56:13 | 🆕 sokrypton created branch 'split-native' at sokrypton/localfold

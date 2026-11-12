@@ -1,0 +1,237 @@
+[
+  {
+    "full_name": "google-deepmind/mujoco",
+    "who": [
+      "AousuoA",
+      "aning35",
+      "arm1383",
+      "chbaaic",
+      "decster",
+      "imshile",
+      "noguchisatoshi",
+      "tsinovoi"
+    ],
+    "event": "star",
+    "stars": 17650,
+    "language": "C++",
+    "description": "Multi-Joint dynamics with Contact. A general purpose physics simulator.",
+    "url": "https://github.com/google-deepmind/mujoco"
+  },
+  {
+    "full_name": "google-deepmind/mujoco_menagerie",
+    "who": [
+      "0xZackary"
+    ],
+    "event": "star",
+    "stars": 4350,
+    "language": "Python",
+    "description": "A collection of high-quality models for the MuJoCo physics engine, curated by Google DeepMind.",
+    "url": "https://github.com/google-deepmind/mujoco_menagerie"
+  },
+  {
+    "full_name": "google-deepmind/open_x_embodiment",
+    "who": [
+      "simaihub"
+    ],
+    "event": "star",
+    "stars": 2096,
+    "language": "Jupyter Notebook",
+    "description": "",
+    "url": "https://github.com/google-deepmind/open_x_embodiment"
+  },
+  {
+    "full_name": "google-deepmind/mujoco_warp",
+    "who": [
+      "johnnynunez",
+      "thowell"
+    ],
+    "event": "mixed",
+    "stars": 1627,
+    "language": "Python",
+    "description": "GPU-optimized version of the MuJoCo physics simulator, designed for NVIDIA hardware.",
+    "url": "https://github.com/google-deepmind/mujoco_warp"
+  },
+  {
+    "full_name": "google-deepmind/formal-conjectures",
+    "who": [
+      "Nas01010101",
+      "github-actions",
+      "mo271",
+      "tombudd"
+    ],
+    "event": "mixed",
+    "stars": 1359,
+    "language": "Lean",
+    "description": "A collection of formalized statements of conjectures in Lean.",
+    "url": "https://github.com/google-deepmind/formal-conjectures"
+  },
+  {
+    "full_name": "aqlaboratory/openfold-3",
+    "who": [
+      "Pana-TsK",
+      "jnwei"
+    ],
+    "event": "mixed",
+    "stars": 914,
+    "language": "Python",
+    "description": "A fully open source biomolecular structure prediction model based on AlphaFold3",
+    "url": "https://github.com/aqlaboratory/openfold-3"
+  },
+  {
+    "full_name": "google-deepmind/representations4d",
+    "who": [
+      "RuskiNuggetz"
+    ],
+    "event": "star",
+    "stars": 423,
+    "language": "Jupyter Notebook",
+    "description": "Foundation models for 4D spatial and temporal vision tasks.",
+    "url": "https://github.com/google-deepmind/representations4d"
+  },
+  {
+    "full_name": "Graylab/FLAb",
+    "who": [
+      "PeidaWu"
+    ],
+    "event": "star",
+    "stars": 204,
+    "language": "Python",
+    "description": "Fitness landscapes for antibodies",
+    "url": "https://github.com/Graylab/FLAb"
+  },
+  {
+    "full_name": "google-deepmind/code-verification",
+    "who": [
+      "zhengyao-lin"
+    ],
+    "event": "star",
+    "stars": 167,
+    "language": "Lean",
+    "description": "Verifying Signal's security at the machine-code level",
+    "url": "https://github.com/google-deepmind/code-verification"
+  },
+  {
+    "full_name": "ProteinDesignLab/caliby",
+    "who": [
+      "0xmsu"
+    ],
+    "event": "star",
+    "stars": 121,
+    "language": "Python",
+    "description": "Potts model-based protein sequence design",
+    "url": "https://github.com/ProteinDesignLab/caliby"
+  },
+  {
+    "full_name": "KULL-Centre/CALVADOS",
+    "who": [
+      "yaseminsucu"
+    ],
+    "event": "star",
+    "stars": 107,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/KULL-Centre/CALVADOS"
+  },
+  {
+    "full_name": "huawei-csl/MACaQ",
+    "who": [
+      "Shenggan"
+    ],
+    "event": "star",
+    "stars": 98,
+    "language": "C++",
+    "description": "SOTA model-agnostic quantization for GGUF, local inference and beyond. Quantize and run text, image, video and audio models with llama.cpp, vLLM, Diffusers and PyTorch.",
+    "url": "https://github.com/huawei-csl/MACaQ"
+  },
+  {
+    "full_name": "Graylab/AlphaRED",
+    "who": [
+      "Numenor-San"
+    ],
+    "event": "star",
+    "stars": 96,
+    "language": "Python",
+    "description": "AlphaFold-initiated replica exchange protein docking",
+    "url": "https://github.com/Graylab/AlphaRED"
+  },
+  {
+    "full_name": "sokrypton/localfold",
+    "who": [
+      "sokrypton"
+    ],
+    "event": "mixed",
+    "stars": 46,
+    "language": "JavaScript",
+    "description": "",
+    "url": "https://github.com/sokrypton/localfold"
+  },
+  {
+    "full_name": "idptools/sparrow",
+    "who": [
+      "ym3141"
+    ],
+    "event": "star",
+    "stars": 46,
+    "language": "Python",
+    "description": "Next generation sequence parameter library for proteins",
+    "url": "https://github.com/idptools/sparrow"
+  },
+  {
+    "full_name": "baker-laboratory/Metallohydrolase_Enzyme_Design",
+    "who": [
+      "averyyyang"
+    ],
+    "event": "star",
+    "stars": 33,
+    "language": "Jupyter Notebook",
+    "description": "Official GitHub repository for the manuscript entitled \"Computational Design of Metallohydrolases\" by Kim, Woodbury, & Ahern et al. published in Nature. This notebook contains (1) tutorials on how to use RFdiffusion2 for enzyme design, (2) a demo pipeline for metallohydrolase design, and (3) data, sequences, and design models from the manuscript. ",
+    "url": "https://github.com/baker-laboratory/Metallohydrolase_Enzyme_Design"
+  },
+  {
+    "full_name": "GENTEL-lab/AlphaEnzyme",
+    "who": [
+      "2333sky",
+      "Reybabylon",
+      "nmrson",
+      "zzjun4ai"
+    ],
+    "event": "star",
+    "stars": 15,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/GENTEL-lab/AlphaEnzyme"
+  },
+  {
+    "full_name": "THGLab/ecenet",
+    "who": [
+      "ysf-s"
+    ],
+    "event": "star",
+    "stars": 11,
+    "language": "Python",
+    "description": "SO(3)-equivariant interatomic potential (MLIP) using per-edge SO(2) features",
+    "url": "https://github.com/THGLab/ecenet"
+  },
+  {
+    "full_name": "idptools/tadatorch",
+    "who": [
+      "alexholehouse"
+    ],
+    "event": "issue",
+    "stars": 0,
+    "language": "Python",
+    "description": "tadatorch is a PyTorch implementation of the TADA activation domain predictor that uses sparrow for parameter predictions. ",
+    "url": "https://github.com/idptools/tadatorch"
+  },
+  {
+    "full_name": "hegelab/AF-TM-Dimers-QC",
+    "who": [
+      "sirius777coder"
+    ],
+    "event": "star",
+    "stars": 0,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/hegelab/AF-TM-Dimers-QC"
+  }
+]
