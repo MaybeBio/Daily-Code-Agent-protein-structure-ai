@@ -1,0 +1,218 @@
+[
+  {
+    "full_name": "google-deepmind/mujoco",
+    "who": [
+      "anight",
+      "shireygrady-cell"
+    ],
+    "event": "star",
+    "stars": 17981,
+    "language": "C++",
+    "description": "Multi-Joint dynamics with Contact. A general purpose physics simulator.",
+    "url": "https://github.com/google-deepmind/mujoco"
+  },
+  {
+    "full_name": "aqlaboratory/openfold-3",
+    "who": [
+      "David-OConnor",
+      "RuikangSun",
+      "jnwei",
+      "robertoatila",
+      "shuwang1"
+    ],
+    "event": "mixed",
+    "stars": 922,
+    "language": "Python",
+    "description": "A fully open source biomolecular structure prediction model based on AlphaFold3",
+    "url": "https://github.com/aqlaboratory/openfold-3"
+  },
+  {
+    "full_name": "r-lib/httr2",
+    "who": [
+      "hadley"
+    ],
+    "event": "push",
+    "stars": 274,
+    "language": "R",
+    "description": "Make HTTP requests and process their responses. A modern reimagining of httr.",
+    "url": "https://github.com/r-lib/httr2"
+  },
+  {
+    "full_name": "ai4protein/VenusFactory2",
+    "who": [
+      "tyang816"
+    ],
+    "event": "other",
+    "stars": 253,
+    "language": "Python",
+    "description": "🏭 AI agent platform with skills for protein engineering, the noob-friendly AI tutorial tool for life science professionals. (ACL Demo2025, arXiv 2026)",
+    "url": "https://github.com/ai4protein/VenusFactory2"
+  },
+  {
+    "full_name": "GENTEL-lab/OriGene",
+    "who": [
+      "mtsmxd"
+    ],
+    "event": "star",
+    "stars": 236,
+    "language": "Python",
+    "description": "OriGene: A Self-Evolving Virtual Disease Biologist for Mechanism-Guided Therapeutic Target Discovery",
+    "url": "https://github.com/GENTEL-lab/OriGene"
+  },
+  {
+    "full_name": "Graylab/FLAb",
+    "who": [
+      "wanyang19880625"
+    ],
+    "event": "star",
+    "stars": 205,
+    "language": "Python",
+    "description": "Fitness landscapes for antibodies",
+    "url": "https://github.com/Graylab/FLAb"
+  },
+  {
+    "full_name": "zaixizhang/STELLA",
+    "who": [
+      "zaixizhang"
+    ],
+    "event": "mixed",
+    "stars": 159,
+    "language": "Python",
+    "description": "STELLA: Self-Evolving LLM Agent for Biomedical Research",
+    "url": "https://github.com/zaixizhang/STELLA"
+  },
+  {
+    "full_name": "GENTEL-lab/EnzymeCAGE",
+    "who": [
+      "faker-hide"
+    ],
+    "event": "star",
+    "stars": 104,
+    "language": "Python",
+    "description": "A geometric foundation model for enzyme retrieval with evolutionary insights.",
+    "url": "https://github.com/GENTEL-lab/EnzymeCAGE"
+  },
+  {
+    "full_name": "sokrypton/localfold",
+    "who": [
+      "sokrypton"
+    ],
+    "event": "issue",
+    "stars": 51,
+    "language": "JavaScript",
+    "description": "",
+    "url": "https://github.com/sokrypton/localfold"
+  },
+  {
+    "full_name": "THGLab/SynLlama",
+    "who": [
+      "srn0621-Bob"
+    ],
+    "event": "fork",
+    "stars": 50,
+    "language": "Python",
+    "description": "Code Space of SynLlama",
+    "url": "https://github.com/THGLab/SynLlama"
+  },
+  {
+    "full_name": "idptools/metapredict",
+    "who": [
+      "alexholehouse"
+    ],
+    "event": "push",
+    "stars": 34,
+    "language": "Python",
+    "description": "A machine learning based protein disorder predictor.",
+    "url": "https://github.com/idptools/metapredict"
+  },
+  {
+    "full_name": "idptools/parrot",
+    "who": [
+      "ryanemenecker"
+    ],
+    "event": "branch",
+    "stars": 22,
+    "language": "Python",
+    "description": "Python package for protein sequence-based bidirectional recurrent neural network. Generalizable to a variety of protein bioinformatic applications.",
+    "url": "https://github.com/idptools/parrot"
+  },
+  {
+    "full_name": "GENTEL-lab/AlphaEnzyme",
+    "who": [
+      "akhilbhardwaj031-sys",
+      "bio-rat",
+      "mtsmxd"
+    ],
+    "event": "star",
+    "stars": 18,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/GENTEL-lab/AlphaEnzyme"
+  },
+  {
+    "full_name": "EDAPINENUT/fewsteprl-sd35",
+    "who": [
+      "EDAPINENUT"
+    ],
+    "event": "issue",
+    "stars": 10,
+    "language": "Python",
+    "description": "Open source repository for the paper \"Fine-tuning Few-step Diffusion Models with Reinforcement Learning\" on SD-3.5",
+    "url": "https://github.com/EDAPINENUT/fewsteprl-sd35"
+  },
+  {
+    "full_name": "yliust/Calpha",
+    "who": [
+      "prokia"
+    ],
+    "event": "star",
+    "stars": 9,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/yliust/Calpha"
+  },
+  {
+    "full_name": "EDAPINENUT/fewsteprl-wan21",
+    "who": [
+      "EDAPINENUT"
+    ],
+    "event": "issue",
+    "stars": 4,
+    "language": "Python",
+    "description": "Open source repository for the paper \"Fine-tuning Few-step Diffusion Models with Reinforcement Learning\" on Wan-2.1",
+    "url": "https://github.com/EDAPINENUT/fewsteprl-wan21"
+  },
+  {
+    "full_name": "baker-laboratory/CaGE",
+    "who": [
+      "EllyTsien"
+    ],
+    "event": "issue",
+    "stars": 1,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/baker-laboratory/CaGE"
+  },
+  {
+    "full_name": "lcy2210/UDQFOLD",
+    "who": [
+      "lmqfly"
+    ],
+    "event": "mixed",
+    "stars": 0,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/lcy2210/UDQFOLD"
+  },
+  {
+    "full_name": "BioComputingUP/BioComp_resource_monitor",
+    "who": [
+      "github-actions"
+    ],
+    "event": "push",
+    "stars": 0,
+    "language": "Python",
+    "description": "Uptime and backend-API monitoring of the BioComputing UP resources (DisProt, MobiDB, RepeatsDB, PED, RING, APICURON…), every 20 minutes on GitHub Actions",
+    "url": "https://github.com/BioComputingUP/BioComp_resource_monitor"
+  }
+]
