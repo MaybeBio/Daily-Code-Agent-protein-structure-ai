@@ -1,13 +1,28 @@
 Fetching events for target(s): alexholehouse, HFChenLab, Junjie-Zhu, sirius777coder, Barakhsaana, Zuricho, Immortals-33, weitinging, ji-xiaoyue, Zirui-Fan, borrytod, xlab-BioAI, SII-ShenggengLin, xtanh, wangwrx, shaowenguang, mapleleaf6, tyang816, mingchen-li, code4luck, zy-zhou, riacd, terry-r123, bzho3923, Xinheng-He, lujiarui, ChenDdon, AspirinCode, bjing2016, prokia, Gonglab-THU, meneshail, xinshi-chen, amyxlu, LirongWu, OdinZhang, EDAPINENUT, QizhiPei, thematrixmaster, zaixizhang, pascalnotin, jsunn-y, Leo-T-Zang, WillHua127, wenjiegroup, Shenggan, yangnianzu0515, chao1224, blt2114, Oxer11, shichence, ChrisAllenMing, jchodera, jgreener64, HannesStark, Peldom, luost26, sokrypton, lmqfly...
 
+2026-11-18 18:26:56 | 💬 jgreener64 created issue 'TSS Multi GPU' in JuliaMolSim/Molly.jl
+2026-11-18 18:20:20 | 💬 jgreener64 created issue 'TSS Multi GPU' in JuliaMolSim/Molly.jl
+2026-11-18 17:06:42 | ⭐️ AspirinCode starred adrian-jasinski/pymolish
+2026-11-18 16:36:20 | ⭐️ Junjie-Zhu starred tiwarylab/mahler
+2026-11-18 16:23:30 | 🔀 sokrypton merged PR in sokrypton/localfold
+2026-11-18 16:23:22 | 🔀 sokrypton opened PR in sokrypton/localfold
+2026-11-18 16:21:52 | 🔀 sokrypton merged PR in sokrypton/localfold
+2026-11-18 16:21:41 | 🔀 sokrypton opened PR in sokrypton/localfold
+2026-11-18 16:10:48 | 🐛 EDAPINENUT closed issue in EDAPINENUT/fewsteprl-sd35: 'Verify evals on Papers with Code'
+2026-11-18 16:10:27 | 🐛 EDAPINENUT closed issue in EDAPINENUT/fewsteprl-wan21: 'Verify evals on Papers with Code'
 2026-11-18 06:19:19 | 🔀 sokrypton merged PR in sokrypton/localfold
 2026-11-18 06:19:15 | 🔀 sokrypton merged PR in sokrypton/localfold
 2026-11-18 06:15:53 | 🔀 sokrypton opened PR in sokrypton/localfold
 2026-11-18 06:15:50 | 🔀 sokrypton opened PR in sokrypton/localfold
+2026-11-18 05:55:21 | 🆕 sokrypton created branch 'bioemu2-ensemble-save' at sokrypton/localfold
 2026-11-18 05:18:18 | 🏷️  sokrypton published release v2.0.2 in sokrypton/py2Dmol
 2026-11-18 02:14:52 | ⭐️ jsunn-y starred prefix-dev/pixi
 2026-11-17 23:46:41 | 💬 sokrypton created issue 'The sequence strip flashes a residue whose letter changed' in sokrypton/py2Dmol
 2026-11-17 23:46:36 | 💬 sokrypton created issue 'See-through faded selections on the 2D painter; the strip can leave a chain out' in sokrypton/py2Dmol
+2026-11-17 21:32:25 | 🚀 sokrypton pushed to sokrypton/py2Dmol
+    - [a6a87f0] (expanded) view(pae=True).from_afdb raised KeyError: 'pae'
+2026-11-17 21:25:14 | 🚀 sokrypton pushed to sokrypton/py2Dmol
+    - [da1f8de] (expanded) PyPI page: the README is the long description
 2026-11-17 17:25:21 | 🚀 EDAPINENUT pushed to EDAPINENUT/contrast_gen
     - [26bc0d9] (expanded) Post: note that it expands FewStepRL Example 5; citation section with arXiv BibTeX
 2026-11-17 16:23:59 | ⭐️ AspirinCode starred lfs119/SynDual
