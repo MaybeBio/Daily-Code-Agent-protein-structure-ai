@@ -1,0 +1,270 @@
+"""
+tests/test_model_manager.py
+
+Tests unitarios para el model manager.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from model_manager import ModelManager
+
+
+class TestModelManagerInit:
+    """Tests de inicialización del model manager."""
+
+    def test_init_not_loaded(self):
+        """Al instanciarse, el modelo no está cargado."""
+        mm = ModelManager()
+        assert mm.is_loaded is False
+
+    def test_init_no_version(self):
+        """Al instanciarse, no hay versión de modelo."""
+        mm = ModelManager()
+        assert mm.model_version is None
+
+    def test_models_are_none(self):
+        """Al instanciarse, todos los modelos son None."""
+        mm = ModelManager()
+        assert mm.model_a is None
+        assert mm.model_null is None
+        assert mm.delta_distribution is None
+        assert mm.applicability_domain is None
+
+
+class TestLoadModelsWithoutArtifacts:
+    """Tests de carga cuando NO existen artefactos (estado Fase 1)."""
+
+    def test_load_without_artifacts_stays_degraded(self, tmp_path, monkeypatch):
+        """
+        Sin artefactos, load_models() debe completarse sin error
+        y dejar el manager en modo degradado.
+        """
+        # Apuntar los settings a paths inexistentes
+        monkeypatch.setattr(
+            "model_manager.settings.model_a_path",
+            str(tmp_path / "nonexistent_model_a.joblib"),
+        )
+        monkeypatch.setattr(
+            "model_manager.settings.model_null_path",
+            str(tmp_path / "nonexistent_model_null.joblib"),
+        )
+
+        mm = ModelManager()
+        mm.load_models()
+
+        assert mm.is_loaded is False
+        assert mm.model_a is None
+        assert mm.model_null is None
+
+
+class TestGetInfo:
+    """Tests del endpoint de metadata."""
+
+    def test_info_without_model(self):
+        """Sin modelo cargado, get_info devuelve defaults vacíos."""
+        mm = ModelManager()
+        info = mm.get_info()
+        assert info["model_version"] is None
+        assert info["training_date"] is None
+        assert info["training_samples"] is None
+        assert info["ndcg_at_10"] is None
+        assert info["spearman"] is None
+        assert info["applicability_domain_threshold"] is None
+        assert info["families_trained"] == []
+
+    def test_info_with_mock_report(self):
+        """Con training report cargado, get_info devuelve datos correctos."""
+        mm = ModelManager()
+        mm._is_loaded = True
+        mm.training_report = {
+            "status": "v0.1.0",
+            "timestamp": "2026-04-05",
+            "pdbbind_loaded": 1000,
+            "cross_validation": {
+                "model_a": {
+                    "ndcg@10": {"mean": 0.85},
+                    "spearman": {"mean": 0.65},
+                }
+            },
+            "families_trained": ["aminergic_GPCR", "kinase"],
+        }
+        mm._families_trained = ["aminergic_GPCR", "kinase"]
+        mm.applicability_domain = {
+            "threshold": 8.7,
+        }
+        info = mm.get_info()
+        assert info["model_version"] == "v0.1.0"
+        assert info["training_samples"] == 1000
+        assert info["applicability_domain_threshold"] == 8.7
+        assert "aminergic_GPCR" in info["families_trained"]
+
+
+class TestPrepareFeatureVector:
+    """Tests de preparación del vector de features (contrato A2)."""
+
+    _REPORT = {"feature_order_a": ["c_feat", "a_feat", "b_feat"]}
+
+    def test_raises_without_feature_order(self):
+        """Sin artifact ni training_report NO hay orden de features: falla
+        firme (un orden alfabético adivinado desalinearía el vector)."""
+        mm = ModelManager()
+        with pytest.raises(ValueError):
+            mm._prepare_feature_vector({"a": 1.0}, model="A")
+
+    def test_uses_training_report_order(self):
+        """Con training report, usa el orden especificado."""
+        mm = ModelManager()
+        mm.training_report = self._REPORT
+        features = {"a_feat": 1.0, "b_feat": 2.0, "c_feat": 3.0}
+        vector = mm._prepare_feature_vector(features, model="A")
+        # Orden del report: c=3, a=1, b=2
+        assert list(vector) == [3.0, 1.0, 2.0]
+
+    def test_missing_feature_imputed_with_mean(self):
+        """[A2] Feature faltante con media de entrenamiento disponible →
+        imputación por media (nunca 0.0 fabricado)."""
+        mm = ModelManager()
+        mm.training_report = {
+            "feature_order_a": ["existing", "missing"],
+        }
+        mm._feature_means = {"missing": 2.5}
+        features = {"existing": 5.0}
+        vector = mm._prepare_feature_vector(features, model="A")
+        assert list(vector) == [5.0, 2.5]
+
+    def test_missing_feature_without_mean_raises(self):
+        """[A2] Feature faltante SIN media imputable → FeatureContractViolation
+        (el caller excluye la molécula explícitamente)."""
+        mm = ModelManager()
+        mm.training_report = {
+            "feature_order_a": ["existing", "missing"],
+        }
+        mm._feature_means = {}
+        with pytest.raises(Exception) as exc:
+            mm._prepare_feature_vector({"existing": 5.0}, model="A")
+        assert "missing" in str(exc.value)
+
+    def test_non_finite_feature_raises_without_mean(self):
+        """[A2] Feature NaN/Inf sin media → violación de contrato."""
+        mm = ModelManager()
+        mm.training_report = self._REPORT
+        mm._feature_means = {}
+        with pytest.raises(Exception):
+            mm._prepare_feature_vector(
+                {"a_feat": 1.0, "b_feat": 2.0, "c_feat": float("nan")},
+                model="A",
+            )
+
+    def test_vector_dtype_float64(self):
+        """El vector debe ser float64."""
+        import numpy as np
+
+        mm = ModelManager()
+        mm.training_report = self._REPORT
+        features = {"a_feat": 1.0, "b_feat": 2.0, "c_feat": 0.0}
+        vector = mm._prepare_feature_vector(features, model="A")
+        assert vector.dtype == np.float64
+
+
+def test_missing_receptor_abstiene_modelo_y_clasificador(tmp_path):
+    from schemas import RescoreRequest
+
+    request = RescoreRequest.model_validate({
+        "smiles": "CCO",
+        "target_pdb_path": str(tmp_path / "missing.pdb"),
+        "poses": [{
+            "pdbqt_block": "ATOM      1  C1  LIG A   1       0.000   0.000   0.000",
+            "vina_score": -8.0,
+            "rmsd_lb": 0.0,
+            "rmsd_ub": 0.0,
+        }],
+        "molecular_weight": 46.07,
+        "logp": -0.31,
+        "tpsa": 20.23,
+        "hbd": 1,
+        "hba": 1,
+        "rotatable_bonds": 0,
+        "qed": 0.4,
+    })
+    result = ModelManager().predict(request)
+    assert result.score_a is None
+    assert result.classifier_prob is None
+    assert result.pose_rank_used == 0
+    assert result.vina_score_used == -8.0
+    assert result.delta.delta is None
+    assert any("Features 3D no disponibles" in w for w in result.warnings)
+
+
+def test_batch_missing_receptor_no_devuelve_probabilidad(tmp_path):
+    from schemas import RescoreRequest
+
+    class FakeModel:
+        def predict(self, matrix):
+            return [0.8]
+
+    request = RescoreRequest.model_validate({
+        "smiles": "CCO",
+        "target_pdb_path": str(tmp_path / "missing.pdb"),
+        "poses": [{
+            "pdbqt_block": "ATOM      1  C1  LIG A   1       0.000   0.000   0.000",
+            "vina_score": -8.0, "rmsd_lb": 0.0, "rmsd_ub": 0.0,
+        }],
+        "molecular_weight": 46.07, "logp": -0.31, "tpsa": 20.23,
+        "hbd": 1, "hba": 1, "rotatable_bonds": 0, "qed": 0.4,
+    })
+    mm = ModelManager()
+    mm.model_a_artifact = {"feature_names": ["mw"]}
+    mm.model_a = FakeModel()
+    mm.model_null = FakeModel()
+    result = mm.predict_batch([request])[0]
+    assert result["excluded"] is True
+    assert result["score_a"] is None
+    assert result["classifier_prob"] is None
+    assert "Features 3D no disponibles" in result["warnings"][0]
+
+@pytest.mark.parametrize("change", ["replace", "remove"])
+def test_cache_no_reutiliza_features_si_cambia_o_desaparece_receptor(tmp_path, monkeypatch, change):
+    from feature_extractor import InteractionFeatureExtractor
+    from pose_filter import PoseFilter
+    from schemas import RescoreRequest
+
+    receptor = tmp_path / "receptor.pdb"
+    receptor.write_text("receptor original", encoding="utf-8")
+    request = RescoreRequest.model_validate({
+        "smiles": "CCO", "target_pdb_path": str(receptor),
+        "poses": [{"pdbqt_block": "pose fija", "vina_score": -8.0}],
+        "molecular_weight": 46.07, "logp": -0.31, "tpsa": 20.23,
+        "hbd": 1, "hba": 1, "rotatable_bonds": 0, "qed": 0.4,
+    })
+    monkeypatch.setattr(PoseFilter, "filter_poses", lambda self, poses, target: {
+        "valid_poses": poses, "poses_passing": len(poses),
+    })
+    reads = []
+    def extract(self, pose, target, **kwargs):
+        if not Path(target).exists(): return None
+        reads.append(Path(target).read_text(encoding="utf-8"))
+        return {"close_contacts_4A": float(len(reads))}
+    monkeypatch.setattr(InteractionFeatureExtractor, "extract_from_pose", extract)
+    class FeaturesReachedModel(Exception): pass
+    def stop_at_model(*args, **kwargs): raise FeaturesReachedModel
+    manager = ModelManager()
+    monkeypatch.setattr(manager, "_contract_safe_vector", stop_at_model)
+    for _ in range(2):
+        with pytest.raises(FeaturesReachedModel): manager.predict(request)
+    assert reads == ["receptor original"]  # La caché sigue sirviendo con bytes iguales.
+    if change == "replace":
+        receptor.write_text("receptor alterado", encoding="utf-8")
+        with pytest.raises(FeaturesReachedModel): manager.predict(request)
+        assert reads == ["receptor original", "receptor alterado"]
+    else:
+        receptor.unlink()
+        result = manager.predict(request)
+        assert result.score_a is None
+        assert result.classifier_prob is None

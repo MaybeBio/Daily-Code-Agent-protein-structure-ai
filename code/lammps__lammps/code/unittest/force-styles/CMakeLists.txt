@@ -1,0 +1,472 @@
+# -*- CMake -*- file for tests of classes computing or modifying forces
+
+function(extract_tags out yaml_file)
+  file(STRINGS ${yaml_file} TAGS_LINE REGEX "^tags:")
+  string(REPLACE "tags:" "" TAGS_LINE "${TAGS_LINE}")
+  string(REGEX MATCHALL "[^, \t\r\n]+" TAGS "${TAGS_LINE}")
+  set(${out} "${TAGS}" PARENT_SCOPE)
+endfunction()
+
+find_package(Python COMPONENTS Interpreter)
+if(Python_EXECUTABLE)
+  add_custom_target(check-tests
+    ${Python_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/check_tests.py
+    -s ${LAMMPS_SOURCE_DIR} -t ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    COMMENT "Check completeness of force style tests")
+endif()
+
+# the test programs get the input folder as compile definition.  on Windows it must be a
+# native path with escaped backslashes, since some tests pass it to "shell copy" commands.
+# globbing and test arguments must keep the forward slash version: CMake 4.4.3 and later
+# escape backslashes when recording the results of CONFIGURE_DEPENDS globs, so a pattern
+# with backslashes never matches its record and every build re-runs CMake without end.
+set(TEST_INPUT_FOLDER ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+if(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  string(REPLACE "/" "\\\\" TEST_INPUT_FOLDER_NATIVE "${TEST_INPUT_FOLDER}")
+else()
+  set(TEST_INPUT_FOLDER_NATIVE ${TEST_INPUT_FOLDER})
+endif()
+add_library(style_tests STATIC ../yaml_writer.cpp ../error_stats.cpp test_config_reader.cpp test_main.cpp)
+if(YAML_FOUND)
+  target_compile_definitions(style_tests PRIVATE TEST_INPUT_FOLDER=${TEST_INPUT_FOLDER_NATIVE})
+else()
+  # we always use static linkage with local compiled libyaml
+  target_compile_definitions(style_tests PRIVATE TEST_INPUT_FOLDER=${TEST_INPUT_FOLDER_NATIVE} YAML_DECLARE_STATIC)
+endif()
+target_include_directories(style_tests PRIVATE "${LAMMPS_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_link_libraries(style_tests PUBLIC GTest::GMock Yaml::Yaml lammps)
+
+# propagate sanitizer options to test tools
+if(ENABLE_SANITIZER AND (NOT (ENABLE_SANITIZER STREQUAL "none")))
+  target_compile_options(style_tests PUBLIC -fsanitize=${ENABLE_SANITIZER})
+  target_link_options(style_tests PUBLIC -fsanitize=${ENABLE_SANITIZER})
+endif()
+
+# unit test for error stats class
+add_executable(test_error_stats test_error_stats.cpp)
+target_include_directories(test_error_stats PRIVATE "${CMAKE_CURRENT_SOURCE_DIR};${LAMMPS_SOURCE_DIR};${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_link_libraries(test_error_stats PRIVATE GTest::GMockMain)
+add_test(NAME ErrorStats COMMAND test_error_stats)
+
+# pair style tester
+add_executable(test_pair_style test_pair_style.cpp)
+target_link_libraries(test_pair_style PRIVATE lammps style_tests)
+target_include_directories(test_pair_style PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
+if(FFT_SINGLE)
+  target_compile_definitions(test_pair_style PRIVATE -DFFT_SINGLE)
+endif()
+
+# self-contained tester for the PERI package pair styles (no YAML reference)
+if(PKG_PERI)
+  add_executable(test_pair_peri test_pair_peri.cpp)
+  target_include_directories(test_pair_peri PRIVATE ${LAMMPS_SOURCE_DIR})
+  target_link_libraries(test_pair_peri PRIVATE lammps GTest::GMock)
+  add_test(NAME PairPeri COMMAND test_pair_peri)
+endif()
+
+if(PKG_QMMM-XTB)
+  add_executable(test_qmmm_xtb_ewald test_qmmm_xtb_ewald.cpp)
+  target_include_directories(test_qmmm_xtb_ewald PRIVATE ${LAMMPS_SOURCE_DIR}/QMMM-XTB)
+  target_link_libraries(test_qmmm_xtb_ewald PRIVATE lammps GTest::GMockMain)
+  add_test(NAME QMMMXTBEwald COMMAND test_qmmm_xtb_ewald)
+endif()
+
+# prepare environment for testers
+if(WIN32)
+  set(FORCE_TEST_ENVIRONMENT PYTHONPATH=${TEST_INPUT_FOLDER})
+else()
+  set(FORCE_TEST_ENVIRONMENT PYTHONPATH=${TEST_INPUT_FOLDER}:${LAMMPS_PYTHON_DIR}:$ENV{PYTHONPATH})
+endif()
+list(APPEND FORCE_TEST_ENVIRONMENT "PYTHONUNBUFFERED=1")
+list(APPEND FORCE_TEST_ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1")
+list(APPEND FORCE_TEST_ENVIRONMENT "OMP_PROC_BIND=false")
+list(APPEND FORCE_TEST_ENVIRONMENT "OMP_NUM_THREADS=4")
+list(APPEND FORCE_TEST_ENVIRONMENT "LAMMPS_POTENTIALS=${LAMMPS_POTENTIALS_DIR}")
+get_property(BUILD_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(BUILD_IS_MULTI_CONFIG)
+  set(LAMMPS_LIB_PATH ${CMAKE_BINARY_DIR}/$<CONFIG>)
+else()
+  set(LAMMPS_LIB_PATH ${CMAKE_BINARY_DIR})
+endif()
+if(APPLE)
+  list(APPEND FORCE_TEST_ENVIRONMENT "DYLD_LIBRARY_PATH=${LAMMPS_LIB_PATH}:$ENV{DYLD_LIBRARY_PATH}")
+elseif(WIN32)
+  list(APPEND FORCE_TEST_ENVIRONMENT "LAMMPSDLLPATH=${LAMMPS_LIB_PATH}")
+else()
+  list(APPEND FORCE_TEST_ENVIRONMENT "LD_LIBRARY_PATH=${LAMMPS_LIB_PATH}:$ENV{LD_LIBRARY_PATH}")
+endif()
+
+# tests for molecular systems and related pair styles
+file(GLOB MOL_PAIR_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/mol-pair-*.yaml)
+# cannot test MSM with single precision data
+if(FFT_SINGLE)
+  list(FILTER MOL_PAIR_TESTS EXCLUDE REGEX "msm")
+endif()
+foreach(TEST ${MOL_PAIR_TESTS})
+  string(REGEX REPLACE "^.*mol-pair-(.*)\.yaml" "MolPairStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_pair_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+# tests for metal-like atomic systems and related pair styles
+file(GLOB ATOMIC_PAIR_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/atomic-pair-*.yaml)
+foreach(TEST ${ATOMIC_PAIR_TESTS})
+  string(REGEX REPLACE "^.*atomic-pair-(.*)\.yaml" "AtomicPairStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_pair_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+# tests for Si-like manybody systems and related pair styles
+file(GLOB MANYBODY_PAIR_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/manybody-pair-*.yaml)
+foreach(TEST ${MANYBODY_PAIR_TESTS})
+  string(REGEX REPLACE "^.*manybody-pair-(.*)\.yaml" "ManybodyPairStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_pair_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+# tests for ellipsoid shape particle systems and related pair styles
+file(GLOB ELLIPSOID_PAIR_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/ellipsoid-pair-*.yaml)
+foreach(TEST ${ELLIPSOID_PAIR_TESTS})
+  string(REGEX REPLACE "^.*ellipsoid-pair-(.*)\.yaml" "EllipsoidPairStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_pair_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+# tests for body particles (atom_style body) and related pair styles
+file(GLOB BODY_PAIR_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/body-pair-*.yaml)
+foreach(TEST ${BODY_PAIR_TESTS})
+  string(REGEX REPLACE "^.*body-pair-(.*)\.yaml" "BodyPairStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_pair_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+# tests for magnetic (atom_style spin) systems and related pair styles
+file(GLOB SPIN_PAIR_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/spin-pair-*.yaml)
+foreach(TEST ${SPIN_PAIR_TESTS})
+  string(REGEX REPLACE "^.*spin-pair-(.*)\.yaml" "SpinPairStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_pair_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+file(GLOB SPH_PAIR_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/sph-pair-*.yaml)
+foreach(TEST ${SPH_PAIR_TESTS})
+  string(REGEX REPLACE "^.*sph-pair-(.*)\.yaml" "SPHPairStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_pair_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+file(GLOB MESO_PAIR_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/meso-pair-*.yaml)
+foreach(TEST ${MESO_PAIR_TESTS})
+  string(REGEX REPLACE "^.*meso-pair-(.*)\.yaml" "MesoPairStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_pair_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+# bond style tester
+add_executable(test_bond_style test_bond_style.cpp)
+target_include_directories(test_bond_style PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_link_libraries(test_bond_style PRIVATE lammps style_tests)
+
+file(GLOB BOND_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/bond-*.yaml)
+foreach(TEST ${BOND_TESTS})
+  string(REGEX REPLACE "^.*bond-(.*)\.yaml" "BondStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_bond_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+# angle style tester
+add_executable(test_angle_style test_angle_style.cpp)
+target_link_libraries(test_angle_style PRIVATE lammps style_tests)
+target_include_directories(test_angle_style PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
+
+file(GLOB ANGLE_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/angle-*.yaml)
+foreach(TEST ${ANGLE_TESTS})
+  string(REGEX REPLACE "^.*angle-(.*)\.yaml" "AngleStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_angle_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+# kspace style tester, currently uses the pair style tool
+file(GLOB KSPACE_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/kspace-*.yaml)
+# cannot test MSM with single precision data
+if(FFT_SINGLE)
+  list(FILTER KSPACE_TESTS EXCLUDE REGEX "msm")
+endif()
+foreach(TEST ${KSPACE_TESTS})
+  string(REGEX REPLACE "^.*kspace-(.*)\.yaml" "KSpaceStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_pair_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+# tester for timestepping fixes
+add_executable(test_fix_timestep test_fix_timestep.cpp)
+if(NOT BUILD_SHARED_LIBS)
+  target_compile_definitions(test_fix_timestep PRIVATE USING_STATIC_LIBS=1)
+endif()
+if(FFT_SINGLE)
+  target_compile_definitions(test_fix_timestep PRIVATE -DFFT_SINGLE)
+endif()
+target_link_libraries(test_fix_timestep PRIVATE lammps style_tests)
+target_include_directories(test_fix_timestep PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
+
+# tests for timestep related fixes (time integration, thermostat, force manipulation, constraints/restraints)
+file(GLOB FIX_TIMESTEP_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/fix-timestep-*.yaml)
+foreach(TEST ${FIX_TIMESTEP_TESTS})
+  string(REGEX REPLACE "^.*fix-timestep-(.*)\.yaml" "FixTimestep:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_fix_timestep ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+# tester for minimizer styles
+add_executable(test_min_style test_min_style.cpp)
+target_link_libraries(test_min_style PRIVATE lammps style_tests)
+target_include_directories(test_min_style PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
+
+# tests for minimizer styles and their min_modify options
+file(GLOB MIN_STYLE_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/min-*.yaml)
+foreach(TEST ${MIN_STYLE_TESTS})
+  string(REGEX REPLACE "^.*min-(.*)\.yaml" "MinStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_min_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+# tester for output data of compute and fix styles
+add_executable(test_output_style test_output_style.cpp)
+target_link_libraries(test_output_style PRIVATE lammps style_tests)
+target_include_directories(test_output_style PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
+
+# tests for the output data of compute styles and of reporting fixes
+file(GLOB OUTPUT_STYLE_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS
+     ${TEST_INPUT_FOLDER}/compute-*.yaml ${TEST_INPUT_FOLDER}/fix-output-*.yaml)
+foreach(TEST ${OUTPUT_STYLE_TESTS})
+  string(REGEX REPLACE "^.*tests.(.*)\.yaml" "OutputStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_output_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+# dihedral style tester
+add_executable(test_dihedral_style test_dihedral_style.cpp)
+target_link_libraries(test_dihedral_style PRIVATE lammps style_tests)
+target_include_directories(test_dihedral_style PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
+
+file(GLOB DIHEDRAL_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/dihedral-*.yaml)
+foreach(TEST ${DIHEDRAL_TESTS})
+  string(REGEX REPLACE "^.*dihedral-(.*)\.yaml" "DihedralStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_dihedral_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+# improper style tester
+add_executable(test_improper_style test_improper_style.cpp)
+target_link_libraries(test_improper_style PRIVATE lammps style_tests)
+target_include_directories(test_improper_style PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
+
+file(GLOB IMPROPER_TESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/improper-*.yaml)
+foreach(TEST ${IMPROPER_TESTS})
+  string(REGEX REPLACE "^.*improper-(.*)\.yaml" "ImproperStyle:\\1" TNAME ${TEST})
+  extract_tags(TEST_TAGS ${TEST})
+  list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+  if(_SKIPME GREATER_EQUAL 0)
+    continue()
+  endif()
+  add_test(NAME ${TNAME} COMMAND test_improper_style ${TEST})
+  set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+  set_tests_properties(${TNAME} PROPERTIES LABELS "${TEST_TAGS}")
+endforeach()
+
+if(MLIAP_ENABLE_PYTHON AND (NOT WIN32))
+  add_executable(test_mliappy_unified test_mliappy_unified.cpp)
+  target_link_libraries(test_mliappy_unified PRIVATE lammps GTest::GMockMain)
+  add_test(NAME TestMliapPyUnified COMMAND test_mliappy_unified)
+  set_tests_properties(TestMliapPyUnified PROPERTIES ENVIRONMENT "${FORCE_TEST_ENVIRONMENT}")
+endif()
+
+add_executable(test_pair_list test_pair_list.cpp)
+target_link_libraries(test_pair_list PRIVATE lammps GTest::GMockMain)
+add_test(NAME TestPairList COMMAND test_pair_list)
+
+if(PKG_EXTRA-FIX)
+  add_executable(test_fix_symmetry test_fix_symmetry.cpp)
+  target_link_libraries(test_fix_symmetry PRIVATE lammps GTest::GMock GTest::GMockMain)
+  add_test(NAME FixSymmetry COMMAND test_fix_symmetry)
+endif()
+
+########################################################################
+# "package kokkos" profiles
+#
+# The KOKKOS package has several accelerator settings a run may vary (neigh,
+# newton, comm, sort, atom/map, gpu/aware), and testing their cross product
+# would mean hundreds of configurations per reference.  That is not needed,
+# because the settings fall into two groups:
+#
+#  - neigh and newton pick which kernel template of a style runs, so they
+#    interact with the style and are varied per reference already: every
+#    KOKKOS test case exists twice, as "kokkos_*" (half list, newton on) and
+#    as "kokkos_*_full" (full list, newton off).
+#  - comm, sort, atom/map and gpu/aware pick which framework path runs - the
+#    per-atom packing of AtomVec, the atom sorting, the atom map, the MPI
+#    buffer placement - and that code is the same whatever style is loaded.
+#
+# The profiles below are a covering set rather than a cross product: they
+# start from the two defaults - the ones a CPU build and a GPU build of the
+# package choose for themselves - and add cross terms, so that between them
+# every value of comm, sort, atom/map and gpu/aware, and both values of neigh
+# and newton, is used at least once.  A style that refuses one of the
+# settings skips instead of failing, so a profile run reports what the styles
+# do support.
+#
+# They are off by default because they multiply the number of test entries.
+# Turn them on to run the whole suite through every setting once, which is
+# what a build configured with -D KOKKOS_DEBUG_SYNC=on needs: with the host
+# defaults the atom exchange, the border builds, the sort and the atom map
+# never touch a device view, so the transfers that build exists to check are
+# not made at all.
+########################################################################
+
+option(ENABLE_KOKKOS_PROFILE_TESTS "Run every force style test through each package kokkos setting once" OFF)
+mark_as_advanced(ENABLE_KOKKOS_PROFILE_TESTS)
+
+if(PKG_KOKKOS AND ENABLE_KOKKOS_PROFILE_TESTS)
+  # the two named profiles are the defaults "package kokkos" itself picks,
+  # spelled out: cpudefault is what a build without a GPU gets, gpudefault
+  # what a build with one gets.  the cross profiles then vary one group of
+  # settings against the other group's default.
+  set(KOKKOS_PROFILE_NAMES  cpudefault  gpudefault
+                            cross-hostpath  cross-devicehalf
+                            cross-nogpuaware  cross-nosort)
+  set(KOKKOS_PROFILE_cpudefault       "-pk kokkos comm no sort no atom/map no neigh half newton on")
+  set(KOKKOS_PROFILE_gpudefault       "-pk kokkos comm device sort device atom/map device gpu/aware on neigh full newton off")
+  set(KOKKOS_PROFILE_cross-hostpath   "-pk kokkos comm host sort host atom/map host neigh half newton off")
+  set(KOKKOS_PROFILE_cross-devicehalf "-pk kokkos comm device sort device atom/map device gpu/aware on neigh half newton on")
+  set(KOKKOS_PROFILE_cross-nogpuaware "-pk kokkos comm device sort device atom/map device gpu/aware off neigh full newton off")
+  # "neigh full" requires "newton off", so this profile keeps the half list
+  set(KOKKOS_PROFILE_cross-nosort     "-pk kokkos comm device sort no atom/map no neigh half newton on")
+
+  # the prefix, the driver and the file name pattern of every reference group,
+  # in the same order the groups are registered above
+  set(KOKKOS_PROFILE_GROUPS
+      "MolPairStyle|test_pair_style|mol-pair-"
+      "AtomicPairStyle|test_pair_style|atomic-pair-"
+      "ManybodyPairStyle|test_pair_style|manybody-pair-"
+      "BondStyle|test_bond_style|bond-"
+      "AngleStyle|test_angle_style|angle-"
+      "DihedralStyle|test_dihedral_style|dihedral-"
+      "ImproperStyle|test_improper_style|improper-"
+      "FixTimestep|test_fix_timestep|fix-timestep-"
+      "MinStyle|test_min_style|min-")
+
+  foreach(GROUP ${KOKKOS_PROFILE_GROUPS})
+    string(REPLACE "|" ";" PARTS ${GROUP})
+    list(GET PARTS 0 GPREFIX)
+    list(GET PARTS 1 GDRIVER)
+    list(GET PARTS 2 GPATTERN)
+    file(GLOB GTESTS LIST_DIRECTORIES false CONFIGURE_DEPENDS ${TEST_INPUT_FOLDER}/${GPATTERN}*.yaml)
+    foreach(TEST ${GTESTS})
+      get_filename_component(TBASE ${TEST} NAME_WE)
+      string(REPLACE "${GPATTERN}" "" TSHORT ${TBASE})
+      extract_tags(TEST_TAGS ${TEST})
+      list(FIND TEST_TAGS "no${CMAKE_SYSTEM_NAME}" _SKIPME)
+      if(_SKIPME GREATER_EQUAL 0)
+        continue()
+      endif()
+      foreach(PROFILE ${KOKKOS_PROFILE_NAMES})
+        set(TNAME "${GPREFIX}:${TSHORT}:kk-${PROFILE}")
+        add_test(NAME ${TNAME} COMMAND ${GDRIVER} ${TEST})
+        set(PROFILE_ENV ${FORCE_TEST_ENVIRONMENT})
+        list(APPEND PROFILE_ENV "LAMMPS_KOKKOS_ARGS=${KOKKOS_PROFILE_${PROFILE}}")
+        set_tests_properties(${TNAME} PROPERTIES ENVIRONMENT "${PROFILE_ENV}")
+        set_tests_properties(${TNAME} PROPERTIES LABELS "kokkos_profile;${TEST_TAGS}")
+      endforeach()
+    endforeach()
+  endforeach()
+endif()

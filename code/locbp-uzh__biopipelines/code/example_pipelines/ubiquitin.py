@@ -1,0 +1,38 @@
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+# tested: 
+
+from biopipelines.pipeline import *
+from biopipelines import SolubleMPNN, AlphaFold, ConformationalChange, Panda, DNAEncoder
+
+
+with Pipeline(project="Ubiquitin", job="InverseFolding"):
+    Resources(gpu="A100", time="4:00:00", memory="16GB")
+    ubiquitin = PDB("4LCD",
+                    chain="E")
+    sequences = SolubleMPNN(structures=ubiquitin,
+                            num_sequences=10)
+    folded = AlphaFold(proteins=sequences)
+    dna = DNAEncoder(sequences=sequences, 
+                     organism="EC")
+    conf_change = ConformationalChange(reference_structures = ubiquitin,
+                                       target_structures = folded)
+    filtered_sequences = Panda(tables=[folded.tables.confidence,
+                                       conf_change.tables.changes],
+                               operations=[Panda.merge(),
+                                           Panda.filter("RMSD < 1.5 and plddt > 80")],
+                               pool=sequences)
+    dna = DNAEncoder(sequences=filtered_sequences, 
+                     organism="EC") 
+
+
+
+
+
+
+
+
+
+

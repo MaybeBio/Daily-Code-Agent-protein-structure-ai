@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+"""
+Helper script for ExtractMetrics tool.
+
+Extracts multiple specific metrics from multiple tables and creates
+separate CSV files for each metric, formatted for easy import into
+statistical analysis software like Prism.
+"""
+
+import pandas as pd
+import numpy as np
+import argparse
+import json
+import sys
+import os
+
+
+def read_metric_csv(path):
+    """Read one metrics CSV, or None if it cannot be read.
+
+    Deliberately not named for the framework helper: ``biopipelines_io``'s namesake
+    resolves a TABLE_REFERENCE and returns (frame, column), a different contract.
+    """
+    try:
+        return pd.read_csv(path)
+    except Exception as e:
+        print(f"Error loading table {path}: {e}")
+        return None
+
+
+def extract_single_metric(tables, table_paths, table_names, metric):
+    """
+    Extract a single metric from multiple tables.
+
+    Args:
+        tables: List of pandas DataFrames
+        table_paths: List of file paths
+        table_names: List of column names for output
+        metric: Name of metric column to extract
+
+    Returns:
+        pandas DataFrame with extracted metric values
+    """
+    # Check which tables have the metric
+    valid_tables = []
+    valid_names = []
+
+    for df, path, name in zip(tables, table_paths, table_names):
+        if df is None:
+            print(f"  Skipping invalid table: {path}")
+            continue
+
+        if metric not in df.columns:
+            print(f"  Warning: Metric '{metric}' not found in {path}")
+            continue
+
+        valid_tables.append(df)
+        valid_names.append(name)
+
+    if not valid_tables:
+        print(f"  Error: Metric '{metric}' not found in any table")
+        return pd.DataFrame(columns=table_names)
+
+    print(f"  Found metric '{metric}' in {len(valid_tables)} tables")
+
+    # Extract metric values from each table
+    extracted_data = {}
+
+    for df, name in zip(valid_tables, valid_names):
+        # Extract metric values, converting to numeric and removing NaN
+        metric_values = pd.to_numeric(df[metric], errors='coerce').dropna()
+        extracted_data[name] = list(metric_values)
+
+        print(f"    {name}: {len(metric_values)} values")
+
+    # Find the maximum number of values to create DataFrame
+    max_length = max(len(values) for values in extracted_data.values()) if extracted_data else 0
+
+    # Pad shorter columns with NaN
+    for name in extracted_data:
+        while len(extracted_data[name]) < max_length:
+            extracted_data[name].append(np.nan)
+
+    # Add empty columns for tables that didn't have this metric
+    for name in table_names:
+        if name not in extracted_data:
+            extracted_data[name] = [np.nan] * max_length
+
+    # Create DataFrame with consistent column order
+    if max_length > 0:
+        result_df = pd.DataFrame({name: extracted_data[name] for name in table_names})
+    else:
+        # Create empty DataFrame with correct column names
+        result_df = pd.DataFrame(columns=table_names)
+
+    return result_df
+
+
+def extract_multiple_metrics(tables, table_paths, table_names, metrics, output_folder):
+    """
+    Extract multiple metrics from multiple tables.
+
+    Args:
+        tables: List of pandas DataFrames
+        table_paths: List of file paths
+        table_names: List of column names for output
+        metrics: List of metric names to extract
+        output_folder: Directory to save output files
+
+    Returns:
+        Dictionary mapping metric names to output file paths
+    """
+    output_files = {}
+
+    for metric in metrics:
+        print(f"Extracting metric: {metric}")
+
+        # Extract this metric
+        extracted_df = extract_single_metric(tables, table_paths, table_names, metric)
+
+        # Save to separate CSV file
+        output_path = os.path.join(output_folder, f"{metric}.csv")
+        extracted_df.to_csv(output_path, index=False, na_rep='')
+
+        output_files[metric] = output_path
+
+        print(f"  Saved to: {output_path}")
+        print(f"  Output shape: {extracted_df.shape}")
+
+        if not extracted_df.empty:
+            print(f"  Sample values:")
+            print(f"  {extracted_df.head().to_string()}")
+        else:
+            print(f"  No data extracted")
+        print()
+
+    return output_files
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Extract multiple metrics from multiple tables')
+    parser.add_argument('--config', required=True, help='Configuration file path')
+    args = parser.parse_args()
+
+    # Load configuration
+    try:
+        with open(args.config, 'r') as f:
+            config = json.load(f)
+    except Exception as e:
+        print(f"Error loading configuration: {e}")
+        sys.exit(1)
+
+    table_paths = config['tables']
+    metrics = config['metrics']
+    table_names = config['table_names']
+    output_folder = config['output_folder']
+
+    print(f"Extracting {len(metrics)} metrics from {len(table_paths)} tables")
+    print(f"Metrics: {', '.join(metrics)}")
+    print(f"Output folder: {output_folder}")
+    print()
+
+    # Load all tables
+    tables = []
+    for path in table_paths:
+        print(f"Loading: {path}")
+        df = read_metric_csv(path)
+        tables.append(df)
+        if df is not None:
+            print(f"  Shape: {df.shape}")
+            print(f"  Columns: {list(df.columns)}")
+        else:
+            print(f"  Failed to load")
+    print()
+
+    loaded_count = sum(1 for df in tables if df is not None)
+    if loaded_count == 0:
+        print(f"Error: None of the {len(table_paths)} input tables could be loaded")
+        sys.exit(1)
+
+    # Extract metrics
+    try:
+        output_files = extract_multiple_metrics(tables, table_paths, table_names, metrics, output_folder)
+
+        print(f"Successfully extracted {len(output_files)} metrics:")
+        for metric, filepath in output_files.items():
+            print(f"  {metric}: {filepath}")
+
+    except Exception as e:
+        print(f"Error extracting metrics: {e}")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

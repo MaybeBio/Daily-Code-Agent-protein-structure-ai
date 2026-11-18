@@ -1,0 +1,148 @@
+"""El validador de sellos para forks tiene que demostrar que ve (AGENTS.md, restricción 2).
+
+Un guardián que aprobara todo pasaría en verde sobre un sello roto. Se le da un
+árbol sintético con un fichero de cada clase y se comprueba que clasifica cada
+uno como debe: lo alterado y lo ausente sin declarar son fallos; lo no
+distribuido declarado y la divergencia con copia conservada, no.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import types
+from pathlib import Path
+
+import pytest
+
+RAIZ = Path(__file__).resolve().parents[2]
+
+
+def _modulo():
+    spec = importlib.util.spec_from_file_location("validar_sellos", RAIZ / "scripts" / "validar_sellos.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _sha(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+@pytest.fixture
+def arbol(tmp_path, monkeypatch):
+    vs = _modulo()
+    (tmp_path / "datos").mkdir()
+    (tmp_path / "datos" / "bueno.txt").write_bytes(b"bueno\r\n")
+    (tmp_path / "datos" / "alterado.txt").write_bytes(b"cambiado\n")
+    (tmp_path / "datos" / "vivo.txt").write_bytes(b"version nueva\n")
+    exp = tmp_path / "artifacts" / "EXP-1"
+    (exp / "sellado_original" / "datos").mkdir(parents=True)
+    (exp / "sellado_original" / "datos" / "vivo.txt").write_bytes(b"version sellada\n")
+    manifest = {"sealed": True, "dataset_hashes": {
+        "datos/bueno.txt": _sha(b"bueno\r\n"),
+        "datos/alterado.txt": _sha(b"original\n"),
+        "privado/pdbbind/1abc.pdb": _sha(b"no viaja"),
+        "datos/perdido.txt": _sha(b"nadie lo tiene"),
+        "datos/vivo.txt": _sha(b"version sellada\n"),
+    }}
+    (exp / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    tabla = {"entradas": [{"prefijo": "privado/pdbbind/", "clase": "NO_REDISTRIBUIBLE", "motivo": "licencia",
+                           "como_obtenerlo": "descargarlo"}],
+             "divergencias_declaradas": [{"experimento": "EXP-1", "ruta": "datos/vivo.txt",
+                                          "hash_sellado": _sha(b"version sellada\n"),
+                                          "copia_conservada": "artifacts/EXP-1/sellado_original/datos/vivo.txt",
+                                          "motivo": "prueba"}]}
+    (tmp_path / "tabla.json").write_text(json.dumps(tabla), encoding="utf-8")
+
+    real = vs._cargar_manifest_tool()
+    falso = types.SimpleNamespace(
+        _load_schema=lambda: {}, _validate=lambda *a: None, _git_toplevel=lambda: str(tmp_path),
+        _resolve_stored_path=real._resolve_stored_path, _sha256_file=real._sha256_file)
+    monkeypatch.setattr(vs, "_cargar_manifest_tool", lambda: falso)
+    monkeypatch.setattr(vs, "ARTEFACTOS", tmp_path / "artifacts")
+    monkeypatch.setattr(vs, "TABLA", tmp_path / "tabla.json")
+    monkeypatch.setattr(vs, "RAIZ", tmp_path)
+    monkeypatch.setattr(vs, "GITATTRIBUTES", tmp_path / ".gitattributes")
+    return vs
+
+
+def test_clasifica_cada_fichero_como_debe(arbol):
+    totales, info = arbol.revisar()
+
+    assert totales["VERIFICADO"] == 1
+    assert totales["EN_COPIA"] == 1
+    assert totales["NO_DISTRIBUIDO"] == 1
+    assert totales["DISTINTO"] == 1
+    assert totales["AUSENTE"] == 1
+    assert sorted(info["fallos"]["EXP-1"]) == ["AUSENTE: datos/perdido.txt", "DISTINTO: datos/alterado.txt"]
+
+
+def test_una_divergencia_sin_copia_valida_sigue_siendo_un_fallo(arbol):
+    copia = arbol.RAIZ / "artifacts" / "EXP-1" / "sellado_original" / "datos" / "vivo.txt"
+    copia.write_bytes(b"alguien toco la copia\n")
+
+    _, info = arbol.revisar()
+
+    assert "DISTINTO: datos/vivo.txt" in info["fallos"]["EXP-1"]
+
+
+def test_el_repositorio_real_valida_entero():
+    """La misma comprobación que la CI: los 167 sellos, desde este árbol."""
+    totales, info = _modulo().revisar()
+
+    assert not info["fallos"], f"sellos que no validan: {sorted(info['fallos'])[:10]}"
+    assert totales["sellados"] >= 167
+
+
+def test_re_sello_mantenido_no_certifica_productor(arbol):
+    manifest_path = arbol.RAIZ / "artifacts" / "EXP-1" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["seal_maintenance"] = [
+        {"path": "datos/bueno.txt", "previous_hash": _sha(b"anterior")},
+        {"path": "datos/vivo.txt", "previous_hash": _sha(b"antes del sello")},
+    ]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    totales, info = arbol.revisar()
+    assert totales["MANTENIDO"] == 1
+    assert totales["MANTENIDO_EN_COPIA"] == 1
+    assert info["experimentos_mantenidos"] == 1
+
+
+def test_pdb_comprimido_solo_valida_si_bytes_descomprimidos_coinciden(arbol):
+    import gzip
+    manifest_path = arbol.RAIZ / "artifacts" / "EXP-1" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    ruta = "data/targets/3F75/raw.pdb"
+    manifest["dataset_hashes"][ruta] = _sha(b"ATOM EXACTO\n")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    compressed = arbol.RAIZ / "data" / "targets" / "3F75" / "raw.pdb.gz"
+    compressed.parent.mkdir(parents=True)
+    compressed.write_bytes(gzip.compress(b"ATOM EXACTO\n"))
+    totales, _ = arbol.revisar()
+    assert totales["VERIFICADO_GZ"] == 1
+    compressed.write_bytes(gzip.compress(b"OTRO\n"))
+    totales, info = arbol.revisar()
+    assert totales["VERIFICADO_GZ"] == 0
+    assert f"GZ_DISTINTO: {ruta}" in info["fallos"]["EXP-1"]
+
+
+def test_una_copia_conservada_que_git_convierte_es_un_fallo(arbol):
+    """La copia de PREP-01 estaba en git con LF y sólo validaba donde git la desprotegía con CRLF."""
+    import subprocess
+    raiz = arbol.RAIZ
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(raiz), *args], check=True, capture_output=True)
+
+    git("init", "-q")
+    git("add", "-A")
+    copia = "artifacts/EXP-1/sellado_original/datos/vivo.txt"
+    assert copia in arbol._activos_de_texto_fuera()
+    assert copia in arbol.con_conversion(arbol._activos_de_texto_fuera())
+
+    (raiz / ".gitattributes").write_bytes(b"*.bin binary\n")
+    arbol.escribir_gitattributes()
+    assert f"{copia} -text" in (raiz / ".gitattributes").read_text(encoding="utf-8")
+    assert arbol.con_conversion(arbol._activos_de_texto_fuera()) == []

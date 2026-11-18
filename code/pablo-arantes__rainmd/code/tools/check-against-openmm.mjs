@@ -1,0 +1,178 @@
+/**
+ * Hold the host reference to OpenMM's own numbers, term by term.
+ *
+ * 🔴 PER TERM, AND WITH LJ AND COULOMB SEPARATED BY THE ORACLE'S OWN ZEROING
+ * ARMS. A total-energy comparison on this fixture passes while the reciprocal
+ * sum is a quarter of its true value and the self energy makes up the
+ * difference, because those two are large and opposite. The oracle builds the
+ * same system three times - whole, charges zeroed, epsilons zeroed - precisely
+ * so that LJ and Coulomb can be compared on their own.
+ *
+ *   node tools/check-against-openmm.mjs
+ */
+import { readFileSync } from "node:fs";
+import { buildRestraints } from "../shared/topology/restraints.js";
+import { parsePrmtop } from "../shared/amber/prmtop.js";
+import { parseInpcrd } from "../shared/amber/inpcrd.js";
+import { buildSystem } from "../shared/topology/system.js";
+import { potentialEnergy } from "../cpu/energy.js";
+
+const fixture = (name) => new URL(`../test/fixtures/${name}`, import.meta.url);
+
+const CASES = [
+  {
+    name: "ala-vac / NoCutoff / unconstrained",
+    topology: "ala-vac", reference: "ala-vac-nocutoff.json",
+    build: { constraints: "none", rigidWater: false, cutoff: 0 },
+    evaluate: { method: "NoCutoff" },
+  },
+  {
+    name: "ala-wat / PME 24^3 / unconstrained",
+    topology: "ala-wat", reference: "ala-wat-pme-free.json",
+    build: { constraints: "none", rigidWater: false, cutoff: 1.0 },
+    evaluate: { method: "PME", alpha: 2.6282608939112583, grid: [24, 24, 24] },
+  },
+  {
+    name: "ala-wat / PME 24^3 / HBonds + rigid water",
+    topology: "ala-wat", reference: "ala-wat-pme.json",
+    build: { constraints: "HBonds", rigidWater: true, cutoff: 1.0 },
+    evaluate: { method: "PME", alpha: 2.6282608939112583, grid: [24, 24, 24] },
+  },
+  // 🔴 THE TRUNCATED-OCTAHEDRON CASE IS DELIBERATELY NOT HERE, AND ITS ABSENCE
+  // IS A FINDING RATHER THAN AN OVERSIGHT. `test/fixtures/ala-oct.*` and
+  // `ala-oct-pme.json` exist and the reciprocal sum on that box is gated - by an
+  // exact lattice sum in `test/physics.test.js`, which is the oracle that found
+  // the transposed wave vector in the first place. What cannot be gated here
+  // yet is the whole system: against OpenMM on that box the DIRECT-space terms
+  // disagree by 0.082 kJ/mol in LJ (3.07e-5) and 2.115 in Coulomb (1.36e-4),
+  // and both are independent of the PME grid - identical at 24^3 and 48^3 - so
+  // they are not the grid floor and not the reciprocal sum. Adding the case
+  // with a tolerance wide enough to pass would be loosening a tolerance to make
+  // a check pass, which this project does not do. See docs/REVIEW.md.
+
+  {
+    // 🔴 THE EQUILIBRATION STAGE'S RESTRAINT, SCORED AT A DISPLACED STRUCTURE.
+    // A positional restraint evaluated at its own reference is exactly zero, so
+    // this case reads the DISPLACED coordinates out of the dump and restrains
+    // them towards the file's own - which is the only configuration in which
+    // the term has a value to compare. The notebooks' convention is `k*d^2`
+    // with no half, and the selection is solute heavy atoms.
+    name: "ala-wat / PME / HBonds / restrained at 500 kJ/mol/nm^2",
+    topology: "ala-wat", reference: "ala-wat-restraint-500.json",
+    build: { constraints: "HBonds", rigidWater: true, cutoff: 1.0 },
+    evaluate: { method: "PME", alpha: 2.6282608939112583, grid: [24, 24, 24] },
+    restrained: true,
+  },
+];
+
+let failures = 0;
+let comparisons = 0;
+
+for (const testCase of CASES) {
+  const topology = parsePrmtop(readFileSync(fixture(`${testCase.topology}.prmtop`), "utf8"));
+  const coordinates = parseInpcrd(
+    readFileSync(fixture(`${testCase.topology}.inpcrd`), "utf8"),
+    { expectedAtomCount: topology.atomCount },
+  );
+  const system = buildSystem(topology, { ...testCase.build, box: coordinates.box });
+  const reference = JSON.parse(readFileSync(fixture(testCase.reference), "utf8"));
+  // A restrained case evaluates the DUMP's coordinates, restrained towards the
+  // file's, so both sides score one configuration rather than two that are
+  // meant to agree.
+  let evaluateAt = coordinates.positions;
+  let restraints = null;
+  if (testCase.restrained === true) {
+    evaluateAt = Float64Array.from(reference.positions);
+    restraints = buildRestraints({
+      force: reference.restraint.force,
+      atoms: reference.restraint.atoms,
+      reference: coordinates.positions,
+    });
+  }
+  const { energy, forces } = potentialEnergy(system, evaluateAt,
+    { ...testCase.evaluate, restraints });
+
+  console.log(`\n=== ${testCase.name} ===`);
+  console.log(`    ${topology.atomCount} atoms, ${system.constraints.count} constraints, `
+    + `${system.exceptions.count} exceptions`);
+
+  const check = (label, ours, theirs, tolerance) => {
+    comparisons += 1;
+    const scale = Math.max(Math.abs(theirs), 1);
+    const relative = Math.abs(ours - theirs) / scale;
+    const ok = relative <= tolerance;
+    if (!ok) failures += 1;
+    console.log(`  ${ok ? "ok  " : "FAIL"} ${label.padEnd(22)} `
+      + `ours ${ours.toFixed(6).padStart(16)}   openmm ${theirs.toFixed(6).padStart(16)}   `
+      + `rel ${relative.toExponential(2)}`);
+  };
+
+  // 🔴 THE BONDED TERMS ARE READ OUT OF THE ORACLE'S FORCE GROUPS BY CLASS
+  // NAME, not by index: the order OpenMM puts forces in a system is its
+  // business and has changed between versions.
+  if (testCase.restrained === true) {
+    // The selection first: a restraint on the wrong atoms still gives a
+    // plausible energy, so the atom list is compared before the number.
+    const theirAtoms = reference.restraint.atoms;
+    comparisons += 1;
+    const sameSelection = restraints.atoms.length === theirAtoms.length
+      && [...restraints.atoms].every((atom, index) => atom === theirAtoms[index]);
+    if (!sameSelection) failures += 1;
+    console.log(`  ${sameSelection ? "ok  " : "FAIL"} ${"restrained selection".padEnd(22)} `
+      + `${restraints.atoms.length} atoms, openmm ${theirAtoms.length}`);
+  }
+  const groups = reference.energy.byForceGroup;
+  const groupEnergy = (className) => {
+    for (const [key, value] of Object.entries(groups)) {
+      if (key.endsWith(`:${className}`)) return value.energy;
+    }
+    return null;
+  };
+  const bondReference = groupEnergy("HarmonicBondForce");
+  const angleReference = groupEnergy("HarmonicAngleForce");
+  const torsionReference = groupEnergy("PeriodicTorsionForce");
+
+  const restraintReference = groupEnergy("CustomExternalForce");
+  if (restraintReference !== null) {
+    check("position restraint", energy.positionRestraint, restraintReference, 1e-10);
+  }
+  if (bondReference !== null) check("harmonic bond", energy.harmonicBond, bondReference, 1e-10);
+  if (angleReference !== null) check("harmonic angle", energy.harmonicAngle, angleReference, 1e-10);
+  if (torsionReference !== null) {
+    check("periodic torsion", energy.periodicTorsion, torsionReference, 1e-10);
+  }
+  check("lennard-jones", energy.lennardJones, reference.energy.ljOnly, 1e-9);
+  check("coulomb (all terms)", energy.coulomb, reference.energy.coulombOnly, 1e-7);
+  check("TOTAL", energy.total, reference.energy.total, 1e-7);
+
+  if (reference.forces !== undefined) {
+    const theirForces = reference.forces.total;
+    let worst = 0;
+    let worstAtom = -1;
+    let normOurs = 0;
+    let normTheirs = 0;
+    for (let atom = 0; atom < topology.atomCount; atom += 1) {
+      for (let component = 0; component < 3; component += 1) {
+        const ours = forces[atom * 3 + component];
+        const theirs = theirForces[atom][component];
+        normOurs += ours * ours;
+        normTheirs += theirs * theirs;
+        const difference = Math.abs(ours - theirs);
+        if (difference > worst) { worst = difference; worstAtom = atom; }
+      }
+    }
+    const rms = Math.sqrt(normTheirs / (3 * topology.atomCount));
+    comparisons += 1;
+    const relative = worst / rms;
+    const ok = relative <= 1e-6;
+    if (!ok) failures += 1;
+    console.log(`  ${ok ? "ok  " : "FAIL"} ${"forces (per atom)".padEnd(22)} `
+      + `worst component error ${worst.toExponential(3)} kJ/mol/nm at atom ${worstAtom}, `
+      + `rms force ${rms.toFixed(3)} -> rel ${relative.toExponential(2)}`);
+    console.log(`       |F| ours ${Math.sqrt(normOurs).toFixed(6)}  openmm ${Math.sqrt(normTheirs).toFixed(6)}`);
+  }
+}
+
+console.log(`\n${comparisons - failures}/${comparisons} comparisons within tolerance`
+  + (failures > 0 ? `  --  ${failures} FAILED` : "  --  all pass"));
+process.exit(failures > 0 ? 1 : 0);

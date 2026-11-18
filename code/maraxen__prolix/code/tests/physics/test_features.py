@@ -1,0 +1,185 @@
+"""Tests for physics-based node features."""
+
+import pytest
+
+# XA-CI: API/physics drift or heavy compile — deselect from GitHub-faithful suite; tracked under XA-DRIFT.
+pytestmark = pytest.mark.slow
+import chex
+import jax
+import jax.numpy as jnp
+from proxide.core.containers import Protein
+from proxide.physics.features import (
+  compute_electrostatic_features_batch,
+  compute_electrostatic_node_features,
+)
+
+@pytest.fixture
+def pqr_protein() -> Protein:
+  """Minimal mock fixture for PQR protein using Atom37 format."""
+  import numpy as np
+  n_res = 10
+  # Use non-zero coordinates to avoid division by zero in electrostatic features
+  coords = np.random.normal(size=(n_res, 37, 3)).astype(np.float32)
+  charges = np.random.normal(size=(n_res, 37)).astype(np.float32)
+  return Protein(
+      coordinates=jnp.array(coords),
+      charges=jnp.array(charges),
+      aatype=jnp.zeros(n_res, dtype=jnp.int32),
+      residue_index=jnp.arange(n_res, dtype=jnp.int32),
+      chain_index=jnp.zeros(n_res, dtype=jnp.int32),
+      atom_names=None,  # type: ignore
+      bonds=None,
+      bond_params=None,
+      angles=None,
+      angle_params=None,
+      proper_dihedrals=None,
+      dihedral_params=None,
+      sigmas=jnp.ones((n_res, 37)),
+      epsilons=jnp.ones((n_res, 37)),
+      full_coordinates=jnp.array(coords),
+      full_atom_mask=jnp.ones((n_res, 37), dtype=jnp.float32),
+  )
+
+@pytest.mark.parametrize("jit_compile", [True, False], ids=["jit", "eager"])
+def test_compute_electrostatic_node_features_shape(
+  pqr_protein: Protein,
+  jit_compile,
+):
+  """Test that the computed features have the correct shape."""
+  fn = compute_electrostatic_node_features
+  if jit_compile:
+    fn = jax.jit(fn)
+
+  features = fn(pqr_protein)
+  n_residues = pqr_protein.coordinates.shape[0]
+  chex.assert_shape(features, (n_residues, 5))
+  chex.assert_tree_all_finite(features)
+
+
+def test_compute_electrostatic_node_features_no_charges(
+  pqr_protein: Protein,
+):
+  """Test that a ValueError is raised if protein has no charges."""
+  protein_no_charges = pqr_protein.replace(charges=None)
+  with pytest.raises(ValueError, match="must have charges"):
+    compute_electrostatic_node_features(protein_no_charges)
+
+
+def test_compute_electrostatic_node_features_no_coordinates(
+  pqr_protein: Protein,
+):
+  """Test that a ValueError is raised if protein has no coordinates at all."""
+  # AtomicSystem won't have full_coordinates; features.py falls back to
+  # coordinates.  To trigger the error, we must remove both.
+  from proxide.core.atomic_system import AtomicSystem, AtomicState, MolecularTopology
+
+  system = AtomicSystem(
+    topology=MolecularTopology(),
+    state=AtomicState(coordinates=None),  # type: ignore[arg-type]
+    source=None,
+  )
+  with pytest.raises((ValueError, AttributeError)):
+    compute_electrostatic_node_features(system)
+
+
+@pytest.mark.parametrize("jit_compile", [True, False], ids=["jit", "eager"])
+def test_compute_electrostatic_node_features_jittable(
+  pqr_protein: Protein,
+  jit_compile,
+):
+  """Test that the feature computation can be JIT compiled."""
+  fn = compute_electrostatic_node_features
+  if jit_compile:
+    fn = jax.jit(fn)
+  features = fn(pqr_protein)
+  chex.assert_tree_all_finite(features)
+
+
+@pytest.mark.parametrize("jit_compile", [True, False], ids=["jit", "eager"])
+def test_compute_electrostatic_features_batch_shape(
+  pqr_protein: Protein,
+  jit_compile,
+):
+  """Test that the batched features have the correct shape."""
+  proteins = [pqr_protein, pqr_protein]
+
+  fn = compute_electrostatic_features_batch
+  if jit_compile:
+    fn = jax.jit(fn)
+
+  features, mask = fn(proteins)
+  n_residues = pqr_protein.coordinates.shape[0]
+  chex.assert_shape(features, (2, n_residues, 5))
+  chex.assert_shape(mask, (2, n_residues))
+  chex.assert_trees_all_close(mask, jnp.ones_like(mask))
+
+
+@pytest.mark.parametrize("jit_compile", [True, False], ids=["jit", "eager"])
+def test_compute_electrostatic_features_batch_padding(
+  pqr_protein: Protein,
+  jit_compile,
+):
+  """Test that padding is applied correctly."""
+  proteins = [pqr_protein]
+
+  n_residues = pqr_protein.coordinates.shape[0]
+  max_length = n_residues + 10
+
+  fn = compute_electrostatic_features_batch
+  if jit_compile:
+    fn = jax.jit(fn, static_argnames=["max_length"])
+
+  features, mask = fn(proteins, max_length=max_length)
+  chex.assert_shape(features, (1, max_length, 5))
+  chex.assert_shape(mask, (1, max_length))
+  chex.assert_trees_all_close(jnp.sum(mask), n_residues)
+
+
+def test_compute_electrostatic_features_batch_empty_list():
+  """Test that an empty list of proteins raises a ValueError."""
+  with pytest.raises(ValueError, match="Must provide at least one protein"):
+    compute_electrostatic_features_batch([])
+
+
+def test_compute_electrostatic_features_batch_max_length_too_small(
+  pqr_protein: Protein,
+):
+  """Test that a small max_length raises a ValueError."""
+  proteins = [pqr_protein]
+  max_length = pqr_protein.coordinates.shape[0] - 1
+  with pytest.raises(ValueError, match="is less than longest sequence"):
+    compute_electrostatic_features_batch(proteins, max_length=max_length)
+
+
+def test_compute_electrostatic_node_features_thermal_mode(
+  pqr_protein: Protein,
+):
+  """Test that thermal mode works correctly."""
+  # Use a dummy key for noise
+  key = jax.random.PRNGKey(0)
+
+  # Mode: direct
+  sigma_direct = 1.0
+  features_direct = compute_electrostatic_node_features(
+    pqr_protein,
+    noise_scale=sigma_direct,
+    noise_mode="direct",
+    rng=key,
+  )
+
+  # Mode: thermal
+  # Calculate T such that sigma is roughly 1.0
+  # sigma = sqrt(0.5 * R * T) => sigma^2 = 0.5 * R * T => T = sigma^2 / (0.5 * R)
+  from proxide.physics.constants import BOLTZMANN_KCAL
+
+  t = 1.0 / (0.5 * BOLTZMANN_KCAL)
+
+  features_temp = compute_electrostatic_node_features(
+    pqr_protein,
+    noise_scale=t,
+    noise_mode="thermal",
+    rng=key,
+  )
+
+  # The values should be close (floating point differences)
+  chex.assert_trees_all_close(features_direct, features_temp, atol=1e-5)

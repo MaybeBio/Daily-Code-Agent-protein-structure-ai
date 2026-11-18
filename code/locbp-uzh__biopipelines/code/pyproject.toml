@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "biopipelines"
+dynamic = ["version"]
+description = "Automated pipeline framework for protein modeling workflows"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+    "biopython>=1.84",
+    "py3Dmol>=2.4",
+    "openpyxl>=3.1",
+    "rdkit>=2024.03",
+    "prompt_toolkit>=3",
+    "ruamel.yaml>=0.17"
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+# Colab base-Python deps: conda-only packages from biopipelines.yaml that have
+# no `openbabel`-named PyPI build. Installed via `pip install -e ".[colab]"`.
+colab = ["openbabel-wheel"]
+# A Scripting step run in a custom `env` needs biopipelines' deps in that env:
+# the runner (pipe_scripting.py) imports the framework to resolve inputs, so the
+# requirement holds even for a proxy-only script — not just when execution()
+# imports biopipelines. `pip install -e ".[scripting]"` in the custom env pulls
+# the full runtime (base deps come with -e .; openbabel matches what tools expect).
+scripting = ["openbabel-wheel"]
+# `bp-mcp` only: the MCP SDK is not needed to author or run pipelines.
+mcp = ["mcp>=2.2"]
+all = ["pytest>=7", "openbabel-wheel", "mcp>=2.2"]
+
+[project.scripts]
+bp-submit = "biopipelines.cli:submit"
+bp-config = "biopipelines.cli:config"
+bp-run = "biopipelines.cli:run"
+bp-warm = "biopipelines.cli:warm"
+bp-visualize = "biopipelines.cli:visualize"
+bp-mcp = "biopipelines.mcp_server:main"
+biopipelines-submit = "biopipelines.cli:submit"
+biopipelines-config = "biopipelines.cli:config"
+biopipelines-run = "biopipelines.cli:run"
+biopipelines-warm = "biopipelines.cli:warm"
+biopipelines-visualize = "biopipelines.cli:visualize"
+
+[tool.setuptools.packages.find]
+include = ["biopipelines*"]
+
+[tool.setuptools.package-data]
+"biopipelines.renderers" = ["vendor/*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "biopipelines.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -m 'not tool_parameters and not network'"
+markers = [
+    "network: reaches a live external API (RCSB and GitHub). Excluded from the default run so a local suite is hermetic and works offline; CI has connectivity and runs it explicitly.",
+    "tool_parameters: opt-in suite that drives every wrapped public-repo tool with a minimal pipeline and asserts each kwarg lands in the emitted artifacts. Needs no GPU or network (1-2 min), excluded from the default run and run explicitly by CI; run with 'pytest tests/tool_parameters -m tool_parameters -v'.",
+]

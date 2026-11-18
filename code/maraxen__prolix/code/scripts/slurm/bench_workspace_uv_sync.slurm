@@ -1,0 +1,50 @@
+#!/bin/bash
+# One-shot: create/update the workspace venv at ``~/projects`` (``uv sync --package prolix``).
+# **proxide** is installed from PyPI (manylinux wheels); no Rust/cmake on the node.
+#
+# debt 937 audit (2026-07-28): this job's entire purpose is syncing the shared
+# venv -- there's no isolated-worktree mode to guard against. Left as-is.
+#
+#SBATCH --job-name=plx-uvsync
+#SBATCH --partition=mit_preemptable
+#SBATCH --time=2:00:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+
+set -euo pipefail
+
+# SLURM copies scripts to spool dir — BASH_SOURCE[0] points there, not the repo.
+#
+# SLURM_SUBMIT_DIR is the directory sbatch was INVOKED from, which is NOT the job
+# working directory that `sbatch -D/--chdir` sets. Submitting over ssh from a home
+# directory therefore used to land here with SLURM_SUBMIT_DIR=$HOME and cd straight
+# out of the repo, after which `uv run` resolves an environment with neither the
+# project nor its dependencies -- a failure that reads as a broken install rather
+# than a wrong cwd. Validate each candidate instead of trusting the first one, so
+# both `sbatch -D <root> ...` and the original "submit from project root" pattern
+# work. Checking PWD first is what makes the -D form work.
+_is_repo_root() { [[ -f "$1/pyproject.toml" ]] && [[ -d "$1/scripts/slurm" ]]; }
+if _is_repo_root "${PWD}"; then
+    _PROJ="${PWD}"
+elif [[ -n "${SLURM_SUBMIT_DIR:-}" ]] && _is_repo_root "${SLURM_SUBMIT_DIR}"; then
+    _PROJ="${SLURM_SUBMIT_DIR}"
+else
+    _PROJ="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+fi
+cd "${_PROJ}"
+echo "repo root: $(pwd)"
+
+# shellcheck source=/dev/null
+export PROLIX_UV_OPT_OUT=1  # manages its own uv env (workspace mode / --python); no myxcel lock-keyed venv
+source "scripts/slurm/_common_env.sh"
+
+WORKSPACE_ROOT="${ENGAGING_WORKSPACE_ROOT:-${HOME}/projects}"
+export UV_PROJECT="${WORKSPACE_ROOT}"
+
+echo "workspace_root=${WORKSPACE_ROOT} job=${SLURM_JOB_ID:-} host=$(hostname)"
+
+# shellcheck source=/dev/null
+source "scripts/slurm/_workspace_uv_sync_inner.sh"
+_workspace_uv_sync_run
+
+echo "uv sync finished OK"

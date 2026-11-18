@@ -1,0 +1,18 @@
+PGEL
+Copyright 2026 AstraZeneca UK Ltd. or its affiliates. All Rights Reserved.
+
+This product includes software originally developed by the 
+University of Washington as part of the RFdiffusion project.
+
+RFdiffusion (https://github.com/RosettaCommons/RFdiffusion)
+Copyright (c) 2023 University of Washington.
+Developed at the Institute for Protein Design by Joseph Watson, et al. 
+
+This project contains substantial modifications to the original 
+RFdiffusion source code. These modifications are licensed under 
+the Apache License, Version 2.0. The original portions of the 
+code remain subject to the terms of the BSD 3-Clause License.
+
+For more information on the original license, please see the 
+included LICENSE_rfdiffusion file or visit:
+https://github.com/RosettaCommons/RFdiffusion/blob/main/LICENSE

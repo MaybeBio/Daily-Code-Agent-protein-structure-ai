@@ -1,0 +1,746 @@
+/*
+ *                    BioJava development code
+ *
+ * This code may be freely distributed and modified under the
+ * terms of the GNU Lesser General Public Licence.  This should
+ * be distributed with the code.  If you do not have a copy,
+ * see:
+ *
+ *      http://www.gnu.org/copyleft/lesser.html
+ *
+ * Copyright for this code is held jointly by the individual
+ * authors.  These should be listed in @author doc comments.
+ *
+ * For more information on the BioJava project and its aims,
+ * or to join the biojava-l mailing list, visit the home page
+ * at:
+ *
+ *      http://www.biojava.org/
+ *
+ */
+package org.biojava.nbio.structure.asa;
+
+import org.biojava.nbio.structure.*;
+import org.biojava.nbio.structure.contact.Contact;
+import org.biojava.nbio.structure.contact.Grid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.vecmath.Point3d;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+
+/**
+ * Class to calculate Accessible Surface Areas based on
+ * the rolling ball algorithm by Shrake and Rupley.
+ * <p>
+ * The code is adapted from a python implementation at http://boscoh.com/protein/asapy
+ * (now source is available at https://github.com/boscoh/asa).
+ * Thanks to Bosco K. Ho for a great piece of code and for his fantastic blog.
+ * <p>
+ * A few optimizations come from Eisenhaber et al, J Comp Chemistry 1994
+ * (https://onlinelibrary.wiley.com/doi/epdf/10.1002/jcc.540160303)
+ * <p>
+ * See
+ * Shrake, A., and J. A. Rupley. "Environment and Exposure to Solvent of Protein Atoms.
+ * Lysozyme and Insulin." JMB (1973) 79:351-371.
+ * Lee, B., and Richards, F.M. "The interpretation of Protein Structures: Estimation of
+ * Static Accessibility" JMB (1971) 55:379-400
+ *
+ * @author Jose Duarte
+ */
+public class AsaCalculator {
+
+	private static final Logger logger = LoggerFactory.getLogger(AsaCalculator.class);
+
+	/**
+	 * The default value for number of sphere points to sample.
+	 * See this paper for a nice study on the effect of this parameter: https://f1000research.com/articles/5-189/v1
+	 */
+	public static final int DEFAULT_N_SPHERE_POINTS = 1000;
+	public static final double DEFAULT_PROBE_SIZE = 1.4;
+	public static final int DEFAULT_NTHREADS = 1;
+
+	private static final boolean DEFAULT_USE_SPATIAL_HASHING = true;
+
+
+
+	// Chothia's amino acid atoms vdw radii
+	public static final double TRIGONAL_CARBON_VDW = 1.76;
+	public static final double TETRAHEDRAL_CARBON_VDW = 1.87;
+	public static final double TRIGONAL_NITROGEN_VDW = 1.65;
+	public static final double TETRAHEDRAL_NITROGEN_VDW = 1.50;
+	public static final double SULFUR_VDW = 1.85;
+	public static final double OXIGEN_VDW = 1.40;
+
+	// Chothia's nucleotide atoms vdw radii
+	public static final double NUC_CARBON_VDW = 1.80;
+	public static final double NUC_NITROGEN_VDW = 1.60;
+	public static final double PHOSPHOROUS_VDW = 1.90;
+
+
+
+
+
+	private class AsaCalcWorker implements Runnable {
+
+		private final int i;
+		private final double[] asas;
+
+		private AsaCalcWorker(int i, double[] asas) {
+			this.i = i;
+			this.asas = asas;
+		}
+
+		@Override
+		public void run() {
+			asas[i] = calcSingleAsa(i);
+		}
+	}
+
+	/**
+	 * The neighbors of a single atom, as parallel primitive arrays of neighbor atom indices and their distances to
+	 * the central atom, sorted by increasing distance.
+	 * <p>
+	 * Parallel primitive arrays are used rather than an array of index-distance objects because there are ~30
+	 * neighbors per atom: for a large structure that would mean millions of small short-lived objects.
+	 */
+	static class Neighbors {
+
+		/** The neighbor atom indices, ordered by increasing distance to the central atom */
+		final int[] indices;
+		/** The distances to the central atom, in increasing order and parallel to {@link #indices} */
+		final double[] dists;
+
+		private Neighbors(int[] indices, double[] dists) {
+			this.indices = indices;
+			this.dists = dists;
+		}
+
+		/**
+		 * Creates a Neighbors from the first count elements of the given buffers, copying them to exact-size arrays
+		 * and sorting them by increasing distance.
+		 * @param indicesBuffer the neighbor indices, only the first count elements are used
+		 * @param distsBuffer the neighbor distances, only the first count elements are used
+		 * @param count the number of neighbors
+		 * @return the sorted neighbors
+		 */
+		static Neighbors createSorted(int[] indicesBuffer, double[] distsBuffer, int count) {
+			int[] indices = Arrays.copyOf(indicesBuffer, count);
+			double[] dists = Arrays.copyOf(distsBuffer, count);
+			// Sorting by closest to farthest away neighbors achieves faster runtimes when checking for occluded
+			// sphere sample points in calcSingleAsa. This follows the ideas exposed in
+			// Eisenhaber et al, J Comp Chemistry 1994 (https://onlinelibrary.wiley.com/doi/epdf/10.1002/jcc.540160303)
+			// This is essential for performance: it brings down the number of occlusion checks to
+			// an average of n_sphere_points/10 per atom, producing ~ x4 performance gain overall.
+			// An insertion sort is used because the arrays are small (~30 elements on average) and because it avoids
+			// both the boxing of a comparator-based sort and the object allocation an index-distance array would need.
+			for (int i = 1; i < count; i++) {
+				double dist = dists[i];
+				int index = indices[i];
+				int j = i - 1;
+				while (j >= 0 && dists[j] > dist) {
+					dists[j + 1] = dists[j];
+					indices[j + 1] = indices[j];
+					j--;
+				}
+				dists[j + 1] = dist;
+				indices[j + 1] = index;
+			}
+			return new Neighbors(indices, dists);
+		}
+	}
+
+
+	private final Point3d[] atomCoords;
+	private final Atom[] atoms;
+	private final double[] radii;
+	private final double probe;
+	private final int nThreads;
+	/**
+	 * The sphere points to sample, as a flat array of interleaved x,y,z coordinates (thus of size 3 x nSpherePoints).
+	 * A flat array of primitives (rather than an array of Vector3d objects) is used for performance: it keeps the
+	 * points contiguous in memory and avoids a pointer dereference per point in the innermost loop of
+	 * {@link #calcSingleAsa(int)}.
+	 */
+	private double[] spherePoints;
+	private int nSpherePoints;
+	private double cons;
+	private Neighbors[] neighbors;
+
+	private boolean useSpatialHashingForNeighbors;
+
+	/**
+	 * Constructs a new AsaCalculator. Subsequently call {@link #calculateAsas()}
+	 * or {@link #getGroupAsas()} to calculate the ASAs
+	 * Only non-Hydrogen atoms are considered in the calculation.
+	 * @param structure the structure, all non-H atoms of given model number will be used
+	 * @param probe the probe size
+	 * @param nSpherePoints the number of points to be used in generating the spherical
+	 *                         dot-density, the more points the more accurate (and slower) calculation
+	 * @param nThreads the number of parallel threads to use for the calculation
+	 * @param hetAtoms if true HET residues are considered, if false they aren't, equivalent to
+	 * @param modelNr the model number from which we want atoms extracted
+	 * NACCESS' -h option
+	 */
+	public AsaCalculator(Structure structure, double probe, int nSpherePoints, int nThreads, boolean hetAtoms, int modelNr) {
+		this.atoms = StructureTools.getAllNonHAtomArray(structure, hetAtoms, modelNr);
+		this.atomCoords = Calc.atomsToPoints(atoms);
+		this.probe = probe;
+		this.nThreads = nThreads;
+
+		this.useSpatialHashingForNeighbors = DEFAULT_USE_SPATIAL_HASHING;
+
+		// initialising the radii by looking them up through AtomRadii
+		radii = new double[atomCoords.length];
+		for (int i=0;i<atomCoords.length;i++) {
+			radii[i] = getRadius(atoms[i]);
+		}
+
+		initSpherePoints(nSpherePoints);
+	}
+
+	/**
+	 * Constructs a new AsaCalculator. Subsequently call {@link #calculateAsas()}
+	 * or {@link #getGroupAsas()} to calculate the ASAs
+	 * Only non-Hydrogen atoms are considered in the calculation.
+	 * @param structure the structure, all non-H atoms of model 1 will be used
+	 * @param probe the probe size
+	 * @param nSpherePoints the number of points to be used in generating the spherical
+	 *                         dot-density, the more points the more accurate (and slower) calculation
+	 * @param nThreads the number of parallel threads to use for the calculation
+	 * @param hetAtoms if true HET residues are considered, if false they aren't, equivalent to
+	 * NACCESS' -h option
+	 */
+	public AsaCalculator(Structure structure, double probe, int nSpherePoints, int nThreads, boolean hetAtoms) {
+		this(structure, probe, nSpherePoints, nThreads, hetAtoms, 0);
+	}
+
+	/**
+	 * Constructs a new AsaCalculator. Subsequently call {@link #calculateAsas()}
+	 * or {@link #getGroupAsas()} to calculate the ASAs.
+	 * @param atoms an array of atoms not containing Hydrogen atoms
+	 * @param probe the probe size
+	 * @param nSpherePoints the number of points to be used in generating the spherical
+	 * dot-density, the more points the more accurate (and slower) calculation
+	 * @param nThreads the number of parallel threads to use for the calculation
+	 * @throws IllegalArgumentException if any atom in the array is a Hydrogen atom
+	 */
+	public AsaCalculator(Atom[] atoms, double probe, int nSpherePoints, int nThreads) {
+		this.atoms = atoms;
+		this.atomCoords = Calc.atomsToPoints(atoms);
+		this.probe = probe;
+		this.nThreads = nThreads;
+
+		this.useSpatialHashingForNeighbors = DEFAULT_USE_SPATIAL_HASHING;
+
+		for (Atom atom:atoms) {
+			if (atom.getElement()==Element.H)
+				throw new IllegalArgumentException("Can't calculate ASA for an array that contains Hydrogen atoms ");
+		}
+
+		// initialising the radii by looking them up through AtomRadii
+		radii = new double[atoms.length];
+		for (int i=0;i<atoms.length;i++) {
+			radii[i] = getRadius(atoms[i]);
+		}
+
+		initSpherePoints(nSpherePoints);
+	}
+
+	/**
+	 * Constructs a new AsaCalculator. Subsequently call {@link #calcSingleAsa(int)}
+	 * to calculate the atom ASAs. The given radius parameter will be taken as the radius for
+	 * all points given. No ASA calculation per group will be possible with this constructor, so
+	 * usage of {@link #getGroupAsas()} will result in a NullPointerException.
+	 * @param atomCoords
+	 * 				the coordinates representing the center of atoms
+	 * @param probe
+	 * 				the probe size
+	 * @param nSpherePoints
+	 * 				the number of points to be used in generating the spherical
+	 * 				dot-density, the more points the more accurate (and slower) calculation
+	 * @param nThreads
+	 * 				the number of parallel threads to use for the calculation
+	 * @param radius
+	 * 				the radius that will be assign to all given coordinates
+	 */
+	public AsaCalculator(Point3d[] atomCoords, double probe, int nSpherePoints, int nThreads, double radius) {
+		this.atoms = null;
+		this.atomCoords = atomCoords;
+		this.probe = probe;
+		this.nThreads = nThreads;
+
+		this.useSpatialHashingForNeighbors = DEFAULT_USE_SPATIAL_HASHING;
+
+		// initialising the radii to the given radius for all atoms
+		radii = new double[atomCoords.length];
+		for (int i=0;i<atomCoords.length;i++) {
+			radii[i] = radius;
+		}
+
+		initSpherePoints(nSpherePoints);
+	}
+
+	private void initSpherePoints(int nSpherePoints) {
+
+		logger.debug("Will use {} sphere points", nSpherePoints);
+
+		// initialising the sphere points to sample
+		this.nSpherePoints = nSpherePoints;
+		this.spherePoints = generateSpherePoints(nSpherePoints);
+
+		cons = 4.0 * Math.PI / nSpherePoints;
+	}
+
+	/**
+	 * Calculates ASA for all atoms and return them as a GroupAsa
+	 * array (one element per residue in structure) containing ASAs per residue
+	 * and per atom.
+	 * The sorting of Groups in returned array is as specified by {@link org.biojava.nbio.structure.ResidueNumber}
+	 * @return
+	 */
+	public GroupAsa[] getGroupAsas() {
+
+		TreeMap<ResidueNumber, GroupAsa> asas = new TreeMap<>();
+
+		double[] asasPerAtom = calculateAsas();
+
+		for (int i=0;i<atomCoords.length;i++) {
+			Group g = atoms[i].getGroup();
+			if (!asas.containsKey(g.getResidueNumber())) {
+				GroupAsa groupAsa = new GroupAsa(g);
+				groupAsa.addAtomAsaU(asasPerAtom[i]);
+				asas.put(g.getResidueNumber(), groupAsa);
+			} else {
+				GroupAsa groupAsa = asas.get(g.getResidueNumber());
+				groupAsa.addAtomAsaU(asasPerAtom[i]);
+			}
+		}
+
+		return asas.values().toArray(new GroupAsa[0]);
+	}
+
+	/**
+	 * Calculates the Accessible Surface Areas for the atoms given in constructor and with parameters given.
+	 * Beware that the parallel implementation is quite memory hungry. It scales well as long as there is
+	 * enough memory available.
+	 * @return an array with asa values corresponding to each atom of the input array
+	 */
+	public double[] calculateAsas() {
+
+		double[] asas = new double[atomCoords.length];
+
+		long start = System.currentTimeMillis();
+		if (useSpatialHashingForNeighbors) {
+			logger.debug("Will use spatial hashing to find neighbors");
+			neighbors = findNeighborIndicesSpatialHashing();
+		} else {
+			logger.debug("Will not use spatial hashing to find neighbors");
+			neighbors = findNeighborIndices();
+		}
+		long end = System.currentTimeMillis();
+		logger.debug("Took {} s to find neighbors", (end-start)/1000.0);
+
+		start = System.currentTimeMillis();
+		if (nThreads<=1) { // (i.e. it will also be 1 thread if 0 or negative number specified)
+			logger.debug("Will use 1 thread for ASA calculation");
+			for (int i=0;i<atomCoords.length;i++) {
+				asas[i] = calcSingleAsa(i);
+			}
+
+		} else {
+			logger.debug("Will use {} threads for ASA calculation", nThreads);
+
+			ExecutorService threadPool = Executors.newFixedThreadPool(nThreads);
+
+			for (int i=0;i<atomCoords.length;i++) {
+				threadPool.submit(new AsaCalcWorker(i,asas));
+			}
+
+			threadPool.shutdown();
+
+			while (!threadPool.isTerminated());
+
+		}
+		end = System.currentTimeMillis();
+		logger.debug("Took {} s to calculate all {} atoms ASAs (excluding neighbors calculation)", (end-start)/1000.0, atomCoords.length);
+
+		return asas;
+	}
+
+	/**
+	 * Set the useSpatialHashingForNeighbors flag to use spatial hashing to calculate neighbors (true) or all-to-all
+	 * distance calculation (false). Default is {@value DEFAULT_USE_SPATIAL_HASHING}.
+	 * Use for testing performance only.
+	 * @param useSpatialHashingForNeighbors the flag
+	 */
+	void setUseSpatialHashingForNeighbors(boolean useSpatialHashingForNeighbors) {
+		this.useSpatialHashingForNeighbors = useSpatialHashingForNeighbors;
+	}
+
+	/**
+	 * Returns list of 3d coordinates of points on a unit sphere using the
+	 * Golden Section Spiral algorithm.
+	 * @param nSpherePoints the number of points to be used in generating the spherical dot-density
+	 * @return a flat array of interleaved x,y,z coordinates, of size 3 x nSpherePoints
+	 */
+	private double[] generateSpherePoints(int nSpherePoints) {
+		double[] points = new double[3 * nSpherePoints];
+		double inc = Math.PI * (3.0 - Math.sqrt(5.0));
+		double offset = 2.0 / nSpherePoints;
+		for (int k=0;k<nSpherePoints;k++) {
+			double y = k * offset - 1.0 + (offset / 2.0);
+			double r = Math.sqrt(1.0 - y*y);
+			double phi = k * inc;
+			points[3*k    ] = Math.cos(phi)*r;
+			points[3*k + 1] = y;
+			points[3*k + 2] = Math.sin(phi)*r;
+		}
+		return points;
+	}
+
+	/**
+	 * Tells whether the 2 given atoms are neighbors for the purposes of the ASA calculation, i.e. whether their
+	 * probe-inflated spheres overlap.
+	 * @param i the index of the first atom
+	 * @param j the index of the second atom
+	 * @param dist the distance between the 2 atoms
+	 * @return true if they are neighbors, false otherwise
+	 */
+	private boolean areNeighbors(int i, int j, double dist) {
+		return dist < radii[i] + probe + probe + radii[j];
+	}
+
+	/**
+	 * Returns the neighbors of every atom, sorted by increasing distance.
+	 * @return array of size n_atoms
+	 */
+	Neighbors[] findNeighborIndices() {
+
+		Neighbors[] nbs = new Neighbors[atomCoords.length];
+
+		// looking at a typical protein case, number of neighbours are from ~10 to ~50, with an average of ~30.
+		// The buffers are reused for all atoms and grown on demand, so that only the exact-size arrays kept in the
+		// returned Neighbors objects are allocated per atom.
+		int[] indicesBuffer = new int[60];
+		double[] distsBuffer = new double[60];
+
+		for (int k=0; k<atomCoords.length; k++) {
+
+			int count = 0;
+
+			for (int i = 0; i < atomCoords.length; i++) {
+				if (i == k) continue;
+
+				double dist = atomCoords[i].distance(atomCoords[k]);
+
+				if (areNeighbors(k, i, dist)) {
+					if (count == indicesBuffer.length) {
+						indicesBuffer = Arrays.copyOf(indicesBuffer, count * 2);
+						distsBuffer = Arrays.copyOf(distsBuffer, count * 2);
+					}
+					indicesBuffer[count] = i;
+					distsBuffer[count] = dist;
+					count++;
+				}
+			}
+
+			nbs[k] = Neighbors.createSorted(indicesBuffer, distsBuffer, count);
+		}
+		return nbs;
+	}
+
+	/**
+	 * Returns the neighbors of every atom, sorted by increasing distance,
+	 * using spatial hashing to avoid all to all distance calculation.
+	 * @return array of size n_atoms
+	 */
+	Neighbors[] findNeighborIndicesSpatialHashing() {
+
+		List<Contact> contactList = calcContacts();
+
+		// A first pass to count the neighbors per atom, so that exact-size arrays can be allocated in the second
+		// pass. Atom indices are dense, so plain arrays are used rather than a map: that avoids boxing the indices
+		// and the repeated hashing, which are significant given that there are ~30 contacts per atom.
+		int[] counts = new int[atomCoords.length];
+		for (Contact contact : contactList) {
+			// note contacts are stored 1-way only, with j>i
+			int i = contact.getI();
+			int j = contact.getJ();
+			if (areNeighbors(i, j, contact.getDistance())) {
+				counts[i]++;
+				counts[j]++;
+			}
+		}
+
+		int[][] indices = new int[atomCoords.length][];
+		double[][] dists = new double[atomCoords.length][];
+		for (int i = 0; i < atomCoords.length; i++) {
+			// note that some atoms might have no neighbors at all, in which case these are empty arrays
+			indices[i] = new int[counts[i]];
+			dists[i] = new double[counts[i]];
+		}
+
+		int[] filled = new int[atomCoords.length];
+		for (Contact contact : contactList) {
+			int i = contact.getI();
+			int j = contact.getJ();
+			double dist = contact.getDistance();
+			if (areNeighbors(i, j, dist)) {
+				indices[i][filled[i]] = j;
+				dists[i][filled[i]] = dist;
+				filled[i]++;
+				indices[j][filled[j]] = i;
+				dists[j][filled[j]] = dist;
+				filled[j]++;
+			}
+		}
+
+		Neighbors[] nbs = new Neighbors[atomCoords.length];
+		for (int i = 0; i < atomCoords.length; i++) {
+			nbs[i] = Neighbors.createSorted(indices[i], dists[i], counts[i]);
+		}
+
+		return nbs;
+	}
+
+	Point3d[] getAtomCoords() {
+		return atomCoords;
+	}
+
+	private List<Contact> calcContacts() {
+		if (atomCoords.length == 0)
+			return new ArrayList<>();
+		double maxRadius = 0;
+		OptionalDouble optionalDouble = Arrays.stream(radii).max();
+		if (optionalDouble.isPresent())
+			maxRadius = optionalDouble.getAsDouble();
+		double cutoff = maxRadius + maxRadius + probe + probe;
+		logger.debug("Max radius is {}, cutoff is {}", maxRadius, cutoff);
+		Grid grid = new Grid(cutoff);
+		grid.addCoords(atomCoords);
+		return grid.getIndicesContacts();
+	}
+
+	private double calcSingleAsa(int i) {
+		Point3d atom_i = atomCoords[i];
+
+		// note the neighbors are already sorted by increasing distance (see Neighbors#createSorted), which is
+		// essential for the performance of the occlusion checks in the loop below
+		Neighbors nbs = neighbors[i];
+		int[] neighbor_indices = nbs.indices;
+		double[] neighbor_dists = nbs.dists;
+		int n_neighbor = neighbor_indices.length;
+
+		double radius_i = probe + radii[i];
+
+		int n_accessible_point = 0;
+		// purely for debugging
+		int[] numDistsCalced = null;
+		if (logger.isDebugEnabled()) numDistsCalced = new int[n_neighbor];
+
+		// Now we precalculate anything depending only on i,j in equation 3 in Eisenhaber 1994.
+		// The per-neighbor data is laid out in a single flat array as quadruplets
+		// [aj_minus_ai.x, aj_minus_ai.y, aj_minus_ai.z, cutoff], so that the innermost loop below is a purely
+		// sequential scan over contiguous primitives, with no object dereferencing. That matches the access
+		// pattern of the early break and is significantly faster than an array of Vector3d objects.
+		double[] nbData = new double[4 * n_neighbor];
+		for (int nbArrayInd =0; nbArrayInd<n_neighbor; nbArrayInd++) {
+			int j = neighbor_indices[nbArrayInd];
+			double dist = neighbor_dists[nbArrayInd];
+			double radius_j = radii[j] + probe;
+			Point3d atom_j = atomCoords[j];
+			int off = 4 * nbArrayInd;
+			nbData[off    ] = atom_j.x - atom_i.x;
+			nbData[off + 1] = atom_j.y - atom_i.y;
+			nbData[off + 2] = atom_j.z - atom_i.z;
+			// see equation 3 in Eisenhaber 1994
+			nbData[off + 3] = (dist*dist + radius_i*radius_i - radius_j*radius_j)/(2*radius_i);
+		}
+
+		int nbDataLength = nbData.length;
+
+		for (int p = 0; p < nSpherePoints; p++) {
+			double pointX = spherePoints[3*p];
+			double pointY = spherePoints[3*p + 1];
+			double pointZ = spherePoints[3*p + 2];
+
+			boolean is_accessible = true;
+
+			// note that the neighbors are sorted by distance, achieving optimal performance in this inner loop
+			// See Eisenhaber et al, J Comp Chemistry 1994
+
+			for (int off = 0; off < nbDataLength; off += 4) {
+
+				// see equation 3 in Eisenhaber 1994. This is slightly more efficient than
+				// calculating distances to the actual sphere points on atom_i (which would be obtained with:
+				// Point3d test_point = new Point3d(point.x*radius + atom_i.x,point.y*radius + atom_i.y,point.z*radius + atom_i.z))
+				double dotProd = nbData[off]*pointX + nbData[off + 1]*pointY + nbData[off + 2]*pointZ;
+
+				if (numDistsCalced!=null) numDistsCalced[off >> 2]++;
+
+				if (dotProd > nbData[off + 3]) {
+					is_accessible = false;
+					break;
+				}
+			}
+			if (is_accessible) {
+				n_accessible_point++;
+			}
+		}
+
+		// purely for debugging
+		if (numDistsCalced!=null) {
+			int sum = 0;
+			for (int numDistCalcedForJ : numDistsCalced) sum += numDistCalcedForJ;
+			logger.debug("Number of sample points distances calculated for neighbors of i={} : average {}, all {}", i, (double) sum / (double) n_neighbor, numDistsCalced);
+		}
+
+		return cons*n_accessible_point*radius_i*radius_i;
+	}
+
+	/**
+	 * Gets the radius for given amino acid and atom
+	 * @param amino
+	 * @param atom
+	 * @return
+	 */
+	private static double getRadiusForAmino(AminoAcid amino, Atom atom) {
+
+		if (atom.getElement().equals(Element.H)) return Element.H.getVDWRadius();
+		// some unusual entries (e.g. 1tes) contain Deuterium atoms in standard aminoacids
+		if (atom.getElement().equals(Element.D)) return Element.D.getVDWRadius();
+
+		String atomCode = atom.getName();
+		char aa = amino.getAminoType();
+
+		// here we use the values that Chothia gives in his paper (as NACCESS does)
+		if (atom.getElement()==Element.O) {
+			return OXIGEN_VDW;
+		}
+		else if (atom.getElement()==Element.S) {
+			return SULFUR_VDW;
+		}
+		else if (atom.getElement()==Element.N) {
+			if ("NZ".equals(atomCode)) return TETRAHEDRAL_NITROGEN_VDW; // tetrahedral Nitrogen
+			return TRIGONAL_NITROGEN_VDW;								// trigonal Nitrogen
+		}
+		else if (atom.getElement()==Element.C) { // it must be a carbon
+			if ("C".equals(atomCode) ||
+					"CE1".equals(atomCode) || "CE2".equals(atomCode) || "CE3".equals(atomCode) ||
+					"CH2".equals(atomCode) ||
+					"CZ".equals(atomCode) || "CZ2".equals(atomCode) || "CZ3".equals(atomCode)) {
+				return TRIGONAL_CARBON_VDW; 							// trigonal Carbon
+			}
+			else if ("CA".equals(atomCode) || "CB".equals(atomCode) ||
+					"CE".equals(atomCode) ||
+					"CG1".equals(atomCode) || "CG2".equals(atomCode)) {
+				return TETRAHEDRAL_CARBON_VDW;							// tetrahedral Carbon
+			}
+			// the rest of the cases (CD, CD1, CD2, CG) depend on amino acid
+			else {
+				switch (aa) {
+				case 'F':
+				case 'W':
+				case 'Y':
+				case 'H':
+				case 'D':
+				case 'N':
+					return TRIGONAL_CARBON_VDW;
+
+				case 'P':
+				case 'K':
+				case 'R':
+				case 'M':
+				case 'I':
+				case 'L':
+					return TETRAHEDRAL_CARBON_VDW;
+
+				case 'Q':
+				case 'E':
+					if ("CD".equals(atomCode)) return TRIGONAL_CARBON_VDW;
+					else if ("CG".equals(atomCode)) return TETRAHEDRAL_CARBON_VDW;
+
+				default:
+					logger.info("Unexpected carbon atom {} for aminoacid {}, assigning its standard vdw radius", atomCode, aa);
+					return Element.C.getVDWRadius();
+				}
+			}
+
+			// not any of the expected atoms
+		} else {
+			// non standard aas, (e.g. MSE, LLP) will always have this problem,
+			logger.debug("Unexpected atom {} for aminoacid {} ({}), assigning its standard vdw radius", atomCode, aa, amino.getPDBName());
+
+			return atom.getElement().getVDWRadius();
+		}
+	}
+
+
+	/**
+	 * Gets the radius for given nucleotide atom
+	 * @param atom
+	 * @return
+	 */
+	private static double getRadiusForNucl(NucleotideImpl nuc, Atom atom) {
+
+		if (atom.getElement().equals(Element.H)) return Element.H.getVDWRadius();
+		if (atom.getElement().equals(Element.D)) return Element.D.getVDWRadius();
+
+		if (atom.getElement()==Element.C) return NUC_CARBON_VDW;
+
+		if (atom.getElement()==Element.N) return NUC_NITROGEN_VDW;
+
+		if (atom.getElement()==Element.P) return PHOSPHOROUS_VDW;
+
+		if (atom.getElement()==Element.O) return OXIGEN_VDW;
+
+		logger.info("Unexpected atom "+atom.getName()+" for nucleotide "+nuc.getPDBName()+", assigning its standard vdw radius");
+		return atom.getElement().getVDWRadius();
+	}
+
+
+	/**
+	 * Gets the van der Waals radius of the given atom following the values defined by
+	 * Chothia (1976) J.Mol.Biol.105,1-14
+	 * NOTE: the vdw values defined by the paper assume no Hydrogens and thus "inflates"
+	 * slightly the heavy atoms to account for Hydrogens. Thus this method cannot be used
+	 * in a structure that contains Hydrogens!
+	 *
+	 * If atom is neither part of a nucleotide nor of a standard aminoacid,
+	 * the default vdw radius for the element is returned. If atom is of
+	 * unknown type (element) the vdw radius of {@link Element#N} is returned
+	 *
+	 * @param atom
+	 * @return
+	 */
+	public static double getRadius(Atom atom) {
+
+		if (atom.getElement()==null) {
+			logger.warn("Unrecognised atom "+atom.getName()+" with serial "+atom.getPDBserial()+
+					", assigning the default vdw radius (Nitrogen vdw radius).");
+			return Element.N.getVDWRadius();
+		}
+
+		Group res = atom.getGroup();
+
+		if (res==null) {
+			logger.warn("Unknown parent residue for atom "+atom.getName()+" with serial "+
+					atom.getPDBserial()+", assigning its default vdw radius");
+			return atom.getElement().getVDWRadius();
+		}
+
+		GroupType type = res.getType();
+
+		if (type == GroupType.AMINOACID) return getRadiusForAmino(((AminoAcid)res), atom);
+
+		if (type == GroupType.NUCLEOTIDE) return getRadiusForNucl((NucleotideImpl)res,atom);
+
+
+		return atom.getElement().getVDWRadius();
+	}
+
+}

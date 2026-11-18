@@ -1,0 +1,295 @@
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+"""
+MutationComposer tool for generating sequences based on mutation profiles.
+
+Takes mutation frequency data from MutationProfiler and generates new sequences
+using various composition strategies based on the observed mutation patterns.
+"""
+
+import os
+from typing import Dict, List, Any, Optional, Union
+
+try:
+    from .base_config import BaseConfig, StandardizedOutput, TableInfo
+    from .file_paths import Path
+    from .datastream import DataStream
+    from .combinatorics import numbered_id
+except ImportError:
+    import sys
+    sys.path.append(os.path.dirname(__file__))
+    from base_config import BaseConfig, StandardizedOutput, TableInfo
+    from file_paths import Path
+    from datastream import DataStream
+    from combinatorics import numbered_id
+
+# The prefix of the sequence ids when the user gives none.
+DEFAULT_PREFIXES = {
+    "single_point": "mut",
+    "weighted_random": "rand",
+    "hotspot_focused": "hotspot",
+    "top_mutations": "top",
+}
+
+
+class MutationComposer(BaseConfig):
+    """
+    Pipeline tool for generating sequences based on mutation frequency profiles.
+    
+    Takes mutation frequency data (typically from MutationProfiler) and generates
+    new sequences using various composition strategies informed by mutation patterns.
+    
+    Commonly used for:
+    - Systematic single-point mutation design
+    - Weighted random sequence generation
+    - Hotspot-focused sequence design
+    - Exploration of high-frequency mutation combinations
+    """
+    
+    # Tool identification
+    TOOL_NAME = "MutationComposer"
+    TOOL_VERSION = "1.4"
+
+    @classmethod
+    def _install_script(cls, folders, env_manager="mamba", force_reinstall=False, **kwargs):
+        return """echo "=== MutationComposer ==="
+echo "Requires MutationEnv (installed with MutationProfiler.install())"
+echo "No additional installation needed."
+touch "$INSTALL_SUCCESS"
+echo "=== MutationComposer ready ==="
+"""
+
+    # Lazy path descriptors
+    sequences_csv = Path(lambda self: self.stream_path("sequences", "sequences.csv"))
+    sequences_fasta = Path(lambda self: self.stream_path("sequences", "sequences.fasta"))
+    config_file = Path(lambda self: self.configuration_path("mutation_composer_config.json"))
+    missing_csv = Path(lambda self: self.table_path("missing"))
+    local_missing_csv = Path(lambda self: self.execution_path("local_missing.csv"))
+    composer_py = Path(lambda self: self.pipe_script_path("pipe_mutation_composer.py"))
+
+    def __init__(self,
+                 frequencies: Union[List[Union[StandardizedOutput, TableInfo, str]],
+                                  Union[StandardizedOutput, TableInfo, str]],
+                 num_sequences: int = 10,
+                 mode: str = "single_point",
+                 min_frequency: float = 0.01,
+                 max_mutations: int = None,
+                 random_seed: int = None,
+                 prefix: str = "",
+                 hotspot_count: int = 10,
+                 combination_strategy: str = "average",
+                 **kwargs):
+        """
+        Initialize mutation composer tool.
+
+        Args:
+            frequencies: Input table(s) with mutation frequencies. Can be:
+                - Single table: StandardizedOutput, TableInfo, or str
+                - Multiple tables: List of the above types
+            num_sequences: Number of sequences to generate
+            mode: Generation strategy:
+                - "single_point": One mutation per sequence, ordered by frequency
+                - "weighted_random": Random sequences using frequency distributions
+                - "hotspot_focused": Focus mutations on high-frequency positions
+                - "top_mutations": Use top N most frequent mutations per position
+            min_frequency: Minimum frequency threshold to consider mutations (default: 0.01)
+            max_mutations: Maximum mutations per sequence (None = unlimited)
+            random_seed: Random seed for reproducible generation (None = random)
+            prefix: Prefix for sequence IDs (e.g., "single_point" -> "single_point_001"). Empty uses the mode's own: mut, rand, hotspot or top
+            hotspot_count: Number of top hotspot positions to consider for hotspot_focused mode (default: 10)
+            combination_strategy: Strategy for combining multiple frequency tables:
+                - "average": Average frequencies across tables, then single mutations
+                - "maximum": Take max frequencies across tables, then single mutations
+                - "stack": One mutation from each table per sequence (multi-point)
+                - "round_robin": Alternate tables for single mutations
+            **kwargs: Additional parameters
+
+        Output:
+            Streams: sequences (.csv)
+            Tables:
+                sequences: id | sequence | mutations | mutation_positions
+                missing: id | removed_by | kind | cause. One `failure` row for each of the `num_sequences` ids the step could not generate, because the frequency table(s) hold no further mutation to apply. The step fails when it wrote no sequence at all, and when every sequence it wrote is identical to the reference (no mutation reached `min_frequency`); the sequences are still written in that case.
+        """
+        # Normalize frequencies to list for consistent handling
+        if isinstance(frequencies, list):
+            self.mutation_inputs = frequencies
+        else:
+            self.mutation_inputs = [frequencies]
+
+        self.combination_strategy = combination_strategy
+        self.num_sequences = num_sequences
+        self.mode = mode
+        self.min_frequency = min_frequency
+        self.max_mutations = max_mutations
+        self.random_seed = random_seed
+        self.prefix = prefix
+        self.hotspot_count = hotspot_count
+
+        super().__init__(**kwargs)
+
+    def validate_params(self):
+        """Validate MutationComposer parameters."""
+        # Validate mode
+        valid_modes = list(DEFAULT_PREFIXES)
+        if self.mode not in valid_modes:
+            raise ValueError(f"Invalid mode: {self.mode}. Valid options: {', '.join(valid_modes)}")
+
+        # Validate combination strategy
+        valid_strategies = ["average", "maximum", "stack", "round_robin"]
+        if self.combination_strategy not in valid_strategies:
+            raise ValueError(f"Invalid combination_strategy: {self.combination_strategy}. Valid options: {', '.join(valid_strategies)}")
+
+        # Validate each mutation input
+        for i, mutation_input in enumerate(self.mutation_inputs):
+            if not isinstance(mutation_input, (StandardizedOutput, TableInfo, str)):
+                raise ValueError(f"frequencies[{i}] must be a StandardizedOutput, TableInfo, or str")
+
+        if self.num_sequences <= 0:
+            raise ValueError("num_sequences must be positive")
+
+        if self.min_frequency < 0 or self.min_frequency > 1:
+            raise ValueError("min_frequency must be between 0 and 1")
+
+        if self.max_mutations is not None and self.max_mutations <= 0:
+            raise ValueError("max_mutations must be positive or None")
+    
+    def configure_inputs(self, pipeline_folders: Dict[str, str]):
+        """Configure input tables from MutationProfiler(s)."""
+        self.folders = pipeline_folders
+
+        # Extract mutation frequency table paths
+        self.frequency_table_paths = []
+
+        for i, mutation_input in enumerate(self.mutation_inputs):
+            if isinstance(mutation_input, TableInfo):
+                frequency_path = mutation_input.info.path
+            elif isinstance(mutation_input, str):
+                frequency_path = mutation_input
+            elif isinstance(mutation_input, StandardizedOutput):
+                # StandardizedOutput - look for absolute_frequencies or similar
+                tables = mutation_input.tables
+                if hasattr(tables, 'absolute_frequencies'):
+                    frequency_path = tables.absolute_frequencies.info.path
+                elif hasattr(tables, 'frequencies'):
+                    frequency_path = tables.frequencies.info.path
+                else:
+                    raise ValueError(f"No frequency table found in frequencies[{i}]")
+            else:
+                raise ValueError(f"Unsupported input type for frequencies[{i}]: {type(mutation_input)}")
+
+            self.frequency_table_paths.append(frequency_path)
+    
+    def get_config_display(self) -> List[str]:
+        """Get configuration display lines."""
+        config_lines = super().get_config_display()
+        
+        config_lines.extend([
+            f"INPUTS: {len(self.mutation_inputs)} frequency table(s)",
+            f"COMBINATION_STRATEGY: {self.combination_strategy}",
+            f"NUM_SEQUENCES: {self.num_sequences}",
+            f"MODE: {self.mode}",
+            f"MIN_FREQUENCY: {self.min_frequency}"
+        ])
+        
+        if self.max_mutations:
+            config_lines.append(f"MAX_MUTATIONS: {self.max_mutations}")
+        
+        return config_lines
+    
+    def _sequence_prefix(self) -> str:
+        """The prefix of every sequence id: the user's, else the mode's. Declared ids and the script both use this one."""
+        return self.prefix or DEFAULT_PREFIXES[self.mode]
+
+    def generate_script(self, script_path: str) -> str:
+        """Generate MutationComposer execution script."""
+        script_content = "#!/bin/bash\n"
+        script_content += "# MutationComposer execution script\n"
+        script_content += self.generate_completion_check_header()
+        script_content += self.activate_environment()
+        script_content += self.generate_script_run_composer()
+        script_content += self.generate_missing_propagation(
+            *self.mutation_inputs, missing_csv=self.missing_csv, local_missing=self.local_missing_csv)
+        script_content += self.generate_completion_check_footer()
+
+        return script_content
+
+    def generate_script_run_composer(self) -> str:
+        """Generate the mutation composer execution part of the script."""
+        import json
+
+        # Create config file for mutation composer
+        config_data = {
+            "frequency_tables": self.frequency_table_paths,
+            "combination_strategy": self.combination_strategy,
+            "num_sequences": self.num_sequences,
+            "mode": self.mode,
+            "min_frequency": self.min_frequency,
+            "max_mutations": self.max_mutations,
+            "random_seed": self.random_seed,
+            "prefix": self._sequence_prefix(),
+            "hotspot_count": self.hotspot_count,
+            "sequences_output": self.sequences_csv,
+            "sequences_fasta": self.sequences_fasta,
+            "local_missing_csv": self.local_missing_csv
+        }
+
+        with open(self.config_file, 'w') as f:
+            json.dump(config_data, f, indent=2)
+
+        return f"""echo "Generating sequences from mutation profiles"
+echo "Input frequencies: {len(self.frequency_table_paths)} table(s)"
+echo "Combination strategy: {self.combination_strategy}"
+echo "Mode: {self.mode}"
+echo "Sequences to generate: {self.num_sequences}"
+echo "Output: {self.sequences_csv}"
+
+python "{self.composer_py}" --config "{self.config_file}"
+
+"""
+    
+    def get_output_files(self) -> Dict[str, Any]:
+        """Get expected output files after sequence generation."""
+        prefix = self._sequence_prefix()
+        sequence_ids = [numbered_id(prefix, i) for i in range(1, self.num_sequences + 1)]
+
+        sequences = DataStream(
+            name="sequences",
+            ids=sequence_ids,
+            files=[],
+            map_table=self.sequences_csv,
+            format="csv"
+        )
+
+        tables = {
+            "sequences": TableInfo(
+                name="sequences",
+                path=self.sequences_csv,
+                columns=["id", "sequence", "mutations", "mutation_positions"],
+                description=f"Generated sequences using {self.mode} mode"
+            ),
+            "missing": self.missing_table_info(self.missing_csv)
+        }
+
+        return {
+            "sequences": sequences,
+            "tables": tables,
+            "output_folder": self.output_folder
+        }
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize configuration."""
+        base_dict = super().to_dict()
+        base_dict.update({
+            "tool_params": {
+                "num_sequences": self.num_sequences,
+                "mode": self.mode,
+                "combination_strategy": self.combination_strategy,
+                "min_frequency": self.min_frequency,
+                "max_mutations": self.max_mutations,
+                "random_seed": self.random_seed,
+                "prefix": self.prefix
+            }
+        })
+        return base_dict

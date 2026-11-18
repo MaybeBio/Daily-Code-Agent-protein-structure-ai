@@ -1,0 +1,908 @@
+"""
+api/routers/batch.py
+
+Batch virtual screening: subi un archivo CSV/Excel/SDF con multiples
+SMILES, evalua todas contra un target, y descarga los resultados
+rankeados de mejor a peor en Excel.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import csv
+import io
+import math
+import uuid as _uuid_mod
+from datetime import datetime, UTC
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from fastapi.responses import StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from core.config import get_settings
+from core.database import get_db
+from core.models import UserORM
+from api.dependencies import get_current_user_optional
+from services.batch_persistence import save_batch as _persist_batch, load_inactive_batch as _load_batch
+from services.targets.access import get_target_for_user, target_is_accessible
+from db.repository import Repository
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+router = APIRouter(prefix="/evaluation", tags=["Batch Screening"])
+settings = get_settings()
+MAX_BATCH_FILE_BYTES = 20 * 1024 * 1024
+
+# ── Active state in memory; durable checkpoints live in batch_runs ────────
+_batches: dict[str, dict[str, Any]] = {}
+_batch_lock = asyncio.Lock()
+_batch_tasks: set[asyncio.Task] = set()
+
+
+async def _get_batch(batch_id):
+    batch = _batches.get(batch_id)
+    if batch is None:
+        batch = await _load_batch(batch_id)
+    return batch
+
+
+async def _supervise_batch(*args):
+    batch_id = args[0]
+    try:
+        await _process_batch(*args)
+    except BaseException as exc:
+        async with _batch_lock:
+            batch = _batches.get(batch_id)
+            if batch is not None:
+                batch.update(status="interrupted" if isinstance(exc, asyncio.CancelledError) else "failed",
+                             error=f"{type(exc).__name__}: {str(exc)[:300]}",
+                             finished_at=datetime.now(UTC).isoformat())
+                try:
+                    await _persist_batch(batch)
+                except Exception as storage_error:
+                    log.error("batch_checkpoint_failed", batch_id=batch_id, error=str(storage_error))
+        log.error("batch_worker_failed", batch_id=batch_id, error=str(exc))
+        if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+            raise
+
+
+def _owner_of(current_user: UserORM | None) -> str:
+    """BATCH-BE-002. Un cribado pertenece a la cuenta que lo lanzó.
+
+    El estado vive en memoria y no tenía dueño: bastaba conocer el
+    identificador —que viaja en enlaces, capturas y paquetes de soporte— para
+    leer o exportar el cribado de otra cuenta en la misma máquina. El espacio
+    anónimo comparte la etiqueta `demo`, igual que en el resto de `/evaluation`.
+    """
+    return str(current_user.id) if current_user else "demo"
+
+
+def _require_own_batch(batch: dict[str, Any] | None, current_user: UserORM | None) -> dict[str, Any]:
+    """404 —no 403— para no confirmar la existencia de un cribado ajeno."""
+    if batch is None or batch.get("owner_id") != _owner_of(current_user):
+        raise HTTPException(status_code=404, detail="Batch no encontrado")
+    return batch
+
+
+def _extract_from_csv(content: str, *, with_labels: bool = False) -> tuple[list[dict], dict[str, bool]]:
+    """Extrae SMILES + nombres + labels active/inactive desde CSV."""
+    import csv
+    reader = csv.DictReader(io.StringIO(content))
+    molecules = []
+    labels = {}
+    for row_number, row in enumerate(reader, 1):
+        if row_number > 10000:
+            raise HTTPException(413, "El batch supera 10000 filas de entrada")
+        smiles = None
+        name = None
+        is_active = None
+        for key in row:
+            if key is None:
+                raise HTTPException(400, "CSV malformado: columnas extra sin encabezado")
+            kl = key.lower().strip()
+            if kl in ("smiles", "canonical_smiles", "structure"):
+                smiles = (row[key] or "").strip()
+            if kl in ("name", "id", "identifier", "molecule_name"):
+                name = (row[key] or "").strip()
+            if kl == "active":
+                try:
+                    is_active = bool(int(row[key].strip()))
+                except (ValueError, TypeError):
+                    pass
+        if smiles and len(smiles) > 1:
+            item = {"smiles": smiles, "name": name or smiles[:20]}
+            if with_labels:
+                item["is_active"] = is_active
+            molecules.append(item)
+            if name and is_active is not None:
+                labels[name] = is_active
+    return molecules, labels
+
+
+def _extract_from_excel(content: bytes, *, with_labels: bool = False) -> tuple[list[dict], dict[str, bool]]:
+    """Extrae SMILES + nombres + labels active/inactive desde Excel."""
+    import openpyxl
+    import zipfile
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            entries = archive.infolist()
+            if len(entries) > 2000 or sum(item.file_size for item in entries) > 80 * 1024 * 1024:
+                raise HTTPException(413, "Excel supera el límite de expansión de 80 MB o 2000 entradas")
+        wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, "Archivo Excel inválido; se requiere .xlsx") from exc
+    try:
+        ws = wb.active
+        if ws is None:
+            return [], {}
+        if (ws.max_column or 0) > 256 or (ws.max_row or 0) > 10001:
+            raise HTTPException(413, "Excel supera 256 columnas o 10000 filas de datos")
+        rows = iter(ws.iter_rows(values_only=True))
+        header = next(rows, None)
+        if header is None:
+            return [], {}
+        headers = [str(h).lower().strip() if h else "" for h in header]
+        smiles_col = next((i for i, h in enumerate(headers) if h in ("smiles", "canonical_smiles", "structure")), None)
+        name_col = next((i for i, h in enumerate(headers) if h in ("name", "id", "identifier", "molecule_name")), None)
+        active_col = next((i for i, h in enumerate(headers) if h == "active"), None)
+        molecules, labels = [], {}
+        for number, row in enumerate(rows, 1):
+            if number > 10000 or len(row) > 256:
+                raise HTTPException(413, "Excel supera el límite de filas o columnas")
+            def value(index):
+                return row[index] if index is not None and index < len(row) else None
+            smiles = str(value(smiles_col)).strip() if value(smiles_col) else None
+            name = str(value(name_col)).strip() if value(name_col) else None
+            if smiles and len(smiles) > 1:
+                item = {"smiles": smiles, "name": name or smiles[:20]}
+                if with_labels:
+                    item["is_active"] = None
+                molecules.append(item)
+                if len(molecules) > 500:
+                    raise HTTPException(400, "Máximo 500 moléculas por batch")
+                if name and active_col is not None:
+                    try:
+                        labels[name] = bool(int(value(active_col)))
+                        if with_labels:
+                            molecules[-1]["is_active"] = labels[name]
+                    except (ValueError, TypeError):
+                        pass
+        return molecules, labels
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(400, "Contenido Excel malformado") from exc
+    finally:
+        wb.close()
+
+
+async def _get_default_targets(current_user: UserORM | None = None) -> list[str]:
+    """Todos los targets registrados en la DB (v1.5: 19 targets offline-first)."""
+    try:
+        from core.database import get_db_session
+        from db.repository import Repository
+        async with get_db_session() as db:
+            repo = Repository(db)
+            all_targets = await repo.get_all_targets()
+            return [t.pdb_id for t in all_targets if t.is_prepared and t.pdb_id and target_is_accessible(t, current_user)]
+    except Exception:
+        return ["7E2Y", "3PP0", "1HSG", "3ERT", "1GPK", "1F0R", "1BN1", "1XP0"]
+
+
+def _extract_smiles_from_sdf(content: str) -> list[dict[str, str]]:
+    try:
+        from rdkit import Chem
+        supplier = Chem.SDMolSupplier()
+        supplier.SetData(content)
+        molecules = []
+        for i, mol in enumerate(supplier):
+            if mol is None:
+                continue
+            smiles = Chem.MolToSmiles(mol)
+            name = mol.GetProp("_Name") if mol.HasProp("_Name") else f"MOL-{i+1:03d}"
+            molecules.append({"smiles": smiles, "name": name})
+        return molecules
+    except Exception:
+        return []
+
+
+@router.post("/batch")
+async def submit_batch(
+    file: UploadFile = File(...),
+    target_pdb_id: str = Query("7E2Y", min_length=4, max_length=10,
+        description="Target PDB ID. Usar 'ALL' para correr contra todos los targets pre-curados."),
+    early_exit: bool = Query(
+        True,
+        deprecated=True,
+        description=(
+            "RETIRADO (BATCH-SCI-001). Se acepta por compatibilidad y se "
+            "ignora: el pre-filtro de vecindad saltaba el acoplamiento y "
+            "publicaba ceros como si fueran medidas. La respuesta declara "
+            "`early_exit_enabled: false`."
+        ),
+    ),
+    current_user: UserORM | None = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Virtual screening batch. Subi un archivo con SMILES, los evalua contra el target,
+    y devuelve resultados rankeados.
+
+    Multi-target: usa target_pdb_id=ALL para correr contra todos los targets pre-curados.
+    Early Exit: si esta activado, MolGraph pre-filtra moleculas similares a inactivos conocidos.
+    Label opcional: si el CSV/Excel tiene columna 'active' (1/0), se computa EF/AUC.
+    """
+    # La ejecución histórica también comparte el contrato de propiedad. Aunque
+    # la UI nueva no la use, conocer un PDB ID privado no autoriza a ejecutarlo.
+    target_pdb_id = target_pdb_id.upper()
+    if target_pdb_id.startswith("USR_"):
+        await get_target_for_user(
+            Repository(db), target_pdb_id, current_user, allow_missing=True
+        )
+
+    # ── Parse file ─────────────────────────────────────────────────
+    content = await file.read(MAX_BATCH_FILE_BYTES + 1)
+    if len(content) > MAX_BATCH_FILE_BYTES:
+        raise HTTPException(status_code=413, detail="El archivo batch supera el límite de 20 MB")
+    filename = (file.filename or "batch").lower()
+
+    molecules = []
+    active_labels: dict[str, bool] = {}  # name → is_active
+
+    if filename.endswith(".csv"):
+        molecules, active_labels = _extract_from_csv(
+            content.decode("utf-8", errors="replace"), with_labels=True)
+    elif filename.endswith((".xlsx", ".xls")):
+        molecules, active_labels = _extract_from_excel(content, with_labels=True)
+    elif filename.endswith(".sdf"):
+        molecules = _extract_smiles_from_sdf(content.decode("utf-8", errors="replace"))
+        active_labels = {}
+    elif filename.endswith(".txt") or filename.endswith(".smi"):
+        text = content.decode("utf-8", errors="replace")
+        for line in text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                parts = line.split()
+                smiles = parts[0]
+                name = parts[1] if len(parts) > 1 else smiles[:20]
+                try:
+                    label = int(parts[2]) if len(parts) > 2 else None
+                except ValueError as exc:
+                    raise HTTPException(400, "Etiqueta active inválida en archivo SMILES") from exc
+                molecules.append({"smiles": smiles, "name": name,
+                                  "is_active": bool(label) if label is not None else None})
+                if label is not None:
+                    active_labels[name] = bool(label)
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Formato no soportado: {filename}. Usa .csv, .xlsx, .sdf, .smi o .txt",
+        )
+
+    if not molecules:
+        raise HTTPException(status_code=400, detail="No se encontraron SMILES validos en el archivo")
+
+    if len(molecules) > 500:
+        raise HTTPException(status_code=400, detail=f"Maximo 500 moleculas por batch. Recibido: {len(molecules)}")
+
+    # ── Resolve targets ───────────────────────────────────────────
+    if target_pdb_id == "ALL":
+        targets = await _get_default_targets(current_user)
+        if not targets:
+            raise HTTPException(422, "No hay receptores preparados accesibles")
+    else:
+        targets = [target_pdb_id]
+
+    # ── Validate SMILES ────────────────────────────────────────────
+    from chem.validator import validate_smiles_or_raise
+    valid = []
+    invalid = 0
+    for m in molecules:
+        try:
+            v = validate_smiles_or_raise(m["smiles"])
+            valid.append({
+                "smiles": v.canonical_smiles,
+                "name": m["name"],
+                "row_id": len(valid),
+                "original": m["smiles"],
+                "is_active": m["is_active"] if "is_active" in m
+                             else active_labels.get(m["name"]),
+            })
+        except Exception:
+            invalid += 1
+
+    if not valid:
+        raise HTTPException(status_code=400, detail="Ningun SMILES valido en el archivo")
+
+    has_labels = any(m["is_active"] is not None for m in valid)
+
+    # El batch legado recorre las combinaciones en serie; el dispatcher limita Vina.
+    num_workers = 1
+
+    # ── Create batch record ────────────────────────────────────────
+    batch_id = str(_uuid_mod.uuid4())
+    batch = {
+        "id": batch_id,
+        "targets": targets,
+        "total": len(valid) * len(targets),
+        "total_molecules": len(valid),
+        "completed": 0,
+        "failed": 0,
+        "skipped_early_exit": 0,
+        "invalid_input": invalid,
+        "status": "running",
+        "results": [],
+        "created_at": datetime.now(UTC).isoformat(),
+        "num_workers": num_workers,
+        "active_task_id": None,
+        "cancel_requested": False,
+        "owner_id": _owner_of(current_user),
+        # Se guarda el hecho, no la petición: el pre-filtro no se aplica.
+        "early_exit": False,
+        "has_labels": has_labels,
+        "ef_metrics": None,
+        "configuration": {"molecules": valid, "targets": targets, "num_workers": num_workers},
+    }
+
+    # Acceptance is durable BEFORE any scientific work starts.
+    await _persist_batch(batch, create=True)
+    async with _batch_lock:
+        _batches[batch_id] = batch
+
+    # ── Launch evaluation in background ────────────────────────────
+    task = asyncio.create_task(_supervise_batch(batch_id, valid, targets, num_workers, False, has_labels))
+    _batch_tasks.add(task)
+    task.add_done_callback(_batch_tasks.discard)
+
+    return {
+        "batch_id": batch_id,
+        "total_molecules": len(valid),
+        "invalid_skipped": invalid,
+        "targets": targets,
+        "early_exit_enabled": False,
+        "has_active_labels": has_labels,
+        "status": "running",
+        "estimated_seconds": len(valid) * len(targets) * 25,
+    }
+
+
+@router.get("/batch/{batch_id}")
+async def get_batch_status(
+    batch_id: str,
+    current_user: UserORM | None = Depends(get_current_user_optional),
+) -> dict[str, Any]:
+    """Get batch evaluation status and partial results."""
+    async with _batch_lock:
+        batch = _require_own_batch(await _get_batch(batch_id), current_user)
+
+    # Return sorted results (best first) if complete
+    results = batch.get("results", [])
+    if batch["status"] == "completed":
+        results = sorted(results, key=_orden_exportado)
+
+    return {
+        "batch_id": batch["id"],
+        "status": batch["status"],
+        "active_task_id": batch.get("active_task_id"),
+        "total": batch["total"],
+        "completed": batch["completed"],
+        "failed": batch.get("failed", 0),
+        "skipped_early_exit": batch.get("skipped_early_exit", 0),
+        "invalid_input": batch.get("invalid_input", 0),
+        "targets": batch.get("targets", [batch.get("target_pdb_id", "")]),
+        "early_exit_enabled": batch.get("early_exit", False),
+        "has_active_labels": batch.get("has_labels", False),
+        "ef_metrics": batch.get("ef_metrics"),
+        # El orden es por diana y por afinidad de Vina (`_orden_exportado`); el nombre viejo describía el orden por índice.
+        "ranking_policy": RANKING_POLICY,
+        # Ya no gobierna el orden. Se conserva: dice si las filas mezclan pesos de apilado, que es lo que vuelve
+        # incomparable entre ellas la columna `total_score` (índice compuesto heredado).
+        "ranking_mixto": len({r.get("stacking_degraded") for r in results
+                              if r.get("status") == "success"}) > 1,
+        "results": results,
+        "error": batch.get("error"),
+    }
+
+
+
+@router.post("/batch/{batch_id}/cancel")
+async def cancel_batch(
+    batch_id: str,
+    current_user: UserORM | None = Depends(get_current_user_optional),
+) -> dict[str, Any]:
+    """Stop the active recorded evaluation and skip remaining batch rows."""
+    from services.docking.queue_handler import request_desktop_job_cancellation
+
+    async with _batch_lock:
+        batch = _require_own_batch(await _get_batch(batch_id), current_user)
+        if batch["status"] not in {"running", "cancelling"}:
+            return {"batch_id": batch_id, "status": batch["status"], "cancelled": False}
+        batch["cancel_requested"] = True
+        batch["status"] = "cancelling"
+        active_task_id = batch.get("active_task_id")
+        await _persist_batch(batch)
+    if active_task_id:
+        request_desktop_job_cancellation(active_task_id)
+    return {"batch_id": batch_id, "status": "cancelling", "cancelled": True}
+
+#: Con qué se ordena una exportación y qué es cada columna de score (D-07 de la investigación de 1.0.4, revisión final).
+#: El orden es por diana y por la afinidad de Vina. `TotalScore` es el índice compuesto heredado: SUP-02 (NO_GO) midió
+#: que no ordena una serie mejor que Vina (ρ 0,397 frente a 0,392 en 8T69; 0,03 frente a 0,13 en 8HFI). Se conserva
+#: por compatibilidad con quien ya lo lee, y por eso el encabezado NO se renombra: se declara su semántica al lado.
+RANKING_POLICY = "por_diana_y_afinidad_de_vina"
+SCORE_BASIS = "affinity_kcal"
+NOTA_TOTAL_SCORE = (
+    "TotalScore es el índice compuesto heredado (0-100), no una afinidad ni una probabilidad: no ordena una serie "
+    "mejor que el score de Vina (SUP-02). Las filas se ordenan por diana y por Affinity_kcal (Vina, kcal/mol; más "
+    "negativo, mejor). El índice no es comparable entre filas con distinto apilado."
+)
+
+_EXPORT_HEADERS = [
+    "Rank", "Name", "SMILES", "TotalScore", "Affinity_kcal", "MW",
+    "LogP", "TPSA", "HBD", "HBA", "Lipinski", "Veber", "Ghose",
+    "Egan", "Muegge", "Fsp3", "QED", "SAScore", "PAINS",
+    "ADME_Score", "BBB", "hERG_Alerts", "Status", "Error", "Target",
+    # Al final y constantes: quien lee por nombre o por posición las anteriores no nota nada.
+    "RankingPolicy", "ScoreBasis",
+]
+
+
+def _numero_exportado(valor: Any, decimales: int) -> float | None:
+    if valor is None:
+        return None
+    numero = float(valor)
+    return round(numero, decimales) if math.isfinite(numero) else None
+
+
+def _regla_exportada(valor: bool | None, si: str = "PASS", no: str = "FAIL") -> str | None:
+    return si if valor is True else no if valor is False else None
+
+
+def _orden_exportado(resultado: dict) -> tuple:
+    """Por diana, las corridas correctas primero y, dentro, por el score de Vina (el más negativo arriba).
+
+    Antes ordenaba por `total_score`, el índice compuesto heredado, que no ordena una serie mejor que Vina (SUP-02,
+    NO_GO: ρ 0,397 frente a 0,392 en 8T69, y 0,03 frente a 0,13 en 8HFI) y además dependía de si el stacking se
+    degradó. La columna `TotalScore` se conserva en la exportación; sólo deja de decidir el orden (segunda opinión
+    de D-07, 2026-11-15). `sorted` es estable: los empates conservan el orden del lote.
+    """
+    afinidad = _numero_exportado(resultado.get("affinity_kcal"), 4)
+    return (resultado.get("target") or "",
+            resultado.get("status") != "success",
+            afinidad is None, afinidad or 0.0)
+
+
+def _fila_exportada(rango: int, resultado: dict) -> list[Any]:
+    pains = resultado.get("is_pains")
+    if pains is None and resultado.get("pains_count") is not None:
+        pains = resultado["pains_count"] > 0
+    alertas = resultado.get("herg_alerts")
+    if isinstance(alertas, list):
+        alertas = "; ".join(str(a) for a in alertas)
+    muegge = resultado.get("muegge_score")
+    return [
+        rango, resultado.get("name"), resultado.get("smiles"),
+        _numero_exportado(resultado.get("total_score"), 1),
+        _numero_exportado(resultado.get("affinity_kcal"), 2),
+        _numero_exportado(resultado.get("molecular_weight"), 1),
+        _numero_exportado(resultado.get("log_p"), 2),
+        _numero_exportado(resultado.get("tpsa"), 1),
+        resultado.get("hbd"), resultado.get("hba"),
+        _regla_exportada(resultado.get("lipinski_pass")),
+        _regla_exportada(resultado.get("veber_pass")),
+        _regla_exportada(resultado.get("ghose_pass")),
+        _regla_exportada(resultado.get("egan_pass")),
+        f"{muegge}/9" if muegge is not None else None,
+        _numero_exportado(resultado.get("fsp3"), 3),
+        _numero_exportado(resultado.get("qed"), 3),
+        _numero_exportado(resultado.get("sa_score"), 1),
+        _regla_exportada(pains, "YES", "NO"),
+        _numero_exportado(resultado.get("adme_score"), 1),
+        _regla_exportada(resultado.get("bbb_permeable"), "YES", "NO"),
+        alertas, resultado.get("status"), resultado.get("error"), resultado.get("target"),
+        RANKING_POLICY, SCORE_BASIS,
+    ]
+
+
+@router.get("/batch/{batch_id}/export")
+async def export_batch_excel(
+    batch_id: str,
+    current_user: UserORM | None = Depends(get_current_user_optional),
+) -> StreamingResponse:
+    """Export batch results as Excel file, ranked best to worst."""
+    async with _batch_lock:
+        batch = _require_own_batch(await _get_batch(batch_id), current_user)
+
+    if batch["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Batch aun en progreso")
+
+    results = sorted(batch["results"], key=_orden_exportado)
+
+    # ── Build Excel ─────────────────────────────────────────────────
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.comments import Comment
+        from openpyxl.utils import get_column_letter
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = f"Batch_{batch_id[:8]}"
+
+        # Styles
+        header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="1a1a2e", end_color="1a1a2e", fill_type="solid")
+        fail_fill = PatternFill(start_color="fee2e2", end_color="fee2e2", fill_type="solid")
+        thin_border = Border(
+            left=Side(style="thin", color="e2e8f0"),
+            right=Side(style="thin", color="e2e8f0"),
+            top=Side(style="thin", color="e2e8f0"),
+            bottom=Side(style="thin", color="e2e8f0"),
+        )
+
+        # Headers
+        headers = _EXPORT_HEADERS
+        for col, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", wrap_text=True)
+            cell.border = thin_border
+            if header == "TotalScore":
+                cell.comment = Comment(NOTA_TOTAL_SCORE, "MolDesign")
+
+        # Data rows
+        for i, r in enumerate(results):
+            row = i + 2
+            values = _fila_exportada(i + 1, r)
+            row_fill = fail_fill if r.get("status") == "failed" else None
+
+            for col, value in enumerate(values, 1):
+                cell = ws.cell(row=row, column=col, value=value)
+                cell.border = thin_border
+                cell.alignment = Alignment(horizontal="center" if col != 2 and col != 3 else "left")
+                if row_fill:
+                    cell.fill = row_fill
+                # Highlight PAINS
+                if col == 19 and values[18] == "YES":
+                    cell.font = Font(color="dc2626", bold=True)
+
+        # Column widths
+        widths = [6, 22, 35, 11, 14, 9, 8, 8, 6, 6, 10, 10, 10,
+                  10, 10, 9, 9, 9, 8, 11, 6, 18, 12, 35, 12, 28, 14]
+        for i, w in enumerate(widths):
+            ws.column_dimensions[get_column_letter(i + 1)].width = w
+
+        # Freeze header
+        ws.freeze_panes = "A2"
+
+        # Cómo leer las columnas de score: sin esto, `TotalScore` se lee como el score de la molécula.
+        lectura = wb.create_sheet("Lectura")
+        for fila_lectura in (("RankingPolicy", RANKING_POLICY), ("ScoreBasis", SCORE_BASIS),
+                             ("TotalScore", NOTA_TOTAL_SCORE)):
+            lectura.append(fila_lectura)
+        lectura.column_dimensions["A"].width = 16
+        lectura.column_dimensions["B"].width = 110
+        for fila_lectura in lectura.iter_rows():
+            fila_lectura[1].alignment = Alignment(wrap_text=True, vertical="top")
+
+        # Auto-filter
+        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(results) + 1}"
+
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        wb.close()
+
+        targets = batch.get("targets", [])
+        target_label = targets[0] if targets and len(targets) == 1 else "ALL"
+        filename = f"MolDesign_Batch_{batch_id[:8]}_{target_label}.xlsx"
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    except ImportError:
+        raise HTTPException(status_code=500, detail="openpyxl no instalado. Instalar con: pip install openpyxl")
+
+
+@router.get("/batch/{batch_id}/csv")
+async def export_batch_csv(
+    batch_id: str,
+    current_user: UserORM | None = Depends(get_current_user_optional),
+) -> StreamingResponse:
+    """Export batch results as CSV file."""
+    async with _batch_lock:
+        propio = await _get_batch(batch_id)
+        # El 400 histórico distingue «existe pero no ha terminado». Se conserva
+        # SÓLO para el dueño: a una cuenta ajena no se le confirma nada.
+        batch = _require_own_batch(propio, current_user)
+
+    if batch["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Batch no completado")
+
+    results = sorted(batch["results"], key=_orden_exportado)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(_EXPORT_HEADERS)
+    for i, r in enumerate(results, start=1):
+        writer.writerow(_fila_exportada(i, r))
+
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="batch_{batch_id[:8]}.csv"'},
+    )
+
+
+# ── Background processing ────────────────────────────────────────────────────
+
+
+async def _evaluate_one_recorded(smiles: str, target_pdb_id: str, name: str, owner: str, batch_id: str | None = None) -> tuple[str, str]:
+    """Each legacy batch item has the same durable request as a regular evaluation."""
+    from core.database import get_db_session
+    from services.docking.queue_handler import submit_recorded_evaluation, await_recorded_evaluation
+    from utils.cache import cache
+
+    async with get_db_session() as request_db:
+        task = await submit_recorded_evaluation(
+            db=request_db, smiles=smiles, target_pdb_id=target_pdb_id,
+            molecule_name=name, user_id=None if owner == "demo" else owner,
+        )
+    await cache.set(f"task_owner:{task.id}", owner, ttl=86400)
+    if batch_id:
+        async with _batch_lock:
+            batch = _batches.get(batch_id)
+            if batch is not None:
+                batch["active_task_id"] = task.id
+                await _persist_batch(batch)
+                if batch.get("cancel_requested"):
+                    from services.docking.queue_handler import request_desktop_job_cancellation
+                    request_desktop_job_cancellation(task.id)
+    state = await await_recorded_evaluation(task.id)
+    if state.status != "SUCCESS" or state.result is None:
+        raise RuntimeError("La evaluación no produjo un resultado persistido.")
+    return task.id, str(state.result.molecule_id)
+
+async def _process_batch(
+    batch_id: str,
+    molecules: list[dict],
+    targets: list[str],
+    num_workers: int,
+    early_exit: bool,
+    has_labels: bool,
+) -> None:
+    """Evalúa cada molécula contra cada target y acumula lo que se calculó.
+
+    `early_exit` sobrevive en la firma porque la llamada histórica lo pasa
+    posicionalmente; ya no gobierna nada (BATCH-SCI-001). Toda molécula válida
+    se acopla: el descarte heurístico no puede decidir qué entra en el
+    denominador de EF/ROC-AUC ni publicar un cero por una medida.
+    """
+    import asyncio as _asyncio
+
+    sem = _asyncio.Semaphore(num_workers)
+    early_exit_skipped = 0  # se conserva en el contrato de métricas: siempre 0
+
+    # ── Per-target + per-molecule evaluation ──────────────────────
+    for target_pdb_id in targets:
+        if _batches.get(batch_id, {}).get("cancel_requested"):
+            break
+        target_pdb_id = target_pdb_id.upper()
+
+        for mol in molecules:
+            if _batches.get(batch_id, {}).get("cancel_requested"):
+                break
+            name = mol["name"]
+            smiles = mol["smiles"]
+
+            task_id = None
+            async with sem:
+                # BATCH-SCI-001. Aqui vivia un pre-filtro de vecindad
+                # (`predict_early_exit`) que saltaba el acoplamiento y metia la
+                # molecula en la tabla con `total_score: 0` y
+                # `affinity_kcal: 0` — cifras que nadie midio. Ademas solo se
+                # aplicaba a las moleculas NO marcadas como activas, de modo
+                # que descartaba senuelos usando la etiqueta que EF y ROC-AUC
+                # pretenden medir. Se acopla todo lo que entra; el descarte
+                # heuristico no decide el denominador de un benchmark.
+
+                # ── Full evaluation ────────────────────────────────
+                try:
+                    owner = _batches.get(batch_id, {}).get("owner_id", "demo")
+                    task_id, molecule_id = await _evaluate_one_recorded(
+                        smiles, target_pdb_id, name, owner, batch_id=batch_id,
+                    )
+                    if not molecule_id:
+                        result = {"name": name, "smiles": smiles, "target": target_pdb_id,
+                                  "status": "failed", "error": "No molecule_id"}
+                    else:
+                        from uuid import UUID
+                        from core.database import get_db_session
+                        from db.repository import Repository
+                        from services.batch_persistence import read_run_result
+
+                        async with get_db_session() as db:
+                            repo = Repository(db)
+                            r = await read_run_result(repo, UUID(molecule_id), task_id)
+                            if r is not None:
+                                pains_count = len(r.pains_matches) if r.pains_matches is not None else None
+                                result = {
+                                    "molecule_id": str(r.molecule_id),
+                                    "name": name, "smiles": smiles, "target": target_pdb_id,
+                                    "status": "success",
+                                    "affinity_kcal": r.affinity_kcal,
+                                    "total_score": r.total_score,
+                                    "affinity_score": r.affinity_score,
+                                    "stacking_degraded": r.stacking_degraded,
+                                    "stacking_effective_weights": r.stacking_effective_weights,
+                                    "adme_score": r.adme_score,
+                                    "molecular_weight": r.molecular_weight,
+                                    "log_p": r.log_p, "tpsa": r.tpsa,
+                                    "hbd": r.hbd, "hba": r.hba,
+                                    "lipinski_pass": r.lipinski_pass,
+                                    "veber_pass": r.veber_pass,
+                                    "ghose_pass": r.ghose_pass,
+                                    "egan_pass": r.egan_pass,
+                                    "muegge_pass": r.muegge_pass,
+                                    "muegge_score": r.muegge_score,
+                                    "fsp3": r.fsp3,
+                                    "bbb_permeable": r.blood_bbb_permeable,
+                                    "herg_alerts": getattr(r, "herg_alerts", None),
+                                    "pains_count": pains_count,
+                                    "is_pains": r.is_pains,
+                                    "qed": r.qed, "sa_score": r.sa_score,
+                                }
+                            else:
+                                result = {"name": name, "smiles": smiles, "target": target_pdb_id,
+                                          "status": "failed", "error": "Result not found in DB"}
+                except Exception as e:
+                    result = {"name": name, "smiles": smiles, "target": target_pdb_id,
+                              "status": "failed", "error": str(e)[:200]}
+
+                # ── Update batch state ────────────────────────────
+                async with _batch_lock:
+                    batch = _batches.get(batch_id)
+                    if batch:
+                        batch["completed"] += 1
+                        if result.get("status") == "failed":
+                            batch["failed"] += 1
+                        if task_id is None:
+                            task_id = batch.get("active_task_id")
+                        batch["active_task_id"] = None
+                        result["task_id"] = task_id
+                        result["row_id"] = mol.get("row_id")
+                        batch["results"].append(result)
+                        await _persist_batch(batch)
+
+    # ── EF/AUC si hay labels ──────────────────────────────────────
+    async with _batch_lock:
+        batch = _batches.get(batch_id)
+        if batch and batch.get("cancel_requested"):
+            batch["status"] = "cancelled"
+            batch["active_task_id"] = None
+            batch["finished_at"] = datetime.now(UTC).isoformat()
+        elif batch and batch["completed"] >= batch["total"]:
+            batch["status"] = "completed"
+            batch["finished_at"] = datetime.now(UTC).isoformat()
+        if batch and has_labels and batch["status"] == "completed":
+            try:
+                batch["ef_metrics"] = _compute_ef_metrics(
+                    batch["results"], molecules, early_exit_skipped
+                )
+            except Exception as e:
+                log.warning("ef_computation_failed", error=str(e))
+        if batch:
+            await _persist_batch(batch)
+
+    log.info("batch_complete", batch_id=batch_id, targets=len(targets), total=batch["total"] if batch else 0)
+
+
+#: Con qué se ordena para EF/AUC: la afinidad de Vina, negada para que «mejor» sea «mayor». Es lo que hacen las cohortes
+#: (`services/cohort/evidence.py`) y lo que decide el orden de la exportación (`_orden_exportado`).
+BASE_DE_EF_AUC = "affinity_kcal"
+
+
+def _compute_ef_metrics(results: list[dict], molecules: list[dict], skipped: int) -> dict | None:
+    """EF/AUC por diana, ordenando por la afinidad de Vina (más negativa = mejor). Fallos cuentan como el peor score y
+    quedan declarados.
+
+    Antes ordenaba por `total_score`, el índice compuesto heredado, o por `affinity_score` si los pesos del apilado
+    diferían entre filas. SUP-02 (NO_GO) midió que ese índice no ordena una serie mejor que Vina (8T69: ρ 0,397 frente a
+    0,392; 8HFI: 0,03 frente a 0,13), y una métrica que cambia de base según el lote no es comparable entre lotes. Desde
+    2026-11-15 la base es una sola y no depende de los pesos: la afinidad de Vina, como en las cohortes.
+    """
+    from collections import Counter
+    from scoring.enriquecimiento import ef_fraccional, roc_auc_midrank
+
+    labels: dict[object, bool] = {}
+    for molecule in molecules:
+        label = molecule.get("is_active")
+        if label is None:
+            continue
+        key = ("row", molecule["row_id"]) if molecule.get("row_id") is not None else (
+            molecule["name"], molecule["smiles"])
+        if key in labels:
+            return {"status": "not_evaluated", "reason": "identidad_de_fila_duplicada"}
+        labels[key] = bool(label)
+    if not labels:
+        return None
+
+    por_diana: dict[str, dict] = {}
+    for target in sorted({r.get("target") for r in results if r.get("target")}):
+        target_rows = [r for r in results if r.get("target") == target]
+        by_key = {
+            (("row", r["row_id"]) if r.get("row_id") is not None
+             else (r.get("name"), r.get("smiles"))): r
+            for r in target_rows
+        }
+        basis = BASE_DE_EF_AUC
+        scores: list[float] = []
+        y: list[bool] = []
+        reasons: Counter[str] = Counter()
+        excluded_active = excluded_inactive = 0
+        for key, label in labels.items():
+            row = by_key.get(key)
+            value = row.get(basis) if row and row.get("status") == "success" else None
+            try:
+                afinidad = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                afinidad = None
+            # Vina: más negativo = mejor. Se niega para que el mayor score sea el mejor, como pide `scoring.enriquecimiento`.
+            score = -afinidad if afinidad is not None and math.isfinite(afinidad) else float("-inf")
+            if score == float("-inf"):
+                reason = (row.get("error") or row.get("status") or "sin_score") if row else "sin_resultado"
+                reasons[str(reason)[:80]] += 1
+                excluded_active += int(label)
+                excluded_inactive += int(not label)
+            scores.append(score)
+            y.append(label)
+
+        auc = roc_auc_midrank(scores, y)
+        metrics = {
+            "n_total": len(y),
+            "n_actives": sum(y),
+            "score_basis": basis,
+            "roc_auc": round(auc, 4) if auc is not None else None,
+            "excluidos": {"activos": excluded_active, "inactivos": excluded_inactive,
+                          "motivos": dict(reasons)},
+        }
+        for pct in (1, 5, 10):
+            ef, _, _ = ef_fraccional(scores, y, pct / 100.0)
+            metrics[f"ef_{pct}pct"] = round(ef, 2) if ef is not None else None
+        por_diana[target] = metrics
+    if not por_diana:
+        return None
+
+    keys = ("ef_1pct", "ef_5pct", "ef_10pct", "roc_auc")
+    media = {
+        key: round(sum(m[key] for m in por_diana.values() if m[key] is not None) /
+                   sum(m[key] is not None for m in por_diana.values()), 4)
+        if any(m[key] is not None for m in por_diana.values()) else None
+        for key in keys
+    }
+    result = {
+        "status": "evaluated",
+        "por_diana": por_diana,
+        "media": media,
+        "n_early_exit_skipped": skipped,
+        "n_total": sum(m["n_total"] for m in por_diana.values()),
+        "n_actives": sum(m["n_actives"] for m in por_diana.values()),
+        "excluidos": {
+            "activos": sum(m["excluidos"]["activos"] for m in por_diana.values()),
+            "inactivos": sum(m["excluidos"]["inactivos"] for m in por_diana.values()),
+        },
+    }
+    # Campos heredados: con varias dianas representan la media no ponderada
+    # de las métricas por diana, nunca un ranking global mezclado.
+    result.update(media if len(por_diana) > 1 else {
+        key: next(iter(por_diana.values()))[key] for key in keys
+    })
+    result["aggregation"] = "mean_per_target" if len(por_diana) > 1 else "single_target"
+    return result

@@ -1,0 +1,21 @@
+name: protein-function-gnn
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch>=2.5
+      - numpy
+      - pandas
+      - scipy
+      - scikit-learn>=1.4
+      - biopython
+      - umap-learn>=0.5
+      - matplotlib>=3.8
+      - seaborn>=0.13
+      - pyyaml
+      - tqdm
+      - pytest>=8.0
+

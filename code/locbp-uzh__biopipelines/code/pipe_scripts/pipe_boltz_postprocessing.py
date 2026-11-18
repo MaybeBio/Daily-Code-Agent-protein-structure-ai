@@ -1,0 +1,526 @@
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+
+"""
+Script used by Boltz2 pipeline to post-process and rename outputs based on sequence IDs
+Simplified version of boltz_results.py with standard parameters
+"""
+
+import argparse
+
+parser = argparse.ArgumentParser(description='Post-process Boltz2 outputs for pipeline integration')
+parser.add_argument('PREDICTION_FOLDER', type=str, help='Boltz2 prediction folder')
+parser.add_argument('OUTPUT_FOLDER', type=str, help='Tool output folder where results will be organized')
+parser.add_argument('SEQUENCE_IDS_FILE', type=str, help='CSV file with sequence IDs for renaming')
+parser.add_argument('--structures-map', type=str, default=None, help='Path to structures_map.csv to update with runtime IDs')
+parser.add_argument('--structures-folder', type=str, default=None, help='Destination folder for predicted PDB/CIF files')
+parser.add_argument('--msas-folder', type=str, default=None, help='Destination folder for MSA files')
+parser.add_argument('--pae-folder', type=str, default=None, help='Destination folder for the full PAE matrices (<id>.npz)')
+parser.add_argument('--pae-map', type=str, default=None, help='Path to pae_map.csv, written for the ids whose PAE file exists')
+parser.add_argument('--confidence-csv', type=str, default=None, help='Path for confidence_scores.csv')
+parser.add_argument('--affinity-csv', type=str, default=None, help='Path for affinity_scores.csv')
+parser.add_argument('--sequences-csv', type=str, default=None, help='Path for sequences.csv')
+parser.add_argument('--msas-csv', type=str, default=None, help='Path for msas_map.csv')
+parser.add_argument('--scores-info', type=str, default=None, help='Path for scores_info.txt')
+parser.add_argument('--skipped-csv', type=str, default=None, help='Configs the generator left out (id, cause); each gets a blank confidence row and a failure row in --local-missing-csv')
+parser.add_argument('--local-missing-csv', type=str, default=None, help='Where the failure rows of this step are written')
+parser.add_argument('--all-samples', action='store_true', default=False,
+                    help='Surface every diffusion sample (_model_0.._model_N) as a separate '
+                         'structure <id>_1..N+1 instead of only the top model as <id>.')
+
+# Parse the arguments
+args = parser.parse_args()
+
+import os
+import sys
+import json
+import shutil
+import csv
+import re
+import pandas as pd
+
+ALL_SAMPLES = args.all_samples
+
+
+def _provenance_indices(row_ids, predicted_ids):
+    """Position in ``predicted_ids`` for each row id, resolved by the framework's id matcher.
+
+    With top_only=False structure ids are '<base>_<k>' while combinatorics keys provenance by '<base>', which is the parent tier of the shared ladder -- so the suffix rule stays in id_map_utils instead of being restated here.
+    """
+    position = {sid: i for i, sid in enumerate(predicted_ids)}
+    matched = get_mapped_ids(list(row_ids), list(predicted_ids), unique=True)
+    return {rid: position.get(matched.get(rid)) for rid in row_ids}
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from biopipelines.biopipelines_io import MISSING_COLUMNS, read_skipped_queries, step_id_from_table_path
+from biopipelines.id_map_utils import get_mapped_ids
+
+# ----- Helper function to flatten nested confidence JSON -----
+def flatten_confidence(conf, parent_key=""):
+    """
+    Flattens the confidence dictionary. Nested keys are concatenated.
+    For a dict value, keys are appended with ':' (or '-' for the second-level nested dict)
+    e.g. {'chains_ptm': {'0': 0.85, '1': 0.83}} becomes {'chains_ptm:0': 0.85, 'chains_ptm:1': 0.83}
+         {'pair_chains_iptm': {'0': {'0': 0.85, '1': 0.81}, '1': {'0': 0.82, '1': 0.83}}}
+             becomes {'pair_chains_iptm:0-0': 0.85, 'pair_chains_iptm:0-1': 0.81, 'pair_chains_iptm:1-0': 0.82, 'pair_chains_iptm:1-1': 0.83}
+    """
+    items = {}
+    for key, value in conf.items():
+        new_key = f"{parent_key}:{key}" if parent_key else key
+        if isinstance(value, dict):
+            # For second-level dictionaries, use a different delimiter (dash) if needed.
+            for subkey, subvalue in value.items():
+                if isinstance(subvalue, dict):
+                    for subsubkey, subsubvalue in subvalue.items():
+                        final_key = f"{new_key}-{subkey}-{subsubkey}"
+                        items[final_key] = subsubvalue
+                else:
+                    final_key = f"{new_key}:{subkey}"
+                    items[final_key] = subvalue
+        else:
+            items[new_key] = value
+    return items
+
+PREDICTION_FOLDER = args.PREDICTION_FOLDER
+OUTPUT_FOLDER = args.OUTPUT_FOLDER
+SEQUENCE_IDS_FILE = args.SEQUENCE_IDS_FILE
+STRUCTURES_MAP = args.structures_map
+
+STRUCTURES_FOLDER = args.structures_folder or OUTPUT_FOLDER
+MSAS_FOLDER = args.msas_folder or os.path.join(OUTPUT_FOLDER, "MSAs")
+PAE_FOLDER = args.pae_folder or os.path.join(OUTPUT_FOLDER, "pae")
+PAE_MAP = args.pae_map or os.path.join(PAE_FOLDER, "pae_map.csv")
+CONFIDENCE_CSV = args.confidence_csv or os.path.join(OUTPUT_FOLDER, "confidence_scores.csv")
+AFFINITY_CSV = args.affinity_csv or os.path.join(OUTPUT_FOLDER, "affinity_scores.csv")
+SEQUENCES_CSV = args.sequences_csv or os.path.join(OUTPUT_FOLDER, "sequences.csv")
+MSAS_CSV = args.msas_csv or os.path.join(OUTPUT_FOLDER, "msas.csv")
+SCORES_INFO = args.scores_info or os.path.join(OUTPUT_FOLDER, "scores_info.txt")
+
+
+def copy_pae(predictions_path, config_id, model_idx, out_id):
+    """Copy one sample's full PAE matrix to <PAE_FOLDER>/<out_id>.npz; None when boltz wrote none."""
+    src = os.path.join(predictions_path, f"pae_{config_id}_model_{model_idx}.npz")
+    if not os.path.exists(src):
+        print(f"No PAE file found for {out_id}: {os.path.basename(src)}")
+        return None
+    target = os.path.join(PAE_FOLDER, f"{out_id}.npz")
+    try:
+        os.makedirs(PAE_FOLDER, exist_ok=True)
+        shutil.copy2(src, target)
+    except Exception as e:
+        print(f"Error copying {src}: {e}")
+        return None
+    print(f"Copied {os.path.basename(src)} to {out_id}.npz")
+    return target
+
+
+# Load provenance from combinatorics config if available
+stored_provenance = {}
+_candidates = [
+    os.path.join(OUTPUT_FOLDER, "_configuration", "combinatorics_config.json"),
+    os.path.join(OUTPUT_FOLDER, "combinatorics_config.json"),
+]
+combinatorics_config_path = next((p for p in _candidates if os.path.exists(p)), _candidates[0])
+if os.path.exists(combinatorics_config_path):
+    try:
+        with open(combinatorics_config_path, 'r') as f:
+            comb_data = json.load(f)
+        stored_provenance = comb_data.get('provenance', {})
+        stored_predicted_ids = comb_data.get('predicted_ids', [])
+        if stored_provenance:
+            print(f"Loaded provenance from combinatorics config: {list(stored_provenance.keys())}")
+    except Exception as e:
+        print(f"Warning: Could not load provenance from combinatorics config: {e}")
+
+# Load sequence IDs for proper renaming
+sequence_ids = []
+if os.path.exists(SEQUENCE_IDS_FILE):
+    df = pd.read_csv(SEQUENCE_IDS_FILE)
+    if 'id' in df.columns:
+        sequence_ids = df['id'].tolist()
+    else:
+        print(f"Warning: No 'id' column found in {SEQUENCE_IDS_FILE}")
+else:
+    print(f"Warning: Sequence IDs file not found: {SEQUENCE_IDS_FILE}")
+
+results_folder = STRUCTURES_FOLDER
+msas_folder = MSAS_FOLDER
+os.makedirs(msas_folder, exist_ok=True)
+
+confidence_data = {}  # dictionary mapping NAME -> flattened confidence dict
+affinity_data = {}  # dictionary mapping NAME -> flattened affinity dict
+structural_files = {} # dictionary mapping NAME -> pdb or cif file
+pae_files = {}  # dictionary mapping NAME -> full PAE matrix npz
+
+# ----- Process each boltz_results folder -----
+folder_to_sequence_map = {}  # Map folder names to sequence IDs
+
+# Look for boltz_results_* folders in the prediction folder
+boltz_results_folders = [f for f in os.listdir(PREDICTION_FOLDER) if f.startswith('boltz_results_')]
+
+# Each boltz_results_*/predictions/ may contain one or many per-prediction subdirs;
+# iterate every subdir so config_id is the actual prediction stem.
+work_items = []
+for boltz_folder in sorted(boltz_results_folders):
+    boltz_folder_path = os.path.join(PREDICTION_FOLDER, boltz_folder)
+    if not os.path.isdir(boltz_folder_path):
+        continue
+    predictions_root = os.path.join(boltz_folder_path, "predictions")
+    if not os.path.isdir(predictions_root):
+        print(f"Warning: predictions/ not found under {boltz_folder}")
+        continue
+    for child in sorted(os.listdir(predictions_root)):
+        child_path = os.path.join(predictions_root, child)
+        if os.path.isdir(child_path):
+            work_items.append((boltz_folder_path, child))
+
+for boltz_folder_path, config_id in work_items:
+    if True:
+        predictions_path = os.path.join(boltz_folder_path, "predictions", config_id)
+        if not os.path.exists(predictions_path):
+            print(f"Warning: Predictions path not found: {predictions_path}")
+            continue
+        
+        # Determine sequence_id from expected sequence IDs if available
+        if sequence_ids:
+            if len(sequence_ids) == 1:
+                # Single expected sequence - use it regardless of folder name
+                sequence_id = sequence_ids[0]
+                print(f"Mapping {config_id} to expected sequence ID: {sequence_id}")
+            elif config_id in sequence_ids:
+                # Config ID matches expected - use it
+                sequence_id = config_id
+                print(f"Mapping {config_id} to sequence ID: {sequence_id} (exact match)")
+            else:
+                # The config step names every folder after an expected id, so any other folder is not this step's prediction
+                raise ValueError(f"ERROR: Cannot map config_id '{config_id}' to any expected sequence ID: {sequence_ids}. "
+                               f"Cannot proceed with output validation.")
+        else:
+            # No expected sequence IDs - use config_id directly
+            sequence_id = config_id
+            print(f"Using config_id as sequence_id: {sequence_id}")
+        
+        folder_to_sequence_map[config_id] = sequence_id
+        
+        # Discover all diffusion-sample model files for this config_id, sorted by
+        # model index. With --all-samples each becomes its own structure
+        # (<seq>_1.._N); otherwise only model_0 is kept (as <seq>).
+        sample_models = []  # list of (model_idx, ext, src_path)
+        for ext in (".pdb", ".cif"):
+            for f in os.listdir(predictions_path):
+                m = re.match(rf"^{re.escape(config_id)}_model_(\d+){re.escape(ext)}$", f)
+                if m:
+                    sample_models.append((int(m.group(1)), ext, os.path.join(predictions_path, f)))
+        sample_models.sort(key=lambda t: t[0])
+
+        if not sample_models:
+            print(f"No structure file found for {config_id}")
+            continue
+
+        if not ALL_SAMPLES:
+            sample_models = [t for t in sample_models if t[0] == 0] or sample_models[:1]
+
+        # Map each kept sample to its output id: single -> <seq>, multi -> <seq>_<k>.
+        # `id_models` pairs the output id with its model index (for per-sample
+        # confidence lookup below).
+        id_models = []
+        if len(sample_models) == 1 and not ALL_SAMPLES:
+            id_models.append((sequence_id, sample_models[0][0], sample_models[0][1], sample_models[0][2]))
+        else:
+            for k, (midx, ext, src) in enumerate(sample_models, start=1):
+                id_models.append((f"{sequence_id}_{k}", midx, ext, src))
+
+        copied_any = False
+        for out_id, midx, ext, src in id_models:
+            target_filepath = os.path.join(results_folder, f"{out_id}{ext}")
+            try:
+                shutil.copy2(src, target_filepath)
+                print(f"Copied {os.path.basename(src)} to {out_id}{ext}")
+                copied_any = True
+            except Exception as e:
+                print(f"Error copying {src}: {e}")
+        if not copied_any:
+            continue
+        # Downstream per-id processing (confidence) iterates id_models; the base
+        # sequence_id retains its original meaning for affinity/MSA (per-complex).
+        
+        # Affinity is written once per complex (not per sample) in Boltz2.
+        aff_filename = f"affinity_{config_id}.json"
+        aff_filepath = os.path.join(predictions_path, aff_filename)
+        
+        # Process MSA files (copy from msa subfolder to tool MSAs folder)
+        msas_path = os.path.join(boltz_folder_path, "msa")
+        msa_target = os.path.join(msas_folder, f"{sequence_id}.csv")
+        msa_copied = False
+        print(f"Looking for MSA folder: {msas_path}")
+        if os.path.exists(msas_path):
+            msa_source = os.path.join(msas_path, f"{config_id}_0.csv")
+            if not os.path.exists(msa_source):
+                # Exact name not found — use ID matching against available files
+                id_to_file = {}
+                for f in os.listdir(msas_path):
+                    if f.endswith('.csv') or f.endswith('.a3m'):
+                        id_to_file[os.path.splitext(f)[0]] = f
+                match = get_mapped_ids([sequence_id], list(id_to_file.keys()), unique=True)
+                matched_id = match.get(sequence_id)
+                if matched_id:
+                    msa_source = os.path.join(msas_path, id_to_file[matched_id])
+                    print(f"Matched MSA via ID mapping: {id_to_file[matched_id]}")
+                else:
+                    msa_source = None
+                    print(f"No MSA match for {sequence_id} in msa/ folder")
+            if msa_source and os.path.exists(msa_source):
+                try:
+                    ext = os.path.splitext(msa_source)[1]
+                    msa_target = os.path.join(msas_folder, f"{sequence_id}{ext}")
+                    shutil.copy2(msa_source, msa_target)
+                    print(f"Copied MSA: {os.path.basename(msa_source)} to {sequence_id}{ext}")
+                    msa_copied = True
+                except Exception as e:
+                    print(f"Error copying MSA file: {e}")
+        
+        # Fall back to recycled MSAs already in the output MSAs folder
+        if not msa_copied and not os.path.exists(msa_target):
+            id_to_file = {}
+            for f in os.listdir(msas_folder):
+                if f.endswith('.csv') or f.endswith('.a3m'):
+                    id_to_file[os.path.splitext(f)[0]] = f
+            if id_to_file:
+                match = get_mapped_ids([sequence_id], list(id_to_file.keys()), unique=True)
+                matched_id = match.get(sequence_id)
+                if matched_id:
+                    src = os.path.join(msas_folder, id_to_file[matched_id])
+                    ext = os.path.splitext(src)[1]
+                    msa_target = os.path.join(msas_folder, f"{sequence_id}{ext}")
+                    shutil.copy2(src, msa_target)
+                    print(f"Copied recycled MSA: {id_to_file[matched_id]} to {sequence_id}{ext}")
+                else:
+                    print(f"No MSA found for {sequence_id}")
+            else:
+                print(f"No MSA files available for {sequence_id}")
+        
+        # Affinity is per-complex; load once and replicate to each sample id.
+        flattened_aff = {}
+        try:
+            if os.path.exists(aff_filepath):
+                with open(aff_filepath, "r") as f:
+                    aff = json.load(f)
+                flattened_aff = flatten_confidence(aff)
+                print(f"Loaded affinity for {config_id}: {len(flattened_aff)} keys")
+            else:
+                print(f"No affinity file found for {config_id}")
+        except Exception as e:
+            print(f"Error reading affinity file {aff_filepath}: {e}")
+
+        # Confidence is per-sample: each output id reads its own model's JSON.
+        for out_id, midx, ext, src in id_models:
+            confidence_data[out_id] = {}
+            affinity_data[out_id] = flattened_aff
+            conf_filepath = os.path.join(predictions_path, f"confidence_{config_id}_model_{midx}.json")
+            try:
+                if os.path.exists(conf_filepath):
+                    with open(conf_filepath, "r") as f:
+                        conf = json.load(f)
+                    confidence_data[out_id] = flatten_confidence(conf)
+                    print(f"Loaded confidence for {out_id}: {len(confidence_data[out_id])} keys")
+            except Exception as e:
+                print(f"Error reading confidence file {conf_filepath}: {e}")
+            structural_files[out_id] = os.path.join(results_folder, f"{out_id}{ext}")
+            pae_path = copy_pae(predictions_path, config_id, midx, out_id)
+            if pae_path:
+                pae_files[out_id] = pae_path
+
+# Update structures_map.csv with actual runtime IDs and file paths
+# (config-time map only has prefix IDs when inputs use lazy patterns)
+if STRUCTURES_MAP and structural_files:
+    map_rows = []
+    for seq_id, struct_path in structural_files.items():
+        map_rows.append({'id': seq_id, 'file': struct_path, 'value': ''})
+    map_df = pd.DataFrame(map_rows)
+
+    # Preserve provenance columns from combinatorics config
+    if stored_provenance and stored_predicted_ids:
+        prov_index = _provenance_indices([r['id'] for r in map_rows], stored_predicted_ids)
+        for stream_name, prov_ids in stored_provenance.items():
+            col_name = f"{stream_name}.id"
+            col_values = []
+            for row in map_rows:
+                idx = prov_index.get(row['id'])
+                col_values.append(prov_ids[idx] if idx is not None and idx < len(prov_ids) else '')
+            map_df[col_name] = col_values
+
+    map_df.to_csv(STRUCTURES_MAP, index=False)
+    print(f"Updated {STRUCTURES_MAP} with {len(map_rows)} structures")
+
+# pae_map.csv lists only the ids whose PAE file was written
+if pae_files:
+    pae_rows = [{'id': pae_id, 'file': pae_path, 'value': ''} for pae_id, pae_path in pae_files.items()]
+    pae_df = pd.DataFrame(pae_rows)
+    if stored_provenance and stored_predicted_ids:
+        prov_index = _provenance_indices([r['id'] for r in pae_rows], stored_predicted_ids)
+        for stream_name, prov_ids in stored_provenance.items():
+            col_values = []
+            for row in pae_rows:
+                idx = prov_index.get(row['id'])
+                col_values.append(prov_ids[idx] if idx is not None and idx < len(prov_ids) else '')
+            pae_df[f"{stream_name}.id"] = col_values
+    pae_df.to_csv(PAE_MAP, index=False)
+    print(f"Created {PAE_MAP} with {len(pae_rows)} PAE matrices")
+
+# Check if we have any data
+print(f"> Total sequences processed: {len(confidence_data)}")
+print(f"> Sequences with confidence data: {[name for name, data in confidence_data.items() if data]}")
+print(f"> Sequences with affinity data: {[name for name, data in affinity_data.items() if data]}")
+
+# Create CSV files for pipeline compatibility
+# 1. Confidence scores CSV
+confidence_rows = []
+for seq_id, conf_data in confidence_data.items():
+    if conf_data:
+        row = {'id': seq_id, 'input_file': seq_id}
+        row.update(conf_data)
+        confidence_rows.append(row)
+
+# A config the generator left out entered the step: it keeps a blank row here and a failure row in the missing table.
+skipped_configs = read_skipped_queries(args.skipped_csv)
+for seq_id in skipped_configs:
+    confidence_rows.append({'id': seq_id, 'input_file': seq_id})
+if args.local_missing_csv:
+    os.makedirs(os.path.dirname(os.path.abspath(args.local_missing_csv)), exist_ok=True)
+    step_id = step_id_from_table_path(args.local_missing_csv)
+    pd.DataFrame([{'id': seq_id, 'removed_by': step_id, 'kind': 'failure', 'cause': cause}
+                  for seq_id, cause in skipped_configs.items()],
+                 columns=MISSING_COLUMNS).to_csv(args.local_missing_csv, index=False)
+
+if confidence_rows:
+    confidence_df = pd.DataFrame(confidence_rows)
+    # Add provenance columns if available
+    if stored_provenance and stored_predicted_ids:
+        prov_index = _provenance_indices([r['id'] for r in confidence_rows], stored_predicted_ids)
+        for stream_name, prov_ids in stored_provenance.items():
+            col_name = f"{stream_name}.id"
+            col_values = []
+            for row_data in confidence_rows:
+                idx = prov_index.get(row_data['id'])
+                col_values.append(prov_ids[idx] if idx is not None and idx < len(prov_ids) else '')
+            confidence_df[col_name] = col_values
+    confidence_csv = CONFIDENCE_CSV
+    confidence_df.to_csv(confidence_csv, index=False)
+    print(f"Created confidence scores CSV: {confidence_csv}")
+
+# 2. Affinity scores CSV (if sequences were processed, create affinity file even if empty)
+affinity_rows = []
+for seq_id, aff_data in affinity_data.items():
+    if aff_data:
+        row = {'id': seq_id, 'input_file': seq_id}
+        row.update(aff_data)
+        affinity_rows.append(row)
+    else:
+        # Create empty row for sequences with no affinity data
+        row = {'id': seq_id, 'input_file': seq_id}
+        affinity_rows.append(row)
+
+if affinity_rows:
+    affinity_df = pd.DataFrame(affinity_rows)
+    # Add provenance columns if available
+    if stored_provenance and stored_predicted_ids:
+        prov_index = _provenance_indices([r['id'] for r in affinity_rows], stored_predicted_ids)
+        for stream_name, prov_ids in stored_provenance.items():
+            col_name = f"{stream_name}.id"
+            col_values = []
+            for row_data in affinity_rows:
+                idx = prov_index.get(row_data['id'])
+                col_values.append(prov_ids[idx] if idx is not None and idx < len(prov_ids) else '')
+            affinity_df[col_name] = col_values
+    affinity_csv = AFFINITY_CSV
+    affinity_df.to_csv(affinity_csv, index=False)
+    print(f"Created affinity scores CSV: {affinity_csv}")
+elif confidence_data:  # If we processed sequences but no affinity data, create empty file
+    # Create empty affinity CSV with just headers
+    affinity_df = pd.DataFrame(columns=['id', 'input_file'])
+    affinity_csv = AFFINITY_CSV
+    affinity_df.to_csv(affinity_csv, index=False)
+    print(f"Created empty affinity scores CSV: {affinity_csv}")
+
+# 3. Create sequences CSV from original input data
+sequences_csv = SEQUENCES_CSV
+if os.path.exists(sequences_csv):
+    # Already written by config generator (with id + sequence columns)
+    print(f"Sequences CSV already exists: {sequences_csv}")
+elif os.path.exists(SEQUENCE_IDS_FILE):
+    # Fallback: copy the sequence IDs file
+    import shutil
+    shutil.copy2(SEQUENCE_IDS_FILE, sequences_csv)
+    print(f"Created sequences CSV: {sequences_csv}")
+else:
+    # Create basic sequences CSV with just the IDs
+    sequences_df = pd.DataFrame({'id': list(confidence_data.keys())})
+    sequences_df.to_csv(sequences_csv, index=False)
+    print(f"Created basic sequences CSV: {sequences_csv}")
+
+# 4. Create MSAs CSV if MSA files exist
+msa_csv = MSAS_CSV
+msa_files_in_dir = []
+
+# Load sequences data to get actual protein sequences
+sequences_data = {}
+if os.path.exists(sequences_csv):
+    try:
+        seq_df = pd.read_csv(sequences_csv)
+        if 'sequence' in seq_df.columns:
+            sequences_data = dict(zip(seq_df['id'], seq_df['sequence']))
+        print(f"Loaded {len(sequences_data)} sequences for MSA table")
+    except Exception as e:
+        print(f"Warning: Could not load sequences from {sequences_csv}: {e}")
+
+print(f"Checking for MSA files in: {msas_folder}")
+if os.path.exists(msas_folder):
+    msa_files = os.listdir(msas_folder)
+    print(f"Found files in MSA folder: {msa_files}")
+    for msa_file in msa_files:
+        if msa_file.endswith('.csv') or msa_file.endswith('.a3m'):
+            seq_id = os.path.splitext(msa_file)[0]  # This is already the sequence_id since we renamed files
+        
+            msa_entry = {
+                'id': seq_id,
+                'sequence': sequences_data.get(seq_id, ''),  # Add actual protein sequence
+                'file': os.path.join(msas_folder, msa_file)
+            }
+            msa_files_in_dir.append(msa_entry)
+            print(f"Added MSA file to list: {msa_file} (sequence_id: {seq_id})")
+else:
+    print(f"MSA folder does not exist: {msas_folder}")
+
+print(f"Total MSA files found: {len(msa_files_in_dir)}")
+if msa_files_in_dir:
+    msa_df = pd.DataFrame(msa_files_in_dir)
+    msa_df.to_csv(msa_csv, index=False)
+    print(f"Created MSAs CSV: {msa_csv}")
+else:
+    print("[Warning] No MSA files found, creating empty MSAs CSV")
+    # Create empty MSAs CSV so completion check doesn't fail
+    msa_df = pd.DataFrame(columns=['id', 'sequence', 'file'])
+    msa_df.to_csv(msa_csv, index=False)
+    print(f"Created empty MSAs CSV: {msa_csv}")
+
+# Create scores explanation file
+scores_explanation="""
+"confidence_score": Aggregated score used to sort the predictions, corresponds to 0.8 * complex_plddt + 0.2 * iptm (ptm for single chains)
+"ptm": Predicted TM score for the complex
+"iptm": Predicted TM score when aggregating at the interfaces
+"ligand_iptm": ipTM but only aggregating at protein-ligand interfaces
+"protein_iptm": ipTM but only aggregating at protein-protein interfaces
+"complex_plddt": Average pLDDT score for the complex
+"complex_iplddt": Average pLDDT score when upweighting interface tokens
+"complex_pde": Average PDE score for the complex
+"complex_ipde": Average PDE score when aggregating at interfaces  
+"chains_ptm": Predicted TM score within each chain
+"pair_chains_iptm": Predicted (interface) TM score between each pair of chains
+"""
+
+with open(SCORES_INFO, 'w') as scores_exp:
+    scores_exp.write(scores_explanation)
+
+print("Post-processing completed successfully!")

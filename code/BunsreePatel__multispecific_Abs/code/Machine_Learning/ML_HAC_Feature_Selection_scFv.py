@@ -1,0 +1,236 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# -------------------- Settings --------------------
+
+# Load data
+df = pd.read_csv(
+    r"C:\Users\meeko\OneDrive\Desktop\ML Practice\scFv\ML Practice_Structure_Based_HAC_Module_scFv.csv"
+)
+
+print("Dataset shape:", df.shape)
+print("\nMissing values:")
+print(df.isnull().sum())
+
+PLOT_SIZE = (16, 12)
+PLOT_DPI = 100
+
+# -------------------- Feature groups --------------------
+
+hydrophobicity_features = [
+    "Fab_Total_SASA",
+    "Num_Hydrophobic_Patches",
+    "Largest_Hydrophobic_Patch_Size",
+    "Largest_Hydrophobic_Patch_SASA",
+    "Max_Hydrophobic_Patch_Intensity",
+    "Mean_Hydrophobic_Patch_Intensity",
+    "Sum_Total_Hydrophobic_Patch_SASA",
+    "Top_Hydrophobic_Patch_Burden",
+    "Num_Aromatic_Patches",
+    "Largest_Aromatic_Patch_Size",
+    "Largest_Aromatic_Patch_SASA",
+    "Max_Aromatic_Patch_Intensity",
+    "Mean_Aromatic_Patch_Intensity",
+    "Sum_Total_Aromatic_Patch_SASA",
+    "Top_Aromatic_Patch_Burden",
+    "Hydro_Dipole_Moment_X",
+    "Hydro_Dipole_Moment_Y",
+    "Hydro_Dipole_Moment_Z",
+]
+
+aggregation_features = [
+    "Fab_Total_SAP",
+]
+
+charge_features = [
+    "Net_Charge",
+    "Dipole_Moment_X",
+    "Dipole_Moment_Y",
+    "Dipole_Moment_Z",
+    "Complementary_Charge_Patches"
+]
+
+
+# -------------------- Validation function --------------------
+
+def validate_feature_group(df, features, group_name):
+    print("\n" + "=" * 80)
+    print(group_name.upper())
+    print("=" * 80)
+
+    X = df[features].copy()
+
+    # Confirm that all selected features are numeric
+    non_numeric = X.select_dtypes(exclude=np.number).columns.tolist()
+
+    if non_numeric:
+        raise TypeError(
+            f"Non-numeric columns in {group_name}: {non_numeric}"
+        )
+
+    # Confirm that there are no missing values
+    if X.isnull().any().any():
+        raise ValueError(f"Missing values detected in {group_name}")
+
+    # Check for zero-variance features
+    variances = X.var()
+    zero_variance_features = variances[variances == 0].index.tolist()
+
+    print("\nZero-variance features:")
+    print(zero_variance_features if zero_variance_features else "None")
+
+    usable_features = [
+        feature for feature in features
+        if feature not in zero_variance_features
+    ]
+
+    print("\nFeatures ranked by variance:")
+    print(variances.to_string())
+
+    print("\nCorrelation matrix:")
+    print(X[usable_features].corr().to_string())
+
+    # Visualize feature distributions
+    X[usable_features].hist(
+        figsize=(16,16),
+        bins=20,
+        color="#040454"
+    )
+
+    plt.suptitle(
+        f"{group_name} Feature Distributions",
+        fontsize=16
+    )
+
+    plt.subplots_adjust(left=0.08, bottom=0.08, right=0.98, top=0.90,
+                        wspace=0.25, hspace=0.5)
+    plt.show()
+
+   
+    # Visualize feature correlations
+    correlation_matrix = X[usable_features].corr()
+
+    plt.figure(figsize=PLOT_SIZE, dpi=PLOT_DPI)
+    #plt.figure(figsize=(12, 10))
+
+    plt.imshow(
+        correlation_matrix,
+        cmap="RdBu_r",
+        interpolation="nearest",
+        aspect="auto",
+        vmin=-1,
+        vmax=1
+    )
+
+    plt.colorbar(label="Correlation")
+
+    plt.xticks(
+        range(len(usable_features)),
+        usable_features,
+        rotation=90,
+        fontsize=9,
+    )
+
+    plt.yticks(
+        range(len(usable_features)),
+        usable_features,
+        fontsize=9,
+    )
+
+    plt.title(f"{group_name} Feature Correlations")
+    plt.subplots_adjust(left=0.30, bottom=0.40, right=0.94, top=0.90)
+    plt.show()
+
+    return {
+        "usable_features": usable_features,
+        "variances": variances,
+        "correlations": correlation_matrix
+    }
+
+
+# -------------------- Run validation --------------------
+
+hydrophobicity_results = validate_feature_group(
+    df,
+    hydrophobicity_features,
+    "Hydrophobicity"
+)
+
+aggregation_results = validate_feature_group(
+    df,
+    aggregation_features,
+    "Aggregation"
+)
+
+charge_results = validate_feature_group(
+    df,
+    charge_features,
+    "Charge"
+)
+
+# -------------------- Optional manual feature drops --------------------
+
+hydrophobicity_to_drop = [
+    "Max_Aromatic_Patch_Intensity",
+    "Mean_Aromatic_Patch_Intensity",
+    "Sum_Total_Aromatic_Patch_SASA",
+]
+aggregation_to_drop = []
+charge_to_drop = []
+
+hydrophobicity_final = [
+    f for f in hydrophobicity_results["usable_features"]
+    if f not in hydrophobicity_to_drop
+]
+
+aggregation_final = [
+    f for f in aggregation_results["usable_features"]
+    if f not in aggregation_to_drop
+]
+
+charge_final = [
+    f for f in charge_results["usable_features"]
+    if f not in charge_to_drop
+]
+
+print("\nFinal Hydrophobicity features:", hydrophobicity_final)
+print("Final Aggregation features:", aggregation_final)
+print("Final Charge features:", charge_final)
+
+
+# Plot again using features remaining after manual drops
+final_feature_groups = [
+    ("Hydrophobicity", hydrophobicity_final),
+    ("Aggregation", aggregation_final),
+    ("Charge", charge_final),
+]
+
+for group_name, features in final_feature_groups:
+    print(f"\n{group_name} features after manual drop:", features)
+
+    df[features].hist(figsize=(16, 16), bins=20, color="#040454")
+    plt.suptitle(f"{group_name} Feature Distributions — After Manual Drop", fontsize=16)
+    plt.subplots_adjust(
+        left=0.08, bottom=0.08, right=0.98, top=0.90,
+        wspace=0.25, hspace=0.5
+    )
+    plt.show()
+
+    correlation_matrix = df[features].corr()
+
+    plt.figure(figsize=PLOT_SIZE, dpi=PLOT_DPI)
+    plt.imshow(
+        correlation_matrix,
+        cmap="RdBu_r",
+        interpolation="nearest",
+        aspect="auto",
+        vmin=-1,
+        vmax=1
+    )
+    plt.colorbar(label="Correlation")
+    plt.xticks(range(len(features)), features, rotation=90, fontsize=9)
+    plt.yticks(range(len(features)), features, fontsize=9)
+    plt.title(f"{group_name} Feature Correlations — After Manual Drop")
+    plt.subplots_adjust(left=0.30, bottom=0.40, right=0.94, top=0.90)
+    plt.show()

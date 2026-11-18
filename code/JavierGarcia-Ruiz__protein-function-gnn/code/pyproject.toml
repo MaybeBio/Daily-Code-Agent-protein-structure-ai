@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=65.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "protgnn"
+version = "0.1.0"
+description = "Protein function prediction using Graph Neural Networks on 3D residue contact graphs"
+authors = [{ name = "Javier Garcia-Ruiz" }]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.5",
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn>=1.4",
+    "biopython",
+    "umap-learn>=0.5",
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    "pyyaml",
+    "tqdm",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+

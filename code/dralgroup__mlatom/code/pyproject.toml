@@ -1,0 +1,84 @@
+# Packaging for installing MLatom directly from a source checkout / clone
+# (`pip install .` or `pip install git+https://github.com/dralgroup/mlatom`).
+#
+# This targets the FLAT layout used by the repository and the public GitHub
+# mirror, where the `mlatom/` package sits at the repo root. The separate
+# `pypi-upload/setup.py` (src/ layout) still drives the PyPI release build; keep
+# the metadata below (deps, entry points, package data) in sync with it.
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlatom"
+dynamic = ["version"]
+description = "A Package for AI-enhanced computational chemistry"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Pavlo O. Dral", email = "admin@mlatom.com" }]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Fortran",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Environment :: Console",
+]
+dependencies = [
+    "numpy<2",
+    "scipy",
+    "h5py",
+    "pyh5md",
+    # Tested with torch 2.7.0 + torchani 2.2.4. Declared as ranges, not exact pins, because
+    # PyTorch ships no build newer than 2.2.2 for macOS x86_64 -- `torch==2.7.0` makes MLatom
+    # uninstallable on every Intel Mac. The upper bounds stop at what has been tested:
+    # torchani's model API changed in 2.8, and torch 2.13 removed
+    # ReduceLROnPlateau.is_better, which our training loops call.
+    "torch>=2.1.2,<2.8",
+    "torchani>=2.2.3,<2.3",
+    "setuptools<81",
+    "matplotlib",
+    "statsmodels",
+    "tqdm",
+    "joblib",
+    "requests",
+    "psutil",
+    # 1.1.1 changed the rule that ends an IRC branch, so its reaction paths no longer
+    # match the ones MLatom is tested against.
+    "geometric<1.1.1",
+    # Reached by ordinary Gaussian/ORCA output parsing: parse_chunk ->
+    # _rotate_dipole_to_input_orientation -> xyz.rotation_matrix -> import rmsd.
+    # The import is lazy, which hid it from every test run in an environment that
+    # happened to have it; on a clean `pip install mlatom` it is a crash on any
+    # Gaussian run. Only needs numpy+scipy, which are already required here.
+    "rmsd",
+    # Lazily imported in interfaces/gaussian_external.py, the ONLY place, to write the file
+    # Gaussian reads back. Undeclared until 2026-09-09, so on a fresh install every calculation
+    # that drives Gaussian for an MLatom method - geometry optimization, frequencies, IRC, QST2,
+    # IR - died writing its output, and Gaussian reported only "Failed to open output file from
+    # external program". Same shape as the rmsd omission fixed in 3.25.2: a lazy import hides
+    # from every test run in an environment that happens to have it.
+    "fortranformat",
+]
+
+[project.urls]
+Homepage = "http://mlatom.com"
+Documentation = "http://mlatom.com/docs"
+Repository = "https://github.com/dralgroup/mlatom"
+
+[project.scripts]
+mlatom = "mlatom.shell_cmd:mlatom_cmd_run"
+MLatomF = "mlatom.shell_cmd:MLatomF"
+mlatom-gui = "mlatom.mlatom_gui:main"
+mlatom_gui = "mlatom.mlatom_gui:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "mlatom._version_static.version" }
+
+[tool.setuptools.packages.find]
+include = ["mlatom", "mlatom.*"]
+
+[tool.setuptools.package-data]
+"*" = ["MLatomF", "xtb", "README", "*.json", "*.so", "*.cpp", "*.pt", "*.dat", "*.txt", "*.pkl", "*.inp", "*.f90", "Makefile", "Makefile.intel", "Makefile.gnu", "Makefile.cygwin", "LICENSE", "*.saved", "*.sh", "*.jl"]

@@ -1,0 +1,328 @@
+machine:
+  # Unix username used for variant auto-detection. If the current user
+  # (getpass.getuser()) matches this value, the loader picks this variant
+  # without needing Pipeline(config="cluster"). Leave empty to opt out.
+  username: ""
+
+  # Notification email used by SLURM submissions with email="auto".
+  # Empty ("") disables email notifications (the default — avoids spam).
+  # Set your address to opt in, e.g. "you@example.com".
+  email: ""
+
+  # Environment manager. `name` selects "mamba", "conda", "micromamba",
+  # or "pip". `init` is a list of raw bash lines emitted before any
+  # per-tool `<mgr> activate <env>` call — typically the manager's shell
+  # hook so `mamba activate` works in non-interactive shells. The user
+  # supplies these verbatim; the framework no longer derives them from
+  # the manager name (this lets you override for non-standard installs).
+  # Use `init: []` for managers like pip that need no shell hook.
+  env_manager:
+    name: "mamba"
+    init:
+    - 'eval "$(mamba shell hook --shell bash)"'
+
+  # Scheduler. `name` selects "slurm", "lsf", "pbs", "colab", or "none".
+  # `init` is a list of raw bash lines emitted at the very top of every
+  # batch script, before any GPU setup, module load, or per-tool
+  # activation — use it to bring host primitives into scope (e.g. source
+  # the lmod profile so `module` is available in non-login batch shells).
+  # `modules` is the list of environment modules to `module load` in batch
+  # scripts (meaningful for any batch scheduler that uses lmod / Tcl
+  # modules). `bp-config auto` detects the scheduler from sinfo/bsub/qsub.
+  scheduler:
+    name: "slurm"
+    init:
+      # Source the host's lmod profile so `module` is on PATH AND so the
+      # site-specific MODULEPATH additions (z01_lmodenv.sh on UZH S3IT)
+      # are visible to module load. /etc/profile.d/lmod.sh alone is not
+      # enough because the site usually carries MODULEPATH in a separate
+      # z*_*.sh fragment loaded *after* lmod.sh in alphabetical order.
+      # This list is produced by `bp-config auto`, which keeps every
+      # /etc/profile.d/*.sh that contributes module state (lmod function,
+      # MODULEPATH) OR sets an outbound proxy — the latter so runtime
+      # downloads (pip git+https, curl/wget of weights) work on compute
+      # nodes, whose non-interactive SLURM shells don't read profile.d.
+    - 'for f in /etc/profile.d/lmod.sh /etc/profile.d/proxy.sh /etc/profile.d/z*_lmodenv.sh;
+      do [ -f "$f" ] && source "$f"; done'
+      # If stale packages under ~/.local/lib/python<ver>/site-packages shadow a
+      # conda env (symptom: ImportError for a package that is installed in the
+      # env, e.g. "cannot import name 'Sentinel' from typing_extensions"),
+      # uncomment the next line to make every env ignore user-site packages.
+      # The durable fix is to remove the offending ~/.local/lib/python* tree.
+    # - 'export PYTHONNOUSERSITE=1'
+    modules:
+    - "miniforge3"
+    - "apptainer"
+
+  # GPU models the machine offers, model -> memory. A tool that declares the GPUs it does
+  # not support (RESOURCE_REQUIREMENTS) is warned about when Resources(gpu=...) can put it
+  # on one: a request that names a model is judged by name, a request that does not
+  # (any, 80GB, !L4, 32GB|80GB) is judged against this list. Leave the memory empty where it
+  # is not known: such a model can be the answer to any memory request. Without this key
+  # only a request that names a model is judged.
+  gpu_models:
+    L4:
+    A100:
+    H100:
+    H200: "140GB"
+
+  # Container executor: "apptainer" or "singularity" or "none"
+  # Used for tools that run inside containers (e.g., RFdiffusionAllAtom)
+  container_executor: "apptainer"
+
+# GNINA-specific runtime configuration
+# CUDA modules and library paths needed for GNINA's CNN scoring.
+# Adjust these to match your HPC environment.
+folders:
+  # Base paths (resolved first)
+  # Runtime placeholders: <username>, <cwd>
+  # - <username>: actual username (e.g., gquarg)
+  # - <cwd>: current working directory
+  base:
+    home: "/home/<username>"
+    data: "<home>/data"
+    scratch: "/scratch/<username>"
+    group: "/shares/locbp.chem.uzh"
+    user: "<group>/<username>"
+    biopipelines: "<cwd>"
+    biopipelines_output: "<user>/BioPipelines"
+
+  # Infrastructure paths
+  infrastructure:
+    pipe_scripts: "<biopipelines>/pipe_scripts"
+    # Folder Scripting searches for a bare script filename, so
+    # Scripting("foo.py") finds <scripts>/foo.py without an absolute path.
+    scripts: "<biopipelines>/my_scripts"
+    pdbs: "<biopipelines>/pdbs"
+    ligands: "<biopipelines>/ligands"
+    sequences: "<biopipelines>/sequences"
+    tables: "<biopipelines>/tables"
+    cache: "<group>/cache"
+    containers: "<group>/containers"
+
+  # Installation files
+  repositories:
+    AF2BIND: "<data>/af2bind"
+    AiZynthFinder: "<data>/aizynthfinder"
+    # The ColabFold env AlphaFold.install() builds, plus the AF2 weights beside
+    # it. On the group share so one install serves everyone and neither eats a
+    # personal home quota. A conda prefix env bakes absolute paths into its
+    # shebangs, so DO NOT repoint this (here or in the overlay) without running
+    # AlphaFold.install(force_reinstall=True) afterwards -- the env does not move.
+    AlphaFold: "<group>/models/localcolabfold"
+    Boltz: "<data>/boltz"
+    BoltzGen: "<data>/boltzgen"
+    DiffDock: "<data>/DiffDock"
+    DynamicBind: "<data>/DynamicBind"
+    ESM2: "<data>/esm2"
+    FLOWR: "<data>/FLOWR"
+    Frame2Seq: "<data>/Frame2Seq"
+    GEMS: "<data>/GEMS"
+    Gnina: "<data>/gnina"
+    HBDesigner: "<data>/HBDesigner"
+    IPSAE: "<data>/ipsae"
+    LASErMPNN: "<data>/LASErMPNN"
+    LigandMPNN: "<data>/LigandMPNN"
+    MMseqs2: "<data>/mmseqs"
+    NeuralPLexer: "<data>/NeuralPLexer"
+    P2Rank: "<data>/p2rank"
+    PLACER: "<data>/PLACER"
+    PLM_Sol: "<data>/PLM_Sol"
+    PocketGen: "<data>/PocketGen"
+    ProteinMPNN: "<data>/ProteinMPNN"
+    REINVENT4: "<data>/REINVENT4"
+    RFD4Proteina: "<data>/rfd4_proteina"
+    RFdiffusion: "<data>/RFdiffusion"
+    RFdiffusion2: "<data>/RFdiffusion2"
+    RFdiffusion3: "<data>/rfdiffusion3"
+    RF3: "<data>/rf3"
+    FoundryMPNN: "<data>/foundry_mpnn"
+    RFdiffusionAllAtom: "<data>/rf_diffusion_all_atom"
+    RTMScore: "<data>/RTMScore"
+    ThermoMPNN: "<data>/ThermoMPNN"
+    VespaG: "<data>/VespaG"
+
+  # Cache paths (shared on group storage)
+  cache:
+    BoltzCache: "<cache>/Boltz"
+    BoltzGenCache: "<cache>/BoltzGen"
+    ProtenixCache: "<cache>/Protenix"
+    # Root of the ColabFold MSA database set. Shared downloads (tarballs, pdb/
+    # mmCIF, DOWNLOADS_READY/PDB_MMCIF_READY markers) live at this root; the built
+    # per-mode indexes live in gpu/ (padded, for mmseqs --gpu / colabfold_search
+    # --gpu) and cpu/ (non-padded). MMseqs2Server appends the active mode.
+    ColabFoldDatabases: "<group>/models/mmseqs2_databases"
+    # The MMseqs2 server serves the same ColabFold-formatted DBs.
+    MMseqs2Databases: "<ColabFoldDatabases>"
+    # AF2 params shared by all AF2-consuming tools (AlphaFold, AF2BIND, BioEmu).
+    # Its params/ subdir holds params_model_*.npz; this is ColabDesign's data_dir.
+    # On the group share so the ~5 GB of weights exist once for the whole lab.
+    # AlphaFold passes this to colabfold_batch as --data; repointing it at an
+    # empty folder makes the next run download a fresh copy rather than fail.
+    AlphaFoldParams: "<group>/models/localcolabfold/colabfold"
+
+  # Server paths
+  server:
+    MMseqs2Server: "<biopipelines_output>/MMseqs2Server"
+
+# Default Environments
+# Each tool can have a default conda environment specified here
+# If no specific model is used, the default is biopipelines containing pyyaml and pandas (it is automatically created when submitting via submit)
+# If the tool itsef manages the change to an environment (e.g. when it needs more than one environment), set it to null
+environments:
+  ADMETAI: "admet_ai"
+  AF2BIND: "af2bind"
+  AiZynthFinder: "aizynthfinder"
+  Aggrescan3D: "Aggrescan3D"
+  AlphaFold: "biopipelines"
+  APBS: "apbs"
+  BFactor: "biopipelines"
+  BayesianAdjuster: "MutationEnv"
+  BioEmu: "bioemu"
+  BioEmu2: "bioemu2"
+  Boltz2: "Boltz2Env"
+  OpenFold3: "OpenFold3Env"
+  BoltzGen: "boltzgen"
+  BoltzGenImport: "boltzgen"
+  BoltzGenMerge: "boltzgen"
+  CABSflex: "CABSflex"
+  CompoundLibrary: "biopipelines"
+  ConformationalChange: "ProteinEnv"
+  Contacts: "ProteinEnv"
+  DiffDock: "diffdock"
+  Distance: "biopipelines"
+  DistanceSelector: "biopipelines"
+  DNAEncoder: "biopipelines"
+  DSSP: "dssp"
+  DynamicBind: "dynamicbind"
+  Embedding: "Embedding"
+  ESM2: "esm2"
+  ESMFold: "esmfold"
+  ESMFold2: "esmfold2"
+  ExtractMetrics: "biopipelines"
+  FLOWR: "FLOWR"
+  Foldcomp: "foldcomp"
+  Foldseek: "foldseek"
+  FPocket: "fpocket"
+  FoundryMPNN: "foundry"
+  Frame2Seq: "frame2seq"
+  Fuse: "biopipelines"
+  GEMS: "gems"
+  Gnina: "biopipelines"
+  HBDesigner: "hbdesigner"
+  IPSAE: "biopipelines"
+  LASErMPNN: "lasermpnn"
+  Ligand: "biopipelines"
+  LigandAtomSelector: "biopipelines"
+  LigandDdG: "PyRosetta"
+  LigandMPNN: "ligandmpnn_env"
+  Load: "biopipelines"
+  MMseqs2: "biopipelines"
+  MMseqs2Server: "biopipelines"
+  Mutagenesis: "MutationEnv"
+  MutationComposer: "MutationEnv"
+  MutationProfiler: "MutationEnv"
+  NeuralPLexer: "neuralplexer"
+  OpenBabel: "biopipelines"
+  OpenMM: "openmm"
+  P2Rank: "p2rank"
+  Panda: "biopipelines"
+  PDB: "biopipelines"
+  Peppr: "peppr"
+  PLACER: "placer"
+  PLIP: "biopipelines"  # container mode: host env only needs pandas + helpers
+  PLM_Sol: "plm_sol"
+  Plot: "biopipelines"
+  PocketGen: "pocketgen"
+  PoseBusters: "posebusters"
+  PoseChange: "ProteinEnv"
+  PPIDdG: "PyRosetta"
+  Prodigy: "prodigy"
+  ProLIF: "prolif"
+  ProteinMPNN: "SE3nv"
+  Protenix: "protenix"
+  PyMOL: "ProteinEnv"
+  RBSDesigner: "rbs_designer"
+  RDKit: "biopipelines"
+  Reduce: "reduce"
+  REINVENT4: "REINVENT4"
+  RF3: "foundry"
+  RFD4Proteina: "RFD4Proteina"
+  RFdiffusion: "SE3nv"
+  RFdiffusion2: "biopipelines"  # container mode: host env only runs the pandas/BioPython helpers; inference runs in the .sif
+  RFdiffusion3: "foundry"
+  RFdiffusionAllAtom: "SE3nv"
+  RTMScore: "rtmscore"
+  SASA: "ProteinEnv"
+  Selection: "ProteinEnv"
+  SelectionTransfer: "biopipelines"
+  Sequence: "biopipelines"
+  SequenceIdentityGate: "biopipelines"
+  SequenceMetricCorrelation: "MutationEnv"
+  StitchSequences: "biopipelines"
+  ThermoMPNN: "thermompnn"
+  TMalign: "usalign"
+  UniProt: "biopipelines"
+  USalign: "usalign"
+  VespaG: "vespag"
+  Vina: "vina"
+  XTB: "xtb"
+
+# Containers
+# Singularity/Apptainer container images for tools that use containerized execution
+# When a container is configured for a tool, it will be used instead of the conda environment
+containers:
+  PLIP: "<containers>/plip_3.0.0.simg"
+  # RFdiffusion2 ships its own Apptainer image (downloaded by setup.py during
+  # install). This already points at the .sif under the repo's directory.
+  RFdiffusion2: "<RFdiffusion2>/rf_diffusion/exec/bakerlab_rf_diffusion_aa.sif"
+  # Container-ready tools (their generated command already threads container_prefix()).
+  # Uncomment a DESTINATION line to:
+  # - run that tool from a .sif instead of its conda env
+  # - pull the image from the SOURCE in environments/_containers.yaml when installing the tool. 
+  # Gnina: "<containers>/gnina.sif"
+  # RFdiffusion: "<containers>/rfdiffusion.sif"
+  # ProteinMPNN: "<containers>/proteinmpnn.sif"
+  # LigandMPNN: "<containers>/ligandmpnn.sif"
+  # DiffDock: "<containers>/diffdock.sif"
+  # Foldseek: "<containers>/foldseek.sif"
+tool_overrides:
+  gnina:
+    modules:
+    - "cuda/12.6.3"
+    - "cudnn/9.8.0.87-12"
+    ld_library_path: "/apps/u24/opt/x86_64_v3/cuda-12.6.3-ok2c7hqa5kefkh3iyolgxrajfpepvh6h/targets/x86_64-linux/lib"
+  mmseqs2server:
+    # Which MMseqs2 server a client auto-starts when none is running: "cpu" (GPU not implemented)
+    mode: "cpu"
+    # Size of the server pool the auto-start launches (default 1). 
+    # The user can also launch extra
+    # servers manually at any time.
+    num_servers: 1
+
+# renderers
+# Controls how tool outputs are displayed in Jupyter notebooks.
+# Maps stream formats (or stream names) to renderer scripts in the renderers/ folder.
+# Lookup order: stream name first, then format, then _default.
+renderers:
+  streams:
+    _metadata: renderers/streams.py
+    pdb: renderers/structures.py
+    cif: renderers/structures.py
+    "pdb|cif": renderers/structures.py
+    pqr: renderers/structures.py
+    dx: renderers/grids.py
+    png: renderers/images.py
+    jpg: renderers/images.py
+    jpeg: renderers/images.py
+    svg: renderers/images.py
+    gif: renderers/images.py
+    bmp: renderers/images.py
+    tiff: renderers/images.py
+    webp: renderers/images.py
+    plots: renderers/plots.py
+    fasta: renderers/fasta.py
+    fa: renderers/fasta.py
+    _default: renderers/streams.py
+  tables:
+    _default: renderers/tables.py

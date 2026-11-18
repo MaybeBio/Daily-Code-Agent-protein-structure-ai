@@ -1,0 +1,18 @@
+name: SE3nv
+channels:
+  - defaults
+  - conda-forge
+  - pytorch
+  - dglteam
+  - nvidia
+dependencies:
+  - python
+  - pytorch::pytorch
+  - torchaudio
+  - pytorch::torchvision
+  - nvidia::cudatoolkit=11.1 # changed to 11.2
+  - dgl-cuda11.1 # installed via commands from doc for pytorch 2.3x
+  - pip
+  - pip:
+    - hydra-core
+    - pyrsistent

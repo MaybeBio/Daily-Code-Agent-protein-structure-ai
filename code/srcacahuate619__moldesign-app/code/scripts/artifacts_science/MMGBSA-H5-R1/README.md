@@ -1,0 +1,63 @@
+# MMGBSA-H5-R1
+
+Registro experimental generado por `scripts/experiment_manifest.py` (FND-01).
+Este archivo se regenera desde `manifest.json`; no editar a mano.
+
+## Hipótesis
+
+Replica de MMGBSA-H5-GBN2-PARIDAD con un filtro de validez geometrica: entre las topologias con Br o I de geometria posible, OpenMM 8.5.2 (Reference) reproduce a sander en vacuum y GBn2 sin superficie (residuo < 0.001 kcal/mol, fuerza convertida < 0.001 kcal/mol/A), con la misma excepcion del azufre que H5; y el OpenMM del runtime de Windows reproduce al de Linux.
+
+## Protocolo
+
+Referencia: `backend/audits/gbn2_paridad_halogenos_r1.py, que importa sin modificar el script sellado de H5, sobre las mismas 55 topologias; corridas nuevas en directorios nuevos (servidor con sander; esta maquina con frontend/src-tauri/resources/python). Filtro declarado antes de medir: geometria imposible si dos atomos estan a < 0.5 A o un angulo de valencia mide < 30 grados. Se diseno despues de ver 5mlj en H5 y se comprobo solo sobre geometrias (sin energias) antes de este prerregistro: marca 5mlj (Br) y 6gnp (Cl, control); en los dos el SDF de PDBBind anade un H a un carbono sp2 halogenado. Diagnostico fuera del gate: recolocar ese H (perpendicular al plano si el centro es plano) y medir la paridad.`
+
+## Gate
+
+GO si entre las topologias con Br o I de geometria posible hay al menos 20 y todas pasan en vacuum y GBn2_no_SA, o -solo si llevan S- el vacio pasa y el desacuerdo desaparece con el S como elemento generico; las de geometria imposible cuentan como INDETERMINADO; y OpenMM de Windows reproduce al de Linux (< 1e-6 kcal/mol y kcal/mol/A) en todas las comparaciones con las mismas entradas. Cualquier otro fallo: NO_GO.
+
+## Ambiente
+
+- Sistema operativo: Windows (AMD64)
+- CPU: 12 núcleos
+- RAM total: 32659 MB
+- GPU: NVIDIA GeForce GTX 1660 SUPER
+- Python: 3.14.3
+- Seeds: 42
+- Git: rama `codex/release-hygiene`, commit `ddb5304aedd27e913ec54a1f25d5218563fc8a95`, dirty=True
+
+## Estado
+
+- Creado: 2026-09-23T17:59:05.333933+00:00
+- Status: finished
+- Decisión: GO
+- Sellado: sí (2026-09-23T18:00:15.647247+00:00)
+- Finalizado: 2026-09-23T18:00:15.816937+00:00
+- Razón de la decisión: La hipotesis se sostiene. De las 24 topologias con Br o I, 23 tienen geometria posible y las 23 pasan: 19 directamente (residuo <= 2e-6 kcal/mol, fuerza <= 1.1e-4 kcal/mol/A) y 4 con azufre que recuperan la paridad con el S como elemento generico en ambos programas. 5mlj es INDETERMINADA por el filtro declarado antes de medir (H22 a 0.259 A de C13; el SDF de PDBBind anade un H a un carbono sp2 con Br); diagnostico fuera del gate: con ese H perpendicular al plano, OpenMM y sander coinciden en 6.0e-6 kcal/mol en vacuum y GBn2, asi que el fallo de H5 queda atribuido entero a la geometria. Control F/Cl: 30 pasan y 6gnp (mismo defecto, H sobre un carbono sp2 con Cl) es INDETERMINADA; con el H recolocado coincide en 6e-9. OpenMM del runtime de Windows reproduce al de Linux en 110/110 comparaciones (8.5e-14 kcal/mol, 1.6e-13 kcal/mol/A) y el filtro da lo mismo en las dos maquinas. Con los mismos parametros (radio 1.5 A, apantallamiento 0.5, alfa/beta/gamma por defecto) los dos programas calculan lo mismo para Br e I: H1-H4 pueden atribuir errores a la fisica y no a la implementacion. Lo que no demuestra: que esos parametros sean buenos. Abierto aparte: el azufre discrepa en GBn2 hasta 11.24 kcal/mol (2weg). Nota de lectura: logs/comparar.log imprime primero el gate de H5 (NO PASA) porque reutiliza su cruce sin modificarlo; el de R1 es la ultima linea.
+- Hashes de assets: 8 archivo(s) con SHA-256
+
+## Flujo de trabajo
+
+1. `init`: crea este directorio con `manifest.json` prellenado y skeletons vacíos.
+2. Ejecutar el experimento: escribir `metrics.json`, `per_complex.jsonl` y `failures.jsonl`.
+3. `validate`: verifica `manifest.json` contra `manifest.schema.json`.
+4. `seal`: registra los SHA-256 de datasets/modelos/binarios/assets y congela el manifest.
+5. `finish`: escribe la decisión (GO/NO_GO/INCONCLUSIVE), la razón y la duración.
+6. `maintain`: documenta de forma auditada los assets sellados que cambian tras el sello.
+
+Después del `seal`, `validate` falla si cualquier archivo sellado cambia o desaparece.
+
+## Inmutabilidad post-seal
+
+- No se permite volver a sellar un experimento ya sellado (protege el cegamiento FND-05).
+- `finish` y `maintain` son las únicas operaciones que modifican `manifest.json` después del sellado.
+- `maintain` solo actualiza `assets_hashes` y registra cada cambio en `seal_maintenance`; datasets/modelos/binarios son inmutables.
+- El README.md regenerado por `seal`/`finish`/`maintain` es la excepción documentada a la regla anterior.
+- Los artefactos de producción permanecen fuera de este árbol (docs/49, sección 17).
+
+## Archivos
+
+- `manifest.json`: registro único del experimento (config, hashes, código, ambiente, salida).
+- `metrics.json`: métricas agregadas del experimento.
+- `per_complex.jsonl`: una línea JSON por complejo evaluado.
+- `failures.jsonl`: una línea JSON por fallo.
+- `README.md`: este archivo.

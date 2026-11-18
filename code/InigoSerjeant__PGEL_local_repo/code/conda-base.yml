@@ -1,0 +1,7 @@
+name: SE3nv-test
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+prefix: /home/ics121/miniforge3/envs/SE3nv-test

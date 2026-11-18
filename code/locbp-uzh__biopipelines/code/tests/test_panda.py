@@ -1,0 +1,1092 @@
+"""Smoke + runtime tests for the Panda tool in pool / no-pool modes.
+
+Two layers:
+
+- Config-time: ``Pipeline(...).save()`` emits a valid bash script when Panda
+  is wired downstream of Sequence/Mock/etc. (tool registration, stream/table
+  wiring, script emission).
+- Runtime: actually execute ``pipe_sequence.py`` / ``pipe_ligand.py`` and
+  ``pipe_panda.py`` end-to-end and inspect the resulting output folder —
+  every pool-forwarded content table (``sequences.csv``, ``compounds.csv``)
+  must retain its upstream content columns, and every stream map-table
+  written alongside must have the expected ``id, file, <stream>.id``
+  provenance schema. The runtime layer exists to catch regressions like the
+  stream_map_target vs. pool_table_map overwrite bug where
+  ``<panda>/sequences.csv`` was clobbered with a lineage-only schema and the
+  ``sequence`` content column disappeared silently.
+"""
+
+import csv
+import json
+import os
+import subprocess
+import sys
+
+import pytest
+
+from tests._helpers import sys_path_prepended
+
+
+# ── runtime helpers ──────────────────────────────────────────────────────────
+
+def _repo_root():
+    import biopipelines.panda as _p
+    return os.path.dirname(os.path.dirname(os.path.abspath(_p.__file__)))
+
+
+def _auto_rename_ids(output_folder, n):
+    """The ids Panda's auto-rename produces for a step (no explicit rename=).
+
+    Mirrors panda.py: prefix is the step folder name with its zero-padded
+    execution order normalized to an int ("002_Panda" -> "2_Panda"), so two
+    unnamed Panda steps get distinct id namespaces.
+    """
+    folder = os.path.basename(output_folder)
+    parts = folder.split("_", 1)
+    prefix = f"{int(parts[0])}_{parts[1]}" if len(parts) > 1 and parts[0].isdigit() else folder
+    return [f"{prefix}_{i + 1}" for i in range(n)]
+
+
+def _run_pipe(name, config_path, config_flag=True):
+    """Execute a pipe_*.py script with its JSON config.
+
+    Most pipe scripts accept ``--config <path>``; a couple take the config
+    path as a positional argument (``pipe_mock.py``). ``config_flag`` picks
+    the calling convention.
+    """
+    script = os.path.join(_repo_root(), "pipe_scripts", f"pipe_{name}.py")
+    args = [sys.executable, script]
+    args += ["--config", str(config_path)] if config_flag else [str(config_path)]
+    subprocess.run(args, check=True)
+
+
+def _check_completion(tool):
+    """Ask the completion checker whether a finished step is complete.
+
+    Reads the step's own `.expected_outputs.json` — the manifest its bash
+    passes — and calls `check_expected_outputs` in process, as
+    `test_completion_all_filtered.py` does. Returns `(ok, missing_by_category)`.
+    """
+    with sys_path_prepended(os.path.join(_repo_root(), "pipe_scripts")):
+        import pipe_check_completion
+
+    with open(os.path.join(tool.output_folder, ".expected_outputs.json")) as f:
+        manifest = json.load(f)
+    return pipe_check_completion.check_expected_outputs(
+        manifest["output_structure"], manifest["tool_name"], tool.output_folder
+    )
+
+
+def _read_csv_rows(path):
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def _read_csv_columns(path):
+    with open(path, newline="") as f:
+        return next(csv.reader(f))
+
+
+# ── Panda: no-pool modes ──────────────────────────────────────────────────────
+
+def test_panda_nopool_single_table_filter_sort(
+    local_config, isolated_cwd, new_pipeline, assert_valid_script, record_case,
+):
+    """Panda(tables=seq.tables.sequences, operations=[filter, sort]) — single table."""
+    from biopipelines.sequence import Sequence
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_nopool_single")
+    with pipeline:
+        seq = Sequence(seq=["MKTAY", "AETGF", "GGGGA"],
+                       type="protein", ids=["a", "b", "c"])
+        Panda(
+            tables=seq.tables.sequences,
+            operations=[
+                Panda.filter("length >= 4"),
+                Panda.sort("id", ascending=True),
+            ],
+        )
+        script_path = pipeline.save()
+
+    record_case(input="Panda nopool single-table",
+                expected="script with Panda marker",
+                actual=os.path.basename(script_path))
+    assert_valid_script(script_path, "Panda", "panda_nopool_single")
+
+
+def test_panda_nopool_multi_table_merge(
+    local_config, isolated_cwd, new_pipeline, assert_valid_script, record_case,
+):
+    """Panda(tables=[a, b], operations=[merge]) — multi-table merge."""
+    from biopipelines.sequence import Sequence
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_nopool_merge")
+    with pipeline:
+        apo = Sequence(seq=["MKTAY", "AETGF"], type="protein", ids=["x", "y"])
+        holo = Sequence(seq=["PPPPL", "QQQQL"], type="protein", ids=["x", "y"])
+        Panda(
+            tables=[apo.tables.sequences, holo.tables.sequences],
+            operations=[Panda.merge(prefixes=["apo_", "holo_"])],
+        )
+        script_path = pipeline.save()
+
+    record_case(input="Panda nopool merge 2 tables",
+                expected="merge in script",
+                actual=os.path.basename(script_path))
+    assert_valid_script(script_path, "Panda", "panda_nopool_merge")
+
+
+def test_panda_nopool_multi_table_concat(
+    local_config, isolated_cwd, new_pipeline, assert_valid_script, record_case,
+):
+    """Panda(tables=[a, b, c], operations=[concat]) — multi-table concat."""
+    from biopipelines.sequence import Sequence
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_nopool_concat")
+    with pipeline:
+        s1 = Sequence(seq=["MKTAY"], type="protein", ids=["a"])
+        s2 = Sequence(seq=["AETGF"], type="protein", ids=["b"])
+        s3 = Sequence(seq=["GGGGA"], type="protein", ids=["c"])
+        Panda(
+            tables=[s1.tables.sequences, s2.tables.sequences, s3.tables.sequences],
+            operations=[Panda.concat()],
+        )
+        script_path = pipeline.save()
+
+    record_case(input="Panda nopool concat 3 tables",
+                expected="concat in script",
+                actual=os.path.basename(script_path))
+    assert_valid_script(script_path, "Panda", "panda_nopool_concat")
+
+
+def test_panda_merge_requires_multi_table(
+    local_config, isolated_cwd, new_pipeline, record_case,
+):
+    """Panda.merge on a single-table input raises ValueError."""
+    from biopipelines.sequence import Sequence
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_merge_invalid")
+    record_case(input="Panda.merge with single table",
+                expected="ValueError", actual="ValueError")
+    with pipeline:
+        seq = Sequence(seq="MKTAY", type="protein", ids="a")
+        with pytest.raises(ValueError):
+            Panda(tables=seq.tables.sequences, operations=[Panda.merge()])
+
+
+# ── Panda: pool modes ─────────────────────────────────────────────────────────
+
+def test_panda_single_pool(
+    local_config, isolated_cwd, new_pipeline, assert_valid_script, record_case,
+):
+    """Panda(pool=seq_out, ...) — single-pool filter keeps matching stream files."""
+    from biopipelines.sequence import Sequence
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_pool_single")
+    with pipeline:
+        seq = Sequence(seq=["MKTAY", "AETGF", "GGGGA"],
+                       type="protein", ids=["a", "b", "c"])
+        Panda(
+            tables=seq.tables.sequences,
+            operations=[Panda.filter("length >= 4")],
+            pool=seq,
+        )
+        script_path = pipeline.save()
+
+    record_case(input="Panda single-pool",
+                expected="POOL MODE wired",
+                actual=os.path.basename(script_path))
+    assert_valid_script(script_path, "Panda", "panda_pool_single")
+
+
+def test_panda_multi_pool_concat(
+    local_config, isolated_cwd, new_pipeline, assert_valid_script, record_case,
+):
+    """Panda(pool=[p1, p2], operations=[concat]) — multi-pool concat + head."""
+    from biopipelines.sequence import Sequence
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_pool_multi")
+    with pipeline:
+        s1 = Sequence(seq=["MKTAY", "AETGF"], type="protein", ids=["a", "b"])
+        s2 = Sequence(seq=["PPPPL", "QQQQL"], type="protein", ids=["c", "d"])
+        Panda(
+            tables=[s1.tables.sequences, s2.tables.sequences],
+            operations=[
+                Panda.concat(),
+                Panda.sort("id"),
+                Panda.head(2),
+            ],
+            pool=[s1, s2],
+        )
+        script_path = pipeline.save()
+
+    record_case(input="Panda multi-pool concat+head",
+                expected="multi-pool script",
+                actual=os.path.basename(script_path))
+    assert_valid_script(script_path, "Panda", "panda_pool_multi")
+
+
+# ── Panda driven by Mock (no Sequence shared-fasta quirk) ─────────────────────
+
+def test_panda_nopool_via_mock(
+    local_config, isolated_cwd, new_pipeline, assert_valid_script, record_case,
+):
+    """Panda downstream of Mock's real per-ID table."""
+    from biopipelines.mock import Mock
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_mock_nopool")
+    with pipeline:
+        m = Mock(
+            ids=["a", "b", "c"],
+            streams={"s": {"format": "pdb", "file": "<id>.pdb"}},
+            tables={"scores": {"columns": ["score"], "fill": {"score": 1.0}}},
+        )
+        Panda(
+            tables=m.tables.scores,
+            operations=[Panda.sort("id", ascending=True)],
+        )
+        script_path = pipeline.save()
+
+    record_case(input="Panda nopool ← Mock",
+                expected="script with Panda+Mock",
+                actual=os.path.basename(script_path))
+    assert_valid_script(script_path, "Panda", "Mock", "panda_mock_nopool")
+
+
+def test_panda_pool_via_mock(
+    local_config, isolated_cwd, new_pipeline, assert_valid_script, record_case,
+):
+    """Panda pool=[Mock1.stream, Mock2.stream] — two real per-ID streams."""
+    from biopipelines.mock import Mock
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_mock_pool")
+    with pipeline:
+        m1 = Mock(ids=["x1", "x2"],
+                  streams={"s": {"format": "pdb", "file": "<id>.pdb"}},
+                  tables={"scores": {"columns": ["score"], "fill": 1.0}})
+        m2 = Mock(ids=["y1", "y2"],
+                  streams={"s": {"format": "pdb", "file": "<id>.pdb"}},
+                  tables={"scores": {"columns": ["score"], "fill": 2.0}})
+        Panda(
+            tables=[m1.tables.scores, m2.tables.scores],
+            operations=[Panda.concat(), Panda.sort("id")],
+            pool=[m1, m2],
+        )
+        script_path = pipeline.save()
+
+    record_case(input="Panda pool ← 2 Mocks",
+                expected="pool script with Mock",
+                actual=os.path.basename(script_path))
+    assert_valid_script(script_path, "Panda", "Mock", "panda_mock_pool")
+
+
+# ── Panda op-cycle tests: Mock → Panda(<op>) → Mock ──────────────────────────
+
+def test_panda_cycle_filter_preserves_ids(
+    local_config, isolated_cwd, new_pipeline, assert_valid_script, record_case,
+):
+    """Panda(filter, pool) keeps the upstream IDs (no rename)."""
+    from biopipelines.mock import Mock
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_cycle_filter")
+    with pipeline:
+        m = Mock(
+            ids=["p1", "p2", "p3"],
+            streams={"s": {"format": "pdb", "file": "<id>.pdb"}},
+            tables={"scores": {"columns": ["score"], "fill": {"score": 0.7}}},
+        )
+        p = Panda(
+            tables=m.tables.scores,
+            operations=[Panda.filter("score > 0.5")],
+            pool=m,
+        )
+        Mock(source=p.streams.s, children="<1..2>",
+             streams={"out": {"format": "pdb", "file": "<id>.pdb"}})
+        script_path = pipeline.save()
+
+    ids = list(p.streams.s.ids)
+    record_case(input="filter-only cycle", expected=["p1", "p2", "p3"], actual=ids)
+    assert ids == ["p1", "p2", "p3"]
+    assert_valid_script(script_path, "Mock", "Panda", "panda_cycle_filter")
+
+
+def test_panda_cycle_sort_head_renames(
+    local_config, isolated_cwd, new_pipeline, assert_valid_script, record_case,
+):
+    """Panda(sort+head, pool) renames to fixed count; cycle is script-valid."""
+    from biopipelines.mock import Mock
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_cycle_sort_head")
+    with pipeline:
+        m = Mock(
+            ids=["r1", "r2", "r3", "r4"],
+            streams={"s": {"format": "pdb", "file": "<id>.pdb"}},
+            tables={"scores": {"columns": ["score"], "fill": {"score": 0.8}}},
+        )
+        p = Panda(
+            tables=m.tables.scores,
+            operations=[Panda.sort("score", ascending=False), Panda.head(2)],
+            pool=m,
+        )
+        Mock(source=p.streams.s, children="<1..2>",
+             streams={"out": {"format": "pdb", "file": "<id>.pdb"}})
+        script_path = pipeline.save()
+
+    ids = list(p.streams.s.ids)
+    record_case(input="sort+head(2) cycle", expected=2, actual=len(ids))
+    assert len(ids) == 2
+    assert all("_" in i for i in ids)
+    assert_valid_script(script_path, "Mock", "Panda", "panda_cycle_sort_head")
+
+
+def test_panda_cycle_sort_tail_renames(
+    local_config, isolated_cwd, new_pipeline, assert_valid_script, record_case,
+):
+    """Panda(sort+tail, pool) also renames; bottom-N cycle."""
+    from biopipelines.mock import Mock
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_cycle_sort_tail")
+    with pipeline:
+        m = Mock(
+            ids=["t1", "t2", "t3", "t4", "t5"],
+            streams={"s": {"format": "pdb", "file": "<id>.pdb"}},
+            tables={"scores": {"columns": ["score"], "fill": {"score": 0.4}}},
+        )
+        p = Panda(
+            tables=m.tables.scores,
+            operations=[Panda.sort("score"), Panda.tail(3)],
+            pool=m,
+        )
+        Mock(source=p.streams.s, children="<A B>",
+             streams={"out": {"format": "pdb", "file": "<id>.pdb"}})
+        script_path = pipeline.save()
+
+    ids = list(p.streams.s.ids)
+    record_case(input="sort+tail(3) cycle", expected=3, actual=len(ids))
+    assert len(ids) == 3
+    assert_valid_script(script_path, "Mock", "Panda", "panda_cycle_sort_tail")
+
+
+def test_panda_cycle_filter_sort_head_combined(
+    local_config, isolated_cwd, new_pipeline, assert_valid_script, record_case,
+):
+    """Panda(filter + sort + head, pool) — the rename path still kicks in."""
+    from biopipelines.mock import Mock
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_cycle_filter_sort_head")
+    with pipeline:
+        m = Mock(
+            ids=["u1", "u2", "u3", "u4", "u5", "u6"],
+            streams={"s": {"format": "pdb", "file": "<id>.pdb"}},
+            tables={"scores": {"columns": ["score"], "fill": {"score": 0.9}}},
+        )
+        p = Panda(
+            tables=m.tables.scores,
+            operations=[
+                Panda.filter("score >= 0.5"),
+                Panda.sort("score", ascending=False),
+                Panda.head(3),
+            ],
+            pool=m,
+        )
+        Mock(source=p.streams.s, children="<1..2>",
+             streams={"out": {"format": "pdb", "file": "<id>.pdb"}})
+        script_path = pipeline.save()
+
+    ids = list(p.streams.s.ids)
+    record_case(input="filter+sort+head(3) cycle", expected=3, actual=len(ids))
+    assert len(ids) == 3
+    assert_valid_script(
+        script_path, "Mock", "Panda", "panda_cycle_filter_sort_head"
+    )
+
+
+def test_panda_cycle_sample_renames(
+    local_config, isolated_cwd, new_pipeline, assert_valid_script, record_case,
+):
+    """Panda(sample(n), pool) renames and fixes output count."""
+    from biopipelines.mock import Mock
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_cycle_sample")
+    with pipeline:
+        m = Mock(
+            ids=["v1", "v2", "v3", "v4"],
+            streams={"s": {"format": "pdb", "file": "<id>.pdb"}},
+            tables={"scores": {"columns": ["score"], "fill": {"score": 0.6}}},
+        )
+        p = Panda(
+            tables=m.tables.scores,
+            operations=[Panda.sample(n=2, random_state=1)],
+            pool=m,
+        )
+        Mock(source=p.streams.s, children="<A B>",
+             streams={"out": {"format": "pdb", "file": "<id>.pdb"}})
+        script_path = pipeline.save()
+
+    ids = list(p.streams.s.ids)
+    record_case(input="sample(n=2) cycle", expected=2, actual=len(ids))
+    assert len(ids) == 2
+    assert_valid_script(script_path, "Mock", "Panda", "panda_cycle_sample")
+
+
+# ── Runtime: pool-mode output content survival ───────────────────────────────
+#
+# These tests actually invoke pipe_sequence.py / pipe_ligand.py / pipe_panda.py
+# and then read the Panda output folder to confirm:
+#   (a) every pool_table_map'd content CSV (sequences.csv, compounds.csv)
+#       still carries its upstream content columns after a round-trip through
+#       Panda's pool mode, for both filter-only (no rename) and sort+head
+#       (rename) cycles;
+#   (b) every stream_map_target CSV (for streams with per-ID files) has the
+#       canonical `id, file, <stream>.id` provenance schema and points at the
+#       correct rows;
+#   (c) the two are not at odds — when pool_table_map and stream_map_target
+#       resolve to the same basename (e.g. `sequences.csv`), the content
+#       must win, not the provenance.
+#
+# (c) is the regression lock for the 2026-04-23 bug where `sequences.csv`
+# was silently overwritten and MutationProfiler failed with
+# "Could not find id and sequence columns".
+
+
+def test_panda_pool_sequence_preserves_content_columns(
+    local_config, isolated_cwd, new_pipeline, record_case,
+):
+    """Sequence → Panda(pool=seq, filter) — post-execution `sequences.csv`
+    must retain `id` and `sequence` (and `type`, `length`), not be
+    overwritten with the stream-map schema `id, file, sequences.id`."""
+    from biopipelines.sequence import Sequence
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_pool_seq_content")
+    with pipeline:
+        seq = Sequence(seq=["MKTAYIAK", "AE", "GGGGALV"],
+                       ids=["long1", "short", "long2"], type="protein")
+        pan = Panda(
+            tables=seq.tables.sequences,
+            operations=[Panda.filter("length >= 5")],
+            pool=seq,
+        )
+        pipeline.save()
+
+    _run_pipe("sequence", os.path.join(seq.output_folder, "_configuration", "sequence_config.json"))
+    _run_pipe("panda", os.path.join(pan.output_folder, "_configuration", "panda_config.json"))
+
+    out_seq = os.path.join(pan.output_folder, "sequences", "sequences.csv")
+    assert os.path.exists(out_seq), f"Panda did not emit {out_seq}"
+    cols = _read_csv_columns(out_seq)
+    rows = _read_csv_rows(out_seq)
+    ids = sorted(r["id"] for r in rows)
+    seqs = {r["id"]: r.get("sequence", "") for r in rows}
+
+    record_case(
+        input="Sequence[long1,short,long2] → Panda(pool, filter length>=5)",
+        expected=({"id", "sequence"}, ["long1", "long2"],
+                  {"long1": "MKTAYIAK", "long2": "GGGGALV"}),
+        actual=(set(cols) & {"id", "sequence"}, ids, seqs),
+    )
+    assert {"id", "sequence"}.issubset(cols), (
+        f"content columns lost from sequences.csv — got {cols}"
+    )
+    assert ids == ["long1", "long2"]
+    assert seqs["long1"] == "MKTAYIAK"
+    assert seqs["long2"] == "GGGGALV"
+
+
+def test_panda_pool_sequence_rename_preserves_content_columns(
+    local_config, isolated_cwd, new_pipeline, record_case,
+):
+    """Sequence → Panda(pool=seq, sort+head) triggers the auto-rename path
+    (`<order>_Panda_1`, `<order>_Panda_2`). Even then, `sequences.csv` must
+    keep the `sequence` content column; `pool.id` provenance is expected as
+    the only new column."""
+    from biopipelines.sequence import Sequence
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_pool_seq_rename")
+    with pipeline:
+        seq = Sequence(seq=["MKTAY", "AETGFLMK", "GG", "HHHHHKKK"],
+                       ids=["a", "b", "c", "d"], type="protein")
+        pan = Panda(
+            tables=seq.tables.sequences,
+            operations=[Panda.sort("length", ascending=False), Panda.head(2)],
+            pool=seq,
+        )
+        pipeline.save()
+
+    _run_pipe("sequence", os.path.join(seq.output_folder, "_configuration", "sequence_config.json"))
+    _run_pipe("panda", os.path.join(pan.output_folder, "_configuration", "panda_config.json"))
+
+    out_seq = os.path.join(pan.output_folder, "sequences", "sequences.csv")
+    assert os.path.exists(out_seq)
+    rows = _read_csv_rows(out_seq)
+    cols = set(rows[0].keys()) if rows else set()
+    ids = sorted(r["id"] for r in rows)
+    parents = sorted(r.get("pool.id", "") for r in rows)
+    longest_two_seqs = sorted(r["sequence"] for r in rows)
+
+    expected_ids = _auto_rename_ids(pan.output_folder, 2)
+    record_case(
+        input="Sequence[a,b,c,d lengths 5,8,2,8] → Panda(sort+head(2), pool)",
+        expected=("sequence col kept", expected_ids,
+                  ["b", "d"], ["AETGFLMK", "HHHHHKKK"]),
+        actual=("sequence" in cols, ids, parents, longest_two_seqs),
+    )
+    assert "sequence" in cols, f"sequence column lost after rename — cols={cols}"
+    assert ids == sorted(expected_ids)
+    assert set(parents) == {"b", "d"}
+    assert longest_two_seqs == ["AETGFLMK", "HHHHHKKK"]
+
+
+def test_panda_pool_ligand_preserves_smiles_column(
+    local_config, isolated_cwd, new_pipeline, record_case,
+):
+    """Ligand(smiles={...}) → Panda(pool=lig, filter) — `compounds.csv`
+    must retain the `smiles` column (and the other content cols) after
+    pool round-trip. Guards against the same stream_map_target
+    overwrite for Ligand's `compounds` stream."""
+    from biopipelines.ligand import Ligand
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_pool_ligand_content")
+    with pipeline:
+        lig = Ligand(smiles={"ethanol": "CCO",
+                             "acetate": "CC(=O)O",
+                             "water": "O"})
+        pan = Panda(
+            tables=lig.tables.compounds,
+            operations=[Panda.filter("id != 'water'")],
+            pool=lig,
+        )
+        pipeline.save()
+
+    _run_pipe("ligand", os.path.join(lig.output_folder, "_configuration", "fetch_config.json"))
+    _run_pipe("panda", os.path.join(pan.output_folder, "_configuration", "panda_config.json"))
+
+    out_cmp = os.path.join(pan.output_folder, "compounds", "compounds.csv")
+    assert os.path.exists(out_cmp), f"Panda did not emit {out_cmp}"
+    rows = _read_csv_rows(out_cmp)
+    cols = set(rows[0].keys()) if rows else set()
+    smiles_by_id = {r["id"]: r.get("smiles", "") for r in rows}
+
+    record_case(
+        input="Ligand(smiles={ethanol,acetate,water}) → Panda(pool, filter !=water)",
+        expected=({"id", "smiles"}, {"ethanol": "CCO", "acetate": "CC(=O)O"}),
+        actual=(cols & {"id", "smiles"}, smiles_by_id),
+    )
+    assert {"id", "smiles"}.issubset(cols), (
+        f"content columns lost from compounds.csv — got {cols}"
+    )
+    assert smiles_by_id == {"ethanol": "CCO", "acetate": "CC(=O)O"}
+
+
+def test_panda_pool_writes_stream_map_tables_with_provenance(
+    local_config, isolated_cwd, new_pipeline, record_case,
+):
+    """Mock(structures stream with per-ID .pdb files) → Panda(pool, sort+head).
+
+    The stream_map_target writer must still produce the structures
+    map_table with `id, file, structures.id` provenance columns, pointing
+    each renamed `<order>_Panda_N` back to its upstream parent. This locks in the
+    behavior the bug-fix preserves for streams that genuinely need a map
+    table (non-empty ``file_template``)."""
+    from biopipelines.mock import Mock
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_pool_stream_map")
+    with pipeline:
+        m = Mock(
+            ids=["a", "b", "c", "d"],
+            streams={"structures": {"format": "pdb", "file": "<id>.pdb"}},
+            tables={"scores": {"columns": ["score"],
+                               "fill": {"score": 0.9}}},
+        )
+        pan = Panda(
+            tables=m.tables.scores,
+            operations=[Panda.sort("score", ascending=False), Panda.head(2)],
+            pool=m,
+        )
+        pipeline.save()
+
+    _run_pipe("mock", os.path.join(m.output_folder, "_configuration", "mock_config.json"),
+              config_flag=False)
+    _run_pipe("panda", os.path.join(pan.output_folder, "_configuration", "panda_config.json"))
+
+    map_path = pan.streams.structures.map_table
+    assert os.path.exists(map_path), f"stream map_table missing: {map_path}"
+    rows = _read_csv_rows(map_path)
+    cols = set(rows[0].keys()) if rows else set()
+    rename_map = {r["id"]: r["structures.id"] for r in rows}
+
+    expected_ids = set(_auto_rename_ids(pan.output_folder, 2))
+    record_case(
+        input="Mock(4 ids) → Panda(sort+head(2), pool) — structures map_table",
+        expected=({"id", "file", "structures.id"}, expected_ids),
+        actual=(cols, set(rename_map.keys())),
+    )
+    assert cols == {"id", "file", "structures.id"}, (
+        f"unexpected stream map_table schema: {cols}"
+    )
+    assert set(rename_map.keys()) == expected_ids
+    # Each renamed ID must link to a concrete upstream parent.
+    assert set(rename_map.values()).issubset({"a", "b", "c", "d"})
+
+
+def test_panda_pool_prunes_recoverable_provenance_by_default(
+    local_config, isolated_cwd, new_pipeline, record_case,
+):
+    """Mock(structures) → Panda(filter, no rename): output IDs stay equal to
+    the upstream IDs, so the emitted `structures.id` provenance column is
+    fully recoverable from the row id by id-semantics. With Panda's default
+    prune_redundant_provenance=True it must be dropped — the column is a
+    genuine no-op for any downstream join. Setting the flag False keeps it."""
+    from biopipelines.mock import Mock
+    from biopipelines.panda import Panda
+
+    def run(prune, job):
+        pipeline = new_pipeline(job)
+        with pipeline:
+            m = Mock(
+                ids=["a", "b", "c"],
+                streams={"structures": {"format": "pdb", "file": "<id>.pdb"}},
+                tables={"scores": {"columns": ["score"], "fill": {"score": 0.9}}},
+            )
+            pan = Panda(
+                tables=m.tables.scores,
+                operations=[Panda.filter("score >= 0.5")],
+                pool=m,
+                prune_redundant_provenance=prune,
+            )
+            pipeline.save()
+        _run_pipe("mock", os.path.join(m.output_folder, "_configuration", "mock_config.json"),
+                  config_flag=False)
+        _run_pipe("panda", os.path.join(pan.output_folder, "_configuration", "panda_config.json"))
+        rows = _read_csv_rows(pan.streams.structures.map_table)
+        return set(rows[0].keys()) if rows else set()
+
+    cols_pruned = run(True, "panda_prune_on")
+    cols_kept = run(False, "panda_prune_off")
+
+    record_case(
+        input="Mock(a,b,c) → Panda(filter, no rename) — structures map_table",
+        expected=("structures.id absent (default)", "structures.id present (off)"),
+        actual=("structures.id" not in cols_pruned, "structures.id" in cols_kept),
+    )
+    # Default True: recoverable provenance column is gone, id/file remain.
+    assert "structures.id" not in cols_pruned, (
+        f"recoverable structures.id was not pruned: {cols_pruned}"
+    )
+    assert {"id", "file"}.issubset(cols_pruned)
+    # Off: column retained verbatim.
+    assert "structures.id" in cols_kept, (
+        f"prune_redundant_provenance=False should keep the column: {cols_kept}"
+    )
+
+
+def test_panda_pool_content_and_stream_map_coexist(
+    local_config, isolated_cwd, new_pipeline, record_case,
+):
+    """Sequence → Panda(pool, filter) emits BOTH a content `sequences.csv`
+    (with `id, sequence, ...`) AND — if `sequences` is also emitted as a
+    stream_map_target — something that carries provenance separately.
+
+    The bug was: one path overwrites the other at the same filename.
+    This test asserts that after the fix, `sequences.csv` is the content
+    table (not a lineage stub), regardless of whether a sibling provenance
+    file exists."""
+    from biopipelines.sequence import Sequence
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_pool_content_wins")
+    with pipeline:
+        seq = Sequence(seq=["MKTAY", "AETGFLMK"], ids=["a", "b"],
+                       type="protein")
+        pan = Panda(
+            tables=seq.tables.sequences,
+            operations=[Panda.filter("length >= 4")],
+            pool=seq,
+        )
+        pipeline.save()
+
+    _run_pipe("sequence", os.path.join(seq.output_folder, "_configuration", "sequence_config.json"))
+    _run_pipe("panda", os.path.join(pan.output_folder, "_configuration", "panda_config.json"))
+
+    out_seq = os.path.join(pan.output_folder, "sequences", "sequences.csv")
+    rows = _read_csv_rows(out_seq)
+    cols = set(rows[0].keys()) if rows else set()
+
+    # The content table must win: `sequence` column is the strong signal.
+    # The lineage-only schema would be {id, file, sequences.id} — explicitly
+    # fail if we see that shape (no `sequence` key).
+    is_content_schema = "sequence" in cols
+    is_lineage_schema = cols == {"id", "file", "sequences.id"}
+
+    record_case(
+        input="Sequence → Panda(pool, filter) sequences.csv schema",
+        expected=(True, False),
+        actual=(is_content_schema, is_lineage_schema),
+    )
+    assert is_content_schema, (
+        f"sequences.csv is a lineage stub, not a content table: cols={cols}"
+    )
+    assert not is_lineage_schema
+
+
+def test_panda_pool_chained_rename_preserves_full_lineage(
+    local_config, isolated_cwd, new_pipeline, record_case,
+):
+    """Mock(ENT) -> Panda(rename) -> Panda(rename): the final stream
+    map_table must carry the full generation chain on the structures
+    stream, with the immediate parent in `structures.id` and the older
+    generation shifted to `structures.-1.id`.
+
+    Without the shift, the second Panda would overwrite the
+    `structures.id` written by the first, and the link from Panda_2 back
+    to ENT would be lost — breaking get_mapped_ids fallback through
+    provenance.
+    """
+    from biopipelines.mock import Mock
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_chain_lineage")
+    with pipeline:
+        m = Mock(
+            ids=["ENT"],
+            streams={"structures": {"format": "pdb", "file": "<id>.pdb"}},
+            tables={"scores": {"columns": ["score"], "fill": {"score": 0.9}}},
+        )
+        p1 = Panda(
+            tables=m.tables.scores,
+            operations=[Panda.head(1)],
+            pool=m,
+            rename="PandaCycle1",
+        )
+        p2 = Panda(
+            tables=p1.tables.result,
+            operations=[Panda.head(1)],
+            pool=p1,
+            rename="PandaCycle2",
+        )
+        pipeline.save()
+
+    _run_pipe("mock", os.path.join(m.output_folder, "_configuration", "mock_config.json"),
+              config_flag=False)
+    _run_pipe("panda", os.path.join(p1.output_folder, "_configuration", "panda_config.json"))
+    _run_pipe("panda", os.path.join(p2.output_folder, "_configuration", "panda_config.json"))
+
+    final_map = p2.streams.structures.map_table
+    assert os.path.exists(final_map), f"final stream map_table missing: {final_map}"
+    rows = _read_csv_rows(final_map)
+    cols = set(rows[0].keys()) if rows else set()
+
+    # Expect: id=PandaCycle2_1,
+    #         structures.id    -> immediate parent (from p1)
+    #         structures.-1.id -> grandparent (ENT)
+    immediate = {r["id"]: r["structures.id"] for r in rows}
+    older = {r["id"]: r.get("structures.-1.id", "") for r in rows}
+
+    record_case(
+        input="Mock(ENT) -> PandaCycle1(rename) -> PandaCycle2(rename)",
+        expected=({"id", "file", "structures.id", "structures.-1.id"},
+                  "non-empty parent + ENT grandparent"),
+        actual=(cols, (set(immediate.values()), set(older.values()))),
+    )
+    assert "structures.id" in cols, f"missing structures.id in {cols}"
+    assert "structures.-1.id" in cols, (
+        f"missing shifted structures.-1.id in {cols} — shift was not applied"
+    )
+    # Every row's grandparent should be the original Mock id.
+    assert set(older.values()) == {"ENT"}, (
+        f"shifted column should hold ENT, got {set(older.values())}"
+    )
+    from biopipelines.id_map_utils import get_mapped_ids
+    assert get_mapped_ids(
+        list(immediate.keys()),
+        ["ENT"],
+        unique=True,
+        map_table_paths=[final_map],
+    ) == {next(iter(immediate.keys())): "ENT"}
+
+    # Immediate parent should be from the first Panda step (not ENT, not the row's own id).
+    for rid, parent in immediate.items():
+        assert parent != rid, f"immediate parent equals self for {rid}"
+        assert parent != "ENT", (
+            f"immediate parent is grandparent (shift failed) for {rid}"
+        )
+
+
+# ── Panda.merge: grain (cross-fan-out level selection) ────────────────────────
+
+def _load_execute_merge():
+    """Import execute_merge from the pipe script without a package install."""
+    import importlib.util
+    path = os.path.join(_repo_root(), "pipe_scripts", "pipe_panda.py")
+    spec = importlib.util.spec_from_file_location("_pipe_panda_grain", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.execute_merge
+
+
+def _grain_frames():
+    import pandas as pd
+    coarse = pd.DataFrame({"id": ["d_1", "d_2"], "mean_plddt": [70.0, 80.0]})
+    fine = pd.DataFrame(
+        {"id": ["d_1_1", "d_1_2", "d_2_1"], "plddt": [85.0, 90.0, 60.0]}
+    )
+    return coarse, fine
+
+
+@pytest.mark.parametrize("coarse_first", [True, False])
+def test_merge_grain_finest_is_order_independent_and_lossless(coarse_first):
+    """grain='finest' broadcasts the coarse value onto every fine row, and the
+    result is identical regardless of input table order."""
+    execute_merge = _load_execute_merge()
+    coarse, fine = _grain_frames()
+    tables = [coarse, fine] if coarse_first else [fine, coarse]
+    out = execute_merge([t.copy() for t in tables], {"on": None, "grain": "finest"})
+
+    assert sorted(out["id"]) == ["d_1_1", "d_1_2", "d_2_1"]
+    assert out["id"].notna().all()  # no resurrected null-id rows
+    by_id = out.set_index("id")
+    # Both siblings of design d_1 carry d_1's mean_plddt (broadcast, not collapsed).
+    assert by_id.loc["d_1_1", "mean_plddt"] == 70.0
+    assert by_id.loc["d_1_2", "mean_plddt"] == 70.0
+    assert by_id.loc["d_2_1", "mean_plddt"] == 80.0
+    assert by_id.loc["d_1_1", "plddt"] == 85.0
+    assert by_id.loc["d_1_2", "plddt"] == 90.0
+
+
+@pytest.mark.parametrize("coarse_first", [True, False])
+def test_merge_grain_finest_picks_deepest_not_largest(coarse_first):
+    """The finest driver is the table whose IDs are deepest in the provenance
+    hierarchy, NOT the one with the most rows. A coarse table with more rows
+    than the fine one (many designs, few refolded) must not become the driver,
+    and unmatched coarse rows must not leak in as null-id rows."""
+    import pandas as pd
+    execute_merge = _load_execute_merge()
+    coarse = pd.DataFrame({"id": ["d_1", "d_2", "d_3"], "mean_plddt": [1.0, 2.0, 3.0]})
+    fine = pd.DataFrame({"id": ["d_1_1"], "plddt": [9.0]})  # 1 row, but deeper
+    tables = [coarse, fine] if coarse_first else [fine, coarse]
+    out = execute_merge([t.copy() for t in tables], {"on": None, "grain": "finest"})
+
+    assert list(out["id"]) == ["d_1_1"]
+    assert out.set_index("id").loc["d_1_1", "mean_plddt"] == 1.0
+
+
+def test_merge_grain_coarsest_keeps_one_row_per_coarse_id(capsys):
+    """grain='coarsest' drives rows from the coarse table, drops fine siblings,
+    warns about the drop, and never leaks a null-id row back in."""
+    execute_merge = _load_execute_merge()
+    coarse, fine = _grain_frames()
+    out = execute_merge([fine.copy(), coarse.copy()], {"on": None, "grain": "coarsest"})
+
+    assert sorted(out["id"]) == ["d_1", "d_2"]
+    assert out["id"].notna().all()
+    assert "WARNING" in capsys.readouterr().out
+
+
+def test_panda_multipool_value_stream_survives_file_stream_sibling(
+    local_config, isolated_cwd, new_pipeline, record_case,
+):
+    """Panda(pool=[file_based, value_based]) must keep the value stream's
+    content columns.
+
+    The runtime file-map builder excluded only shared-file streams, so a
+    value-based `sequences` stream (files=[], content in map_table) was
+    collected as if it were per-id files and rewritten as `id, file` —
+    dropping `sequence`. A single-pool test does not catch it; the
+    file-based sibling is what puts the extractor on that path."""
+    from biopipelines.sequence import Sequence
+    from biopipelines.mock import Mock
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_multipool_value")
+    with pipeline:
+        seq = Sequence(seq=["MKTAYIAK", "GGGGALV"], ids=["d1", "d2"],
+                       type="protein")
+        struct = Mock(ids=["d1", "d2"],
+                      streams={"structures": {"format": "pdb", "file": "<id>.pdb"}})
+        pan = Panda(
+            tables=seq.tables.sequences,
+            operations=[Panda.filter("length >= 5")],
+            pool=[struct, seq],
+        )
+        pipeline.save()
+
+    _run_pipe("sequence", os.path.join(seq.output_folder, "_configuration", "sequence_config.json"))
+    _run_pipe("mock", os.path.join(struct.output_folder, "_configuration", "mock_config.json"),
+              config_flag=False)
+    _run_pipe("panda", os.path.join(pan.output_folder, "_configuration", "panda_config.json"))
+
+    out_seq = os.path.join(pan.output_folder, "sequences", "sequences.csv")
+    assert os.path.exists(out_seq), f"Panda did not emit {out_seq}"
+    cols = set(_read_csv_columns(out_seq))
+    rows = _read_csv_rows(out_seq)
+    seqs = {r["id"]: r.get("sequence", "") for r in rows}
+
+    record_case(
+        input="Panda(pool=[Mock(structures), Sequence]) sequences.csv",
+        expected=({"id", "sequence"}, {"d1": "MKTAYIAK", "d2": "GGGGALV"}),
+        actual=(cols & {"id", "sequence"}, seqs),
+    )
+    assert {"id", "sequence"}.issubset(cols), (
+        f"value-stream content lost beside a file-based pool: cols={cols}"
+    )
+    assert seqs["d1"] == "MKTAYIAK"
+    assert seqs["d2"] == "GGGGALV"
+
+
+def test_panda_head_accounts_for_slots_no_row_reached(
+    local_config, isolated_cwd, new_pipeline, record_case,
+):
+    """Mock(6 ids) → Panda(filter + sort + head(4), pool): only 2 rows survive.
+
+    `head(4)` fixes what the step DECLARES (`N_Panda_1..4`), the filter decides
+    how many rows there are. Slots 3 and 4 name no upstream id, so nothing in the
+    missing manifest the dropped inputs produced can excuse them — they have to be
+    accounted for under the ids they were declared by, or `pipe_check_completion`
+    demands two files that correctly have nothing to contain. Found on
+    BinderDesign/tagged_binder_002, where 23 of 30 declared slots went unfilled in
+    both the `structures` and `msas` streams and the step was marked FAILED."""
+    from biopipelines.mock import Mock
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_head_slot_shortfall")
+    with pipeline:
+        m = Mock(
+            ids=["w1", "w2", "w3", "w4", "w5", "w6"],
+            streams={"structures": {"format": "pdb", "file": "<id>.pdb"}},
+            tables={"scores": {"columns": ["id", "score"],
+                               "rows": [["w1", 9.0], ["w2", 8.0], ["w3", 1.0],
+                                        ["w4", 1.0], ["w5", 1.0], ["w6", 1.0]]}},
+        )
+        pan = Panda(
+            tables=m.tables.scores,
+            operations=[Panda.filter("score > 5"),
+                        Panda.sort("score", ascending=False),
+                        Panda.head(4)],
+            pool=m,
+        )
+        pipeline.save()
+
+    declared = _auto_rename_ids(pan.output_folder, 4)
+    assert list(pan.streams.structures.ids) == declared
+
+    _run_pipe("mock", os.path.join(m.output_folder, "_configuration", "mock_config.json"),
+              config_flag=False)
+    _run_pipe("panda", os.path.join(pan.output_folder, "_configuration", "panda_config.json"))
+
+    missing = _read_csv_rows(os.path.join(pan.output_folder, "tables", "missing.csv"))
+    slots = {r["id"]: r for r in missing if r["id"] in declared}
+
+    record_case(
+        input="Mock(6) → Panda(filter keeps 2 + head(4), pool) — missing.csv",
+        expected=set(declared[2:]),
+        actual=set(slots),
+    )
+    assert set(slots) == set(declared[2:]), (
+        f"unfilled slots not accounted for: {sorted(slots)}"
+    )
+    for slot_id, row in slots.items():
+        assert row["kind"] == "filter", f"{slot_id} must be excusable, got {row['kind']}"
+        assert "head(4)" in row["cause"] and "2 rows survived" in row["cause"], row["cause"]
+
+    ok, still_missing = _check_completion(pan)
+    assert ok, f"an accounted-for shortfall still failed the step: {still_missing}"
+
+
+def test_panda_head_with_every_row_filtered_is_not_a_failure(
+    local_config, isolated_cwd, new_pipeline, record_case,
+):
+    """The same bug at its limit — BinderDesign/tagged_binder_short_002 kept 0 of 200.
+
+    `tests/test_completion_all_filtered.py` covers a fully-filtered step whose
+    declared ids ARE the ids in missing.csv (Panda's no-rename path). The rename
+    path declares a fresh id space, so every declared slot is unfilled and none of
+    them appears in the manifest the dropped inputs wrote."""
+    from biopipelines.mock import Mock
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_head_slot_all_filtered")
+    with pipeline:
+        m = Mock(
+            ids=["z1", "z2", "z3"],
+            streams={"structures": {"format": "pdb", "file": "<id>.pdb"}},
+            tables={"scores": {"columns": ["id", "score"],
+                               "rows": [["z1", 1.0], ["z2", 1.0], ["z3", 1.0]]}},
+        )
+        pan = Panda(
+            tables=m.tables.scores,
+            operations=[Panda.filter("score > 5"), Panda.head(3)],
+            pool=m,
+        )
+        pipeline.save()
+
+    declared = _auto_rename_ids(pan.output_folder, 3)
+
+    _run_pipe("mock", os.path.join(m.output_folder, "_configuration", "mock_config.json"),
+              config_flag=False)
+    _run_pipe("panda", os.path.join(pan.output_folder, "_configuration", "panda_config.json"))
+
+    missing = _read_csv_rows(os.path.join(pan.output_folder, "tables", "missing.csv"))
+    excused = {r["id"] for r in missing if r["kind"] == "filter"}
+    ok, still_missing = _check_completion(pan)
+
+    record_case(
+        input="Mock(3) → Panda(filter keeps 0 + head(3), pool) — completion",
+        expected=(set(declared), True),
+        actual=(excused & set(declared), ok),
+    )
+    assert set(declared).issubset(excused)
+    assert ok, f"a step whose filter kept nothing was reported as failed: {still_missing}"
+
+
+def test_panda_head_still_requires_the_rows_that_did_survive(
+    local_config, isolated_cwd, new_pipeline, record_case,
+):
+    """The case that must NOT be excused, or a broken extraction reads as a filter."""
+    from biopipelines.mock import Mock
+    from biopipelines.panda import Panda
+
+    pipeline = new_pipeline("panda_head_slot_survivor_lost")
+    with pipeline:
+        m = Mock(
+            ids=["y1", "y2", "y3"],
+            streams={"structures": {"format": "pdb", "file": "<id>.pdb"}},
+            tables={"scores": {"columns": ["id", "score"],
+                               "rows": [["y1", 9.0], ["y2", 8.0], ["y3", 1.0]]}},
+        )
+        pan = Panda(
+            tables=m.tables.scores,
+            operations=[Panda.filter("score > 5"), Panda.head(3)],
+            pool=m,
+        )
+        pipeline.save()
+
+    _run_pipe("mock", os.path.join(m.output_folder, "_configuration", "mock_config.json"),
+              config_flag=False)
+    _run_pipe("panda", os.path.join(pan.output_folder, "_configuration", "panda_config.json"))
+
+    declared = _auto_rename_ids(pan.output_folder, 3)
+    survivor = os.path.join(pan.output_folder, "structures", f"{declared[0]}.pdb")
+    assert os.path.exists(survivor), survivor
+    os.remove(survivor)
+
+    ok, still_missing = _check_completion(pan)
+    record_case(input="survivor's file deleted → completion check",
+                expected="incomplete", actual="incomplete" if not ok else "complete")
+    assert not ok, "a survivor's missing file was excused by the slot accounting"
+    assert "structures" in still_missing

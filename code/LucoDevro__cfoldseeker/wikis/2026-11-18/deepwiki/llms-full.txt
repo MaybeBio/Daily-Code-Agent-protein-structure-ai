@@ -1,0 +1,2582 @@
+# Page: cfoldseeker Overview
+
+# cfoldseeker Overview
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [LICENSE](LICENSE)
+- [README.md](README.md)
+- [docs/index.rst](docs/index.rst)
+- [env.yml](env.yml)
+- [pyproject.toml](pyproject.toml)
+- [workflow.png](workflow.png)
+- [workflow.svg](workflow.svg)
+
+</details>
+
+
+
+`cfoldseeker` is a technical framework designed to identify homologous gene clusters by leveraging protein structural similarity rather than primary sequence alone [README.md:9-10](). By utilizing `foldseek`, it searches for structural homologs of query protein models and reconstructs their genomic context to identify colocalized hits [README.md:10-11]().
+
+As the structural discovery engine of the **csuite** toolbox, `cfoldseeker` integrates with `cblaster` for downstream analysis and `clinker` for cluster visualization [README.md:12-15]().
+
+### Core Search Strategies
+The system operates in three primary modes to balance sensitivity, speed, and resource availability:
+
+| Mode | Description | Key Components |
+| :--- | :--- | :--- |
+| **Remote** | Searches AlphaFoldDB via the FoldSeek webserver. | `RemoteSearch`, `communication.py` |
+| **Local** | Searches a user-provided FoldSeek database on local hardware. | `LocalSearch`, `cfoldseeker-cds` |
+| **Local-Clustered** | Optimized local search using MMseqs2-preclustered representatives. | `LocalClusteredSearch`, `MMseqs2` |
+
+For detailed information on these modes, see [Search Modes](#3).
+
+---
+
+### System Integration & Workflow
+`cfoldseeker` bridges the gap between 3D protein structures (CIF/PDB files) and genomic coordinates. It translates structural hits into genomic clusters that can be visualized as gene arrows.
+
+#### Structural to Genomic Mapping
+This diagram illustrates how the system maps entities from the "Natural Language Space" (biological concepts) to the "Code Entity Space" (classes and functions).
+
+```mermaid
+graph TD
+    subgraph "Natural Language Space"
+        A["Protein Structure (Query)"]
+        B["Homologous Protein"]
+        C["Gene Cluster (BGC)"]
+    end
+
+    subgraph "Code Entity Space"
+        direction LR
+        A1["CIF/PDB File"] --> D["Search.run()"]
+        D --> E["Hit (class)"]
+        E --> F["Cluster (class)"]
+        F --> G["cblaster Session"]
+    end
+
+    A -.-> A1
+    B -.-> E
+    C -.-> F
+```
+**Sources:** [cfoldseeker/classes.py:1-100](), [README.md:10-12]()
+
+#### Toolchain Architecture
+The following diagram maps the command-line utilities to their internal entry points and primary responsibilities.
+
+```mermaid
+graph LR
+    subgraph "CLI Entrypoints"
+        CLI1["cfoldseeker"]
+        CLI2["cfoldseeker-cds"]
+        CLI3["cfoldseeker-seqs"]
+    end
+
+    subgraph "System Logic"
+        CLI1 --> MAIN["main.py:main()"]
+        CLI2 --> CDS["build_cds_db.py:main()"]
+        CLI3 --> SEQS["extract_sequences.py:main()"]
+    end
+
+    subgraph "External Integrations"
+        MAIN --> FS["FoldSeek Binary/API"]
+        CDS --> NCBI["NCBI Entrez / ENA"]
+        SEQS --> CB["cblaster.extract_clusters"]
+    end
+```
+**Sources:** [pyproject.toml:46-50](), [README.md:26-30]()
+
+---
+
+### Child Pages
+This documentation is organized into several detailed sections:
+
+*   **[Getting Started: Installation and Environment Setup](#1.1)**
+    Covers installation via Bioconda, Pip, or Docker, and setting up the required environment for `foldseek` and `kegg-pull` [pyproject.toml:24-32](), [env.yml:1-15]().
+*   **[Tutorial: End-to-End Thioalbamide Example](#1.2)**
+    A practical walkthrough using the thioalbamide dataset, demonstrating the transition from `cfoldseeker-cds` database building to cluster identification [docs/index.rst:35-36]().
+
+### Downstream Utilities
+*   **`cfoldseeker-cds`**: A pre-processing utility that builds a local SQLite/CSV database of genomic coordinates (CDS) from GenBank files or NCBI datasets [README.md:29](), [pyproject.toml:48]().
+*   **`cfoldseeker-seqs`**: A post-processing utility to extract nucleotide or protein sequences from identified clusters for further analysis [README.md:29](), [pyproject.toml:49]().
+
+### Citations and License
+`cfoldseeker` is released under the **MIT License** [LICENSE:1-21](). If you use this tool, please cite the primary manuscript and the underlying technologies: `foldseek`, `cblaster`, and `kegg_pull` [README.md:35-48]().
+
+**Sources:**
+- [README.md:1-53]()
+- [pyproject.toml:1-52]()
+- [env.yml:1-15]()
+- [docs/index.rst:1-45]()
+- [LICENSE:1-21]()
+
+---
+
+# Page: Getting Started: Installation and Environment Setup
+
+# Getting Started: Installation and Environment Setup
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [bioconda_recipe/meta.yaml](bioconda_recipe/meta.yaml)
+- [docker/Dockerfile](docker/Dockerfile)
+- [docs/guide/install.rst](docs/guide/install.rst)
+- [env.yml](env.yml)
+- [pyproject.toml](pyproject.toml)
+
+</details>
+
+
+
+This page provides technical instructions for installing `cfoldseeker` and configuring the necessary environment for structural biosynthetic gene cluster (BGC) mining. `cfoldseeker` requires a specific Python environment (3.12+) and several non-Python binary dependencies, most notably **FoldSeek**.
+
+## 1. Installation Methods
+
+`cfoldseeker` can be installed via Bioconda, Docker, or Pip. The Bioconda and Docker methods are preferred as they automatically handle the `foldseek` binary dependency.
+
+### Bioconda (Recommended)
+Installation via Bioconda ensures that all dependencies defined in the recipe `[bioconda_recipe/meta.yaml:28-37]()` are met, including the `foldseek` binary.
+
+```bash
+# Create a fresh environment with cfoldseeker
+conda create -n cfoldseeker -c bioconda -c conda-forge cfoldseeker
+
+# Alternatively, use the provided environment file
+conda env create -f env.yml
+conda activate cfoldseeker
+```
+**Sources:** `[docs/guide/install.rst:14-33]()`, `[env.yml:1-15]()`, `[bioconda_recipe/meta.yaml:23-37]()`.
+
+### Docker
+For Windows users (via WSL) or containerized workflows, a Docker image is provided. The image is built on a Miniconda base and installs `cfoldseeker` into a internal Conda environment `[docker/Dockerfile:1-11]()`.
+
+```bash
+docker pull lucodevro/cfoldseeker
+
+# Run command with volume mapping
+docker run -v $(pwd):/data lucodevro/cfoldseeker cfoldseeker -i /data/query.cif ...
+```
+**Sources:** `[docs/guide/install.rst:35-49]()`, `[docker/Dockerfile:1-11]()`.
+
+### Pip (Advanced)
+Installing via PyPi or GitHub requires manual installation of `foldseek`.
+```bash
+# From GitHub (Development version)
+pip install .
+
+# From PyPi
+pip install cfoldseeker
+```
+**Sources:** `[docs/guide/install.rst:50-70]()`, `[pyproject.toml:1-52]()`.
+
+---
+
+## 2. Environment Dependencies
+
+The system relies on a specific stack of bioinformatics libraries and external binaries.
+
+### Dependency Graph: Code to System Entities
+The following diagram maps the `cfoldseeker` installation requirements to their roles within the codebase.
+
+**Installation Entity Map**
+```mermaid
+graph TD
+    subgraph "Python Space"
+        A["cfoldseeker [Package]"] --> B["cfoldseeker.main:main"]
+        A --> C["cfoldseeker.build_cds_db:main"]
+        A --> D["cfoldseeker.extract_sequences:main"]
+    end
+
+    subgraph "External Binaries"
+        E["foldseek binary"]
+        F["NCBI Entrez API"]
+    end
+
+    subgraph "Data Requirements"
+        G["UniProt ID Mapping Table"]
+        H["CDS Coordinate DB (.csv)"]
+    end
+
+    B -- "invokes" --> E
+    C -- "populates" --> H
+    B -- "queries" --> F
+    B -- "requires for RemoteSearch" --> G
+```
+**Sources:** `[pyproject.toml:46-49]()`, `[bioconda_recipe/meta.yaml:15-18]()`, `[docs/guide/install.rst:9-11]()`.
+
+---
+
+## 3. Mandatory External Data: UniProt ID Mapping
+
+When running in **Remote Mode**, `cfoldseeker` performs a multi-tier cross-referencing of structural hits. To resolve KEGG and GenPept identifiers, the tool requires a local copy of the UniProt ID mapping table `[docs/guide/install.rst:9-11]()`.
+
+| Data Component | Requirement | Purpose |
+| :--- | :--- | :--- |
+| **Mapping Table** | `uniprot_kegg_genpept.gz` | Translates UniProt accessions to KEGG/GenPept for genomic context retrieval. |
+| **FoldSeek Binary** | `foldseek` | Executes structural alignments in Local and Local-Clustered modes. |
+| **CDS Database** | Created via `cfoldseeker-cds` | Provides local genomic coordinates for structure hits. |
+
+**Sources:** `[docs/guide/install.rst:9-11]()`, `[pyproject.toml:48]()`.
+
+---
+
+## 4. Implementation Details: Entry Points
+
+`cfoldseeker` registers three primary CLI commands via `setuptools` entry points. These are the interfaces users interact with after a successful installation.
+
+**CLI Entry Point Architecture**
+```mermaid
+graph LR
+    subgraph "CLI Entry Points"
+        main["cfoldseeker"]
+        cds["cfoldseeker-cds"]
+        seqs["cfoldseeker-seqs"]
+    end
+
+    subgraph "Code Implementation"
+        main_mod["cfoldseeker/main.py"]
+        build_mod["cfoldseeker/build_cds_db.py"]
+        ext_mod["cfoldseeker/extract_sequences.py"]
+    end
+
+    main -- "calls" --> main_mod
+    cds -- "calls" --> build_mod
+    seqs -- "calls" --> ext_mod
+```
+
+| Entry Point | Target Function | Source File |
+| :--- | :--- | :--- |
+| `cfoldseeker` | `main()` | `[cfoldseeker/main.py]()` |
+| `cfoldseeker-cds` | `main()` | `[cfoldseeker/build_cds_db.py]()` |
+| `cfoldseeker-seqs` | `main()` | `[cfoldseeker/extract_sequences.py]()` |
+
+**Sources:** `[pyproject.toml:46-49]()`, `[bioconda_recipe/meta.yaml:15-18]()`.
+
+---
+
+## 5. Verification
+
+To verify the installation and the presence of the `foldseek` binary, run the following command:
+
+```bash
+cfoldseeker -h
+```
+This confirms the environment is active and the `cfoldseeker` package is correctly installed in the Python path `[bioconda_recipe/meta.yaml:39-41]()`.
+
+**Sources:** `[bioconda_recipe/meta.yaml:39-41]()`.
+
+---
+
+# Page: Tutorial: End-to-End Thioalbamide Example
+
+# Tutorial: End-to-End Thioalbamide Example
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [docs/guide/tutorial.rst](docs/guide/tutorial.rst)
+- [example/cfoldseeker_search/binary.txt](example/cfoldseeker_search/binary.txt)
+- [example/cfoldseeker_search/clusters.tsv](example/cfoldseeker_search/clusters.tsv)
+- [example/cfoldseeker_search/foldseek_result.txt](example/cfoldseeker_search/foldseek_result.txt)
+- [example/cfoldseeker_search/hits.tsv](example/cfoldseeker_search/hits.tsv)
+- [example/cfoldseeker_search/session.json](example/cfoldseeker_search/session.json)
+- [example/cfoldseeker_search/summary.txt](example/cfoldseeker_search/summary.txt)
+- [example/query_models/WP_020634191.1.cif](example/query_models/WP_020634191.1.cif)
+- [example/thioalbamide.faa](example/thioalbamide.faa)
+
+</details>
+
+
+
+This tutorial provides a technical walkthrough for running a `cfoldseeker` search using the `local_clustered` mode. This workflow is designed for comprehensive genomic mining, utilizing structural alignments to identify Biosynthetic Gene Clusters (BGCs) across large-scale genomic datasets.
+
+The example focuses on searching for the **thioalbamide** BGC from *Amycolatopsis alba* DSM 44262 (GCF_000384215.1) against a target database of all *Bacillaceae* proteomes.
+
+## Workflow Overview
+
+The process transitions from raw sequence data to identified structural gene clusters through four primary stages:
+1.  **Query Preparation**: Generating 3D models (CIF) for the thioalbamide proteins.
+2.  **Context DB Construction**: Building a coordinate database (`cfoldseeker-cds`) from NCBI GenBank files.
+3.  **Target DB Construction**: Clustering target sequences (MMseqs2) and generating structural encodings (Foldseek/ProstT5).
+4.  **Search & Extraction**: Running `cfoldseeker` and extracting candidate sequences.
+
+### System Data Flow
+
+The following diagram illustrates the relationship between the CLI tools and the underlying data structures.
+
+**Data Flow: From Raw Genomes to Structural Clusters**
+```mermaid
+graph TD
+    subgraph "Preparation Space"
+        A["NCBI GenBank (.gbff)"] -- "cfoldseeker-cds" --> B["Context DB (.csv.gz)"]
+        C["Target Fasta (.faa)"] -- "mmseqs easy-linclust" --> D["Clustering Table (.tsv)"]
+        D -- "foldseek createdb (ProstT5)" --> E["Foldseek DB (3Di)"]
+    end
+
+    subgraph "cfoldseeker Execution (Code Space)"
+        F["main.py"] --> G["LocalClusteredSearch (local_clustered.py)"]
+        G --> H["Foldseek Binary Execution"]
+        H --> I["Polars LazyFrame Processing"]
+        I --> J["Cluster Identification (classes.py)"]
+    end
+
+    subgraph "Output Space"
+        J --> K["session.json"]
+        J --> L["hits.tsv / clusters.tsv"]
+        K -- "cfoldseeker-seqs" --> M["Extracted Fasta/GBK"]
+    end
+
+    style G stroke-width:2px
+    style J stroke-width:2px
+```
+Sources: [docs/guide/tutorial.rst:4-88](), [cfoldseeker/main.py:1-50]()
+
+---
+
+## 1. Building the Genomic Context Database
+
+To map structural hits back to their genomic neighborhood, `cfoldseeker` requires a compressed CDS database.
+
+**Command:**
+```bash
+cfoldseeker-cds -i gbff_package -m ncbi-package -o bacillaceae_cds.gz -gz
+```
+
+**Implementation Detail:**
+The `cfoldseeker-cds` tool (implemented in `build_cds_db.py`) parses NCBI GenBank packages using a `Polars` ETL pipeline. It extracts `CDS` features, normalizes coordinates (handling multi-exon genes), and resolves taxon names via NCBI Entrez if necessary [docs/guide/tutorial.rst:49-54]().
+
+Sources: [docs/guide/tutorial.rst:49-54](), [cfoldseeker/build_cds_db.py:1-100]()
+
+---
+
+## 2. Preparing the Target Structural Database
+
+Generating 3D structures for millions of proteins is computationally expensive. This workflow uses **ProstT5**, a Large Language Model (LLM) that translates amino acid sequences directly into Foldseek's 3Di alphabet [docs/guide/tutorial.rst:89-94]().
+
+### Pre-clustering with MMseqs2
+To reduce redundancy, sequences are clustered at 90% identity:
+```bash
+mmseqs easy-linclust faas/* clustered tmp --min-seq-id 0.9 -c 0.9
+```
+This produces `clustered_cluster.tsv`, which `LocalClusteredSearch` uses to expand hits from representative sequences to all cluster members [docs/guide/tutorial.rst:81-87]().
+
+### Foldseek Database Creation
+Generate 3Di encodings for representative sequences:
+```bash
+foldseek createdb clustered_rep_seq.fasta DB/Bacillaceae --gpu 1 --prostt5-model weights/
+```
+Sources: [docs/guide/tutorial.rst:81-110](), [cfoldseeker/local_clustered.py:10-40]()
+
+---
+
+## 3. Running the Search
+
+The search is executed using the `local_clustered` mode. This mode inherits from `LocalSearch` but adds logic to join Foldseek results with the MMseqs2 clustering table.
+
+**Command:**
+```bash
+cfoldseeker -q query_models/ \
+            -db DB/Bacillaceae \
+            -cds bacillaceae_cds.gz \
+            -m local_clustered \
+            --mmseqs clustered_cluster.tsv \
+            -o cfoldseeker_search \
+            --require WP_020634196.1 \
+            -t 14
+```
+
+### Execution Logic
+1.  **Structural Alignment**: The `LocalSearch.run()` method invokes the `foldseek easy-search` binary [cfoldseeker/local.py:65-90]().
+2.  **Cluster Expansion**: `LocalClusteredSearch.expand_sequence_clusters()` uses a Polars `join` to map representative hits to all sequences in the `clustered_cluster.tsv` file [cfoldseeker/local_clustered.py:45-65]().
+3.  **Genomic Mapping**: Hits are joined against the `bacillaceae_cds.gz` database to retrieve scaffold coordinates [cfoldseeker/local.py:110-130]().
+4.  **Spatial Clustering**: The `Search.identify_clusters()` method uses a `NetworkX` graph to group hits within 10kb (default) of each other [cfoldseeker/classes.py:280-320]().
+
+Sources: [docs/guide/tutorial.rst:123-130](), [cfoldseeker/local.py:65-130](), [cfoldseeker/local_clustered.py:45-65](), [cfoldseeker/classes.py:280-320]()
+
+---
+
+## 4. Interpreting Results
+
+The search produces several output files in the `cfoldseeker_search` directory.
+
+### Key Output Files
+
+| File | Description | Technical Entity |
+| :--- | :--- | :--- |
+| `hits.tsv` | Individual structural alignments with genomic coordinates. | `Hit` class [cfoldseeker/classes.py:15-60]() |
+| `clusters.tsv` | Grouped BGC candidates with aggregate scores. | `Cluster` class [cfoldseeker/classes.py:65-150]() |
+| `session.json` | A `cblaster`-compatible session file for visualization. | `Search.generate_session()` [cfoldseeker/classes.py:330-360]() |
+| `binary.txt` | A presence/absence matrix of query proteins across clusters. | `Search.generate_output()` [cfoldseeker/classes.py:250-270]() |
+
+**Example `clusters.tsv` Snippet:**
+```text
+number  hits                                            start   end     score   scaff
+1       WP_251174786.1,WP_251174788.1,WP_251174792.1    65904   72536   2460    NZ_JAMAWE010000007.1
+```
+[example/cfoldseeker_search/clusters.tsv:1-2]()
+
+Sources: [example/cfoldseeker_search/clusters.tsv:1-10](), [example/cfoldseeker_search/hits.tsv:1-10](), [cfoldseeker/classes.py:15-150]()
+
+---
+
+## 5. Sequence Extraction
+
+After identifying candidate clusters, use `cfoldseeker-seqs` to retrieve the underlying protein or nucleotide sequences for downstream analysis (e.g., `clinker` or `BigScape`).
+
+**Command:**
+```bash
+cfoldseeker-seqs -i cfoldseeker_search/session.json -o extracted_sequences --protein
+```
+
+**Implementation:**
+The `cfoldseeker-seqs` utility (implemented in `extract_sequences.py`) loads the `session.json`, parses the `Hit` and `Cluster` objects, and uses the `thread_map` function to fetch sequences in parallel from the local GenBank files or NCBI [cfoldseeker/extract_sequences.py:50-120]().
+
+Sources: [docs/guide/tutorial.rst:130-140](), [cfoldseeker/extract_sequences.py:50-120]()
+
+---
+
+# Page: Core Architecture
+
+# Core Architecture
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [cfoldseeker/__init__.py](cfoldseeker/__init__.py)
+- [cfoldseeker/classes.py](cfoldseeker/classes.py)
+- [cfoldseeker/main.py](cfoldseeker/main.py)
+- [cfoldseeker/remote_parsers.py](cfoldseeker/remote_parsers.py)
+
+</details>
+
+
+
+`cfoldseeker` is designed to bridge the gap between protein structural similarity and genomic context analysis. The architecture follows a modular **Command pattern**, where a centralized entry point orchestrates specialized search engines that share a common data model and lifecycle.
+
+## System Overview
+
+The system operates by taking protein structure files (typically in `.cif` or `.pdb` format) and performing a two-step discovery process:
+1.  **Structural Search**: Utilizing **FoldSeek** to identify homologous structures in either remote (AlphaFold DB) or local databases.
+2.  **Genomic Contextualization**: Mapping structural hits back to their genomic coordinates to identify colocalized gene clusters.
+
+### Code-to-Entity Mapping
+The following diagram illustrates how high-level system operations map to specific classes and functions within the codebase.
+
+**Figure 1: System Entity Mapping**
+```mermaid
+graph TD
+    subgraph "CLI Layer (main.py)"
+        A["CLI Input"] --> B["create_parser()"]
+        B --> C["parse_and_validate_arguments()"]
+        C --> D["init_search()"]
+    end
+
+    subgraph "Logic Layer (classes.py)"
+        D --> E["Search (Abstract Base)"]
+        E --> F["Hit (Data Model)"]
+        E --> G["Cluster (Data Model)"]
+    end
+
+    subgraph "Execution Engines"
+        E -- "implements" --> H["RemoteSearch (remote.py)"]
+        E -- "implements" --> I["LocalSearch (local.py)"]
+        E -- "implements" --> J["LocalClusteredSearch (local_clustered.py)"]
+    end
+
+    subgraph "Data Sources"
+        H --> K["FoldSeek Webserver"]
+        I --> L["Local FoldSeek DB"]
+        J --> M["MMseqs2 Clusters"]
+    end
+```
+**Sources:** [cfoldseeker/main.py:28-52](), [cfoldseeker/main.py:127-148](), [cfoldseeker/classes.py:21-46](), [cfoldseeker/classes.py:440-455]()
+
+---
+
+## Workflow Orchestration
+
+The workflow is managed by `cfoldseeker/main.py`. It handles the transition from raw user arguments to an initialized search object and manages the lifecycle of the search, including temporary file cleanup and logging.
+
+For details, see [CLI Entrypoint and Workflow Orchestration (main.py)](#2.1).
+
+### The Search Lifecycle
+All search modes follow a standardized lifecycle defined in the `Search` base class:
+1.  **Initialization**: Validation of paths and parameters.
+2.  **Execution (`run()`)**: Performing the FoldSeek search and gathering hits.
+3.  **Clustering (`identify_clusters()`)**: Using `networkx` to find colocalized genes based on `max_gap` and `max_length` parameters.
+4.  **Output Generation**: Writing results to TSV, JSON (cblaster compatible), or visual plots.
+
+**Figure 2: Data Flow and Component Interaction**
+```mermaid
+sequenceDiagram
+    participant CLI as main.py
+    participant Factory as init_search()
+    participant Engine as Search Implementation
+    participant Models as Hit / Cluster Objects
+    participant Out as Output Handlers
+
+    CLI->>Factory: Pass Namespace args
+    Factory->>Engine: Instantiate (Remote/Local)
+    CLI->>Engine: run()
+    Engine->>Engine: foldseek_search()
+    Engine->>Models: Create Hit instances
+    Engine->>Engine: identify_clusters()
+    Engine->>Models: Create Cluster instances
+    CLI->>Engine: generate_output()
+    Engine->>Out: write_tables() / write_session()
+```
+**Sources:** [cfoldseeker/main.py:151-189](), [cfoldseeker/classes.py:534-555](), [cfoldseeker/classes.py:657-690]()
+
+---
+
+## Core Data Models
+
+The internal representation of data is centered around two primary classes in `cfoldseeker/classes.py`:
+*   **`Hit`**: Stores FoldSeek metrics (e-value, score, coverage) alongside genomic metadata (scaffold ID, exon coordinates, strand).
+*   **`Cluster`**: A collection of `Hit` objects that satisfy spatial constraints (colocalization).
+
+For details, see [Core Data Models: Hit, Cluster, and Search Base Class (classes.py)](#2.2).
+
+### Key Integration Points
+*   **FoldSeek**: The primary engine for structural alignment.
+*   **Polars**: Used for high-performance data manipulation, especially in `LocalSearch` and `LocalClusteredSearch` for joining large coordinate databases.
+*   **NetworkX**: Used within `Search.identify_clusters()` to treat genomic hits as nodes in a graph, where edges represent proximity within the `max_gap` threshold.
+*   **cblaster/clinker**: The system exports data in formats compatible with the `csuite` ecosystem for downstream visualization and cluster comparison.
+
+**Sources:** [cfoldseeker/classes.py:8-15](), [cfoldseeker/classes.py:768-790](), [cfoldseeker/local.py:7-10]()
+
+---
+
+# Page: CLI Entrypoint and Workflow Orchestration (main.py)
+
+# CLI Entrypoint and Workflow Orchestration (main.py)
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [cfoldseeker/main.py](cfoldseeker/main.py)
+- [docs/guide/usage.rst](docs/guide/usage.rst)
+
+</details>
+
+
+
+The `cfoldseeker/main.py` file serves as the central entrypoint for the application. It is responsible for initializing the runtime environment, parsing command-line arguments, configuring logging, and orchestrating the high-level workflow execution. It acts as a factory for the different search modes (Remote, Local, and Local-Clustered) and manages the lifecycle of the search process, including the cleanup of temporary resources.
+
+### CLI Argument Parsing and Validation
+
+The command-line interface is built using the standard `argparse` library. The implementation is split into two primary phases: definition and validation.
+
+#### Argument Definition: `create_parser()`
+The `create_parser()` function [cfoldseeker/main.py:28-150]() organizes CLI options into logical groups:
+*   **General**: Mode selection (`-m`), CPU core allocation (`-c`), and verbosity control (`-vv`).
+*   **Inputs and Outputs**: Paths for query CIF files (`-q`), output directory (`-o`), and temporary storage (`-t`), as well as flags for various output formats (cblaster sessions, clinker plots, etc.).
+*   **Search Options**: Thresholds for FoldSeek hits (e-value, bitscore, coverage) and genomic cluster constraints (maximum intergenic gap, minimum hits).
+*   **Remote-specific**: Databases (e.g., `afdb50`), taxon filters, and the UniProt ID mapping table path.
+*   **Local-specific**: Paths to the FoldSeek database (`-ldb`), the CDS context database (`-cdb`), and clustering files (`-cl`).
+
+#### Argument Validation: `parse_and_validate_arguments()`
+After parsing, `parse_and_validate_arguments()` [cfoldseeker/main.py:153-228]() ensures the integrity of the provided parameters:
+1.  **Output Directory**: Checks if the output directory exists. If it does and the `--force` flag is not set, the program exits to prevent data loss [cfoldseeker/main.py:171-176]().
+2.  **Mode-specific Checks**: 
+    *   For `local` or `local_clustered` modes, it verifies that the FoldSeek database (`-ldb`) and CDS database (`-cdb`) are provided [cfoldseeker/main.py:186-193]().
+    *   For `local_clustered`, it additionally requires the clustering file (`-cl`) [cfoldseeker/main.py:195-200]().
+    *   For `remote`, it ensures the UniProt mapping table exists [cfoldseeker/main.py:202-207]().
+3.  **Path Resolution**: Converts all input strings into absolute `Path` objects.
+
+**Sources:** [cfoldseeker/main.py:28-228]()
+
+---
+
+### Logging Strategy
+
+`cfoldseeker` uses a centralized logging configuration established at the module level.
+*   **Implementation**: A `logging.StreamHandler` is directed to `sys.stdout` [cfoldseeker/main.py:23]().
+*   **Verbosity**: The `-vv` flag maps integers (0-4) to standard logging levels (CRITICAL to DEBUG) within `run_workflow` [cfoldseeker/main.py:288-292]().
+*   **Format**: Logs include timestamp, level, filename, function name, and the message [cfoldseeker/main.py:21]().
+
+**Sources:** [cfoldseeker/main.py:18-25](), [cfoldseeker/main.py:288-292]()
+
+---
+
+### Search Initialization Factory: `init_search()`
+
+The `init_search()` function serves as a factory that returns an instance of a `Search` subclass based on the user-selected mode.
+
+| Mode | Class Instantiated | Logic Summary |
+| :--- | :--- | :--- |
+| `remote` | `RemoteSearch` | Validates existence of the mapping table and query folder. |
+| `local` | `LocalSearch` | Validates FoldSeek DB and CDS DB files. |
+| `local_clustered` | `LocalClusteredSearch` | Validates FoldSeek DB, CDS DB, and MMseqs2 clustering TSV. |
+
+**Sources:** [cfoldseeker/main.py:231-278](), [cfoldseeker/main.py:12-14]()
+
+---
+
+### Workflow Orchestration Lifecycle
+
+The lifecycle of a `cfoldseeker` run is managed by `run_workflow(args)` [cfoldseeker/main.py:281-326](). This function encapsulates the entire execution flow from directory creation to instance cleanup.
+
+#### Workflow Execution Steps
+1.  **Setup**: The output and temporary directories are created [cfoldseeker/main.py:294-301]().
+2.  **Instantiation**: Calls `init_search()` to create the appropriate search object [cfoldseeker/main.py:304]().
+3.  **Execution**: Invokes the `run()` method of the search object. This is an abstract method in the `Search` base class implemented by specific modes [cfoldseeker/main.py:307]().
+4.  **Reporting**: Calls `generate_output()` to write TSV tables, sessions, and plots to the output directory [cfoldseeker/main.py:310]().
+5.  **Teardown**: The `__del__` method (or explicit cleanup) is implicitly handled as the object goes out of scope, but the folder management is robust against failures via the entry point logic [cfoldseeker/main.py:313-326]().
+
+**Sources:** [cfoldseeker/main.py:281-326]()
+
+---
+
+### Logic and Data Flow Diagrams
+
+#### CLI to Search Object Association
+This diagram bridges the Natural Language CLI arguments to the specific Python Class entities that handle them.
+
+```mermaid
+graph TD
+    subgraph "CLI Space (argparse)"
+        M["-m / --mode"]
+        Q["-q / --query"]
+        LDB["-ldb / --local-db"]
+        CDB["-cdb / --context-db"]
+        CL["-cl / --clustering"]
+        UMA["-uma / --uniprot-mapping"]
+    end
+
+    subgraph "Code Entity Space (main.py)"
+        Parser["create_parser()"]
+        Validator["parse_and_validate_arguments()"]
+        Factory["init_search()"]
+    end
+
+    subgraph "Implementation Classes"
+        RS["RemoteSearch"]
+        LS["LocalSearch"]
+        LCS["LocalClusteredSearch"]
+    end
+
+    Parser --> Validator
+    Validator -- "mode=='remote'" --> Factory
+    Validator -- "mode=='local'" --> Factory
+    Validator -- "mode=='local_clustered'" --> Factory
+
+    Factory -- "Uses UMA" --> RS
+    Factory -- "Uses LDB, CDB" --> LS
+    Factory -- "Uses LDB, CDB, CL" --> LCS
+
+    M -.-> Factory
+```
+**Sources:** [cfoldseeker/main.py:28-150](), [cfoldseeker/main.py:231-278]()
+
+#### Workflow Lifecycle: `run_workflow()`
+This diagram illustrates the operational flow of `main.py` and how it interacts with search objects.
+
+```mermaid
+sequenceDiagram
+    participant Main as main.py:run_workflow()
+    participant Obj as Search Object (RS/LS/LCS)
+    participant FS as File System
+
+    Main->>FS: Path.mkdir(parents=True, exist_ok=True)
+    Main->>Main: init_search(args)
+    activate Main
+    Main-->>Obj: Instantiates Search subclass
+    deactivate Main
+    
+    Main->>Obj: run()
+    activate Obj
+    Note over Obj: Internal: Search, Filter, Identify Clusters
+    Obj-->>Main: Complete
+    deactivate Obj
+    
+    Main->>Obj: generate_output()
+    activate Obj
+    Obj->>FS: write hits.tsv, clusters.tsv, session.json
+    Obj-->>Main: Complete
+    deactivate Obj
+    
+    Main->>Main: Finalize Logging
+```
+**Sources:** [cfoldseeker/main.py:281-311]()
+
+### Summary of Key Functions
+
+| Function | Purpose |
+| :--- | :--- |
+| `create_parser()` | Defines the CLI structure and help strings. |
+| `parse_and_validate_arguments()` | Ensures input paths exist and mandatory parameters for specific modes are provided. |
+| `init_search()` | Returns a `RemoteSearch`, `LocalSearch`, or `LocalClusteredSearch` instance. |
+| `run_workflow()` | Top-level function executing the full stack: Setup -> Init -> Run -> Output. |
+
+**Sources:** [cfoldseeker/main.py:1-326]()
+
+---
+
+# Page: Core Data Models: Hit, Cluster, and Search Base Class (classes.py)
+
+# Core Data Models: Hit, Cluster, and Search Base Class (classes.py)
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [cfoldseeker/classes.py](cfoldseeker/classes.py)
+
+</details>
+
+
+
+This page provides a technical deep dive into `cfoldseeker/classes.py`, which defines the foundational data structures and abstract logic for the cfoldseeker workflow. It covers the representation of structural hits, the logic for grouping hits into Biosynthetic Gene Clusters (BGCs) using graph theory, and the lifecycle of a search operation.
+
+## The Hit Object
+
+The `Hit` class is the primary container for a single protein structure match identified by FoldSeek. It encapsulates structural metrics, genomic coordinates, and taxonomic metadata [cfoldseeker/classes.py:21-46]().
+
+### Genomic Coordinate Handling
+Unlike simple BLAST hits, `Hit` objects support multi-exon gene structures. Coordinates are stored as a list of integer pairs [cfoldseeker/classes.py:94](). The class provides helper methods to abstract the complexity of these coordinates:
+*   **`start()` / `end()`**: Return the absolute minimum and maximum coordinates across all exons [cfoldseeker/classes.py:130-160]().
+*   **`distance()`**: Calculates the intergenic distance between two hits on the same scaffold. It determines the gap between the end of the upstream hit and the start of the downstream hit [cfoldseeker/classes.py:166-189]().
+
+### Cross-Referencing Metadata
+A `Hit` tracks how it was resolved from a FoldSeek structural ID to a genomic location via the `crossref_method` attribute (e.g., `KEGG`, `GenPept`, or `local`) [cfoldseeker/classes.py:80]().
+
+Sources: [cfoldseeker/classes.py:21-189]()
+
+---
+
+## The Cluster Object
+
+The `Cluster` class represents a spatially proximal group of `Hit` objects on a genomic scaffold. It is responsible for calculating aggregate scores and validating cluster composition against search parameters.
+
+### Scoring and Metrics
+A cluster's significance is determined by several calculated properties:
+*   **`score`**: The sum of all individual FoldSeek alignment scores within the cluster [cfoldseeker/classes.py:228-230]().
+*   **`avg_evalue`**: The arithmetic mean of E-values for all hits in the cluster [cfoldseeker/classes.py:232-234]().
+*   **`coverage`**: The number of unique query proteins represented in the cluster divided by the total number of queries in the search session [cfoldseeker/classes.py:248-250]().
+
+### Validation Logic
+The `is_valid()` method filters clusters based on user-defined thresholds for minimum hits and minimum unique query coverage [cfoldseeker/classes.py:252-263]().
+
+Sources: [cfoldseeker/classes.py:192-263]()
+
+---
+
+## The Search Base Class
+
+`Search` is an abstract base class (ABC) that defines the template for all search modes (`RemoteSearch`, `LocalSearch`, `LocalClusteredSearch`). It orchestrates the transition from raw FoldSeek results to structured `Cluster` objects.
+
+### Lifecycle Methods
+Subclasses must implement the following abstract methods:
+*   **`run()`**: The entry point for executing the specific FoldSeek search logic [cfoldseeker/classes.py:321-323]().
+*   **`generate_output()`**: Handles the writing of results to disk [cfoldseeker/classes.py:325-327]().
+
+### Cluster Identification (NetworkX Integration)
+The `identify_clusters()` method implements a graph-based approach to identify BGCs. It uses `networkx` to model hits as nodes and spatial proximity as edges.
+
+| Step | Logic |
+| :--- | :--- |
+| **Grouping** | Hits are grouped by scaffold (`scaff`) [cfoldseeker/classes.py:365-366](). |
+| **Sorting** | Hits on each scaffold are sorted by their `start()` coordinate [cfoldseeker/classes.py:368](). |
+| **Graph Building** | An edge is created between two hits if their `distance()` is $\le$ `max_intergenic` [cfoldseeker/classes.py:372-374](). |
+| **Component Analysis** | `nx.connected_components()` is called to extract clusters [cfoldseeker/classes.py:376](). |
+
+### Mapping Code Entities to Search Logic
+The following diagram illustrates how the `Search` class methods interact with the data models and external libraries.
+
+**Search Logic and Data Flow**
+```mermaid
+graph TD
+    subgraph "Search Base Class (classes.py)"
+        S["Search.identify_clusters()"]
+        H["Hit Objects"]
+        C["Cluster Objects"]
+    end
+
+    subgraph "External Libraries"
+        NX["networkx.Graph"]
+        CB["cblaster.classes.Session"]
+    end
+
+    H -- "1. Distance Calculation" --> S
+    S -- "2. Add Edges" --> NX
+    NX -- "3. Connected Components" --> C
+    C -- "4. Populate Session" --> CB
+    CB -- "5. write()" --> Output["session.json"]
+```
+Sources: [cfoldseeker/classes.py:266-415]()
+
+---
+
+## Downstream Integration
+
+### cblaster Session Generation
+`cfoldseeker` is designed to be compatible with the `cblaster` ecosystem. The `Search` class contains logic to convert internal `Cluster` and `Hit` objects into a `cblaster.classes.Session` object [cfoldseeker/classes.py:387-415](). This enables:
+1.  **Visualization**: Generating cluster maps via `plot_clusters()` [cfoldseeker/classes.py:449-455]().
+2.  **Session Persistence**: Saving results to `session.json` for later inspection or use with `cblaster` CLI tools [cfoldseeker/classes.py:423-424]().
+
+### Data Transformation Workflow
+The diagram below maps the natural language requirements of BGC identification to the specific code entities in `classes.py`.
+
+**From Genomic Hits to BGC Clusters**
+```mermaid
+graph LR
+    subgraph "Natural Language Space"
+        R1["Protein Match"]
+        R2["Proximity Constraint"]
+        R3["Gene Cluster"]
+    end
+
+    subgraph "Code Entity Space"
+        E1["Hit class"]
+        E2["max_intergenic (arg)"]
+        E3["Cluster class"]
+    end
+
+    R1 <--> E1
+    R2 <--> E2
+    R3 <--> E3
+
+    E1 -- "distance() <= max_intergenic" --> E3
+    E3 -- "contains" --> E1
+```
+Sources: [cfoldseeker/classes.py:21-25](), [cfoldseeker/classes.py:166-170](), [cfoldseeker/classes.py:192-195](), [cfoldseeker/classes.py:372-374]()
+
+---
+
+# Page: Search Modes
+
+# Search Modes
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [cfoldseeker/main.py](cfoldseeker/main.py)
+- [docs/guide/usage.rst](docs/guide/usage.rst)
+
+</details>
+
+
+
+`cfoldseeker` provides three distinct operational modes to accommodate different search scales and infrastructure availability. All search modes are managed by the `init_search()` factory in `cfoldseeker/main.py` [cfoldseeker/main.py:126-146]() and follow a unified execution contract defined by the `Search` base class.
+
+### The Search Interface
+
+Every search mode inherits from the `Search` abstract base class [cfoldseeker/classes.py:277-314](). This ensures that regardless of the underlying engine (Remote API vs. Local Binary), the workflow remains consistent:
+
+1.  **`run()`**: Orchestrates the specific search logic (e.g., submitting tickets to FoldSeek or executing a subprocess).
+2.  **`identify_clusters()`**: A shared method that uses `NetworkX` to group hits into genomic clusters based on intergenic distance and genomic length [cfoldseeker/classes.py:440-520]().
+3.  **`generate_output()`**: Standardizes the production of `hits.tsv`, `clusters.tsv`, and optional `cblaster` or `clinker` session files [cfoldseeker/classes.py:522-638]().
+
+### Search Mode Selection
+
+| Mode | Class | Best For | Requirements |
+| :--- | :--- | :--- | :--- |
+| **Remote** | `RemoteSearch` | Small-scale queries against public databases (AFDB). | Internet access, UniProt mapping table. |
+| **Local** | `LocalSearch` | Searching custom or proprietary structural databases. | Local `foldseek` binary, pre-built structural DB, CDS context DB. |
+| **Local-Clustered** | `LocalClusteredSearch` | Large-scale genomic searches (e.g., thousands of genomes). | MMseqs2 cluster TSV, FoldSeek DB of representatives, CDS context DB. |
+
+---
+
+### Remote Search Mode
+
+The **Remote** mode (`-m remote`) leverages the FoldSeek webserver to perform structural searches against the AlphaFold Database (AFDB). It is designed for users who do not wish to maintain local structural databases or high-performance computing clusters.
+
+This mode performs complex cross-referencing to bridge structural hits (identified by UniProt/AFDB IDs) to genomic coordinates via KEGG and ENA/GenPept APIs.
+
+*   **Key Component**: `RemoteSearch` class [cfoldseeker/remote.py:20-25]().
+*   **Workflow**: Submits queries via `communication.py` [cfoldseeker/communication.py:25-56](), parses JSON results, and resolves metadata through a three-tier hierarchy (KEGG → ENA → UniSave).
+*   **Concurrency**: Uses `thread_map` to parallelize API requests across multiple workers [cfoldseeker/remote.py:80-94]().
+
+For details, see [Remote Search Mode (remote.py)](#3.1).
+
+**Sources:** [cfoldseeker/remote.py:20-94](), [cfoldseeker/communication.py:25-56](), [cfoldseeker/main.py:55-55]().
+
+---
+
+### Local Search Mode
+
+The **Local** mode (`-m local`) executes the `foldseek easy-search` binary on the user's local machine. This is the primary mode for searching private structural datasets or large-scale local mirrors of public databases.
+
+*   **Key Component**: `LocalSearch` class [cfoldseeker/local.py:18-23]().
+*   **Workflow**: Invokes `foldseek` via `subprocess` [cfoldseeker/local.py:100-141](), then uses `Polars` LazyFrames to join the structural hits against a pre-built CDS coordinate database (`cfoldseeker-cds` output).
+*   **Coordinate Resolution**: Maps local sequence identifiers to genomic locations using the `cds_db` [cfoldseeker/local.py:143-176]().
+
+For details, see [Local Search Mode (local.py)](#3.2).
+
+**Sources:** [cfoldseeker/local.py:18-176](), [docs/guide/usage.rst:33-112]().
+
+---
+
+### Local-Clustered Search Mode
+
+The **Local-Clustered** mode (`-m local_clustered`) is an optimized version of the local search designed for massive datasets. It reduces the search space by only searching structural representatives of protein families and then programmatically expanding those hits to all members of the cluster.
+
+*   **Key Component**: `LocalClusteredSearch` class [cfoldseeker/local_clustered.py:15-20]().
+*   **Workflow**: Inherits from `LocalSearch` but overrides the hit processing to include an `expand_sequence_clusters()` step [cfoldseeker/local_clustered.py:58-96]().
+*   **Optimization**: Significantly reduces the number of structural alignments required by utilizing MMseqs2 pre-clustering results.
+
+For details, see [Local-Clustered Search Mode (local_clustered.py)](#3.3).
+
+**Sources:** [cfoldseeker/local_clustered.py:15-96](), [docs/guide/usage.rst:113-129]().
+
+---
+
+### System Entity Mapping
+
+The following diagrams illustrate the relationship between user-facing search modes and the underlying code entities.
+
+#### Search Factory and Hierarchy
+This diagram shows how `main.py` selects a search implementation based on the `--mode` argument.
+
+```mermaid
+graph TD
+    subgraph "CLI Entrypoint (main.py)"
+        [main] --> [init_search]
+    end
+
+    subgraph "Search Implementations"
+        [init_search] -- "mode='remote'" --> [RemoteSearch]
+        [init_search] -- "mode='local'" --> [LocalSearch]
+        [init_search] -- "mode='local_clustered'" --> [LocalClusteredSearch]
+    end
+
+    subgraph "Inheritance (classes.py)"
+        [RemoteSearch] -- "inherits" --> [Search_Base]
+        [LocalSearch] -- "inherits" --> [Search_Base]
+        [LocalClusteredSearch] -- "inherits" --> [LocalSearch]
+    end
+
+    [Search_Base] --> [identify_clusters]
+    [Search_Base] --> [generate_output]
+```
+**Sources:** [cfoldseeker/main.py:126-146](), [cfoldseeker/classes.py:277-314](), [cfoldseeker/local_clustered.py:15-20]().
+
+#### Data Flow and Dependency Mapping
+This diagram maps the natural language "Search Modes" to the specific files and external dependencies they interact with.
+
+```mermaid
+graph LR
+    subgraph "Remote Mode"
+        [RemoteSearch] --> [communication.py]
+        [communication.py] -- "HTTP" --> [FoldSeek_API]
+        [communication.py] -- "HTTP" --> [NCBI_Entrez]
+    end
+
+    subgraph "Local Modes"
+        [LocalSearch] --> [subprocess_foldseek]
+        [LocalClusteredSearch] --> [expand_sequence_clusters]
+        [LocalSearch] -- "reads" --> [CDS_Database_TSV]
+        [LocalClusteredSearch] -- "reads" --> [MMseqs2_Cluster_TSV]
+    end
+
+    [LocalSearch] -- "uses" --> [Polars_LazyFrame]
+    [RemoteSearch] -- "uses" --> [thread_map]
+```
+**Sources:** [cfoldseeker/remote.py:80-94](), [cfoldseeker/local.py:100-141](), [cfoldseeker/local_clustered.py:58-96](), [cfoldseeker/communication.py:25-56]().
+
+---
+
+# Page: Remote Search Mode (remote.py)
+
+# Remote Search Mode (remote.py)
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [cfoldseeker/__init__.py](cfoldseeker/__init__.py)
+- [cfoldseeker/communication.py](cfoldseeker/communication.py)
+- [cfoldseeker/remote.py](cfoldseeker/remote.py)
+- [cfoldseeker/remote_parsers.py](cfoldseeker/remote_parsers.py)
+
+</details>
+
+
+
+The `RemoteSearch` mode facilitates gene cluster identification by querying the FoldSeek webserver. It is designed for users who do not have local structural databases and wish to leverage public repositories (e.g., AFDB, PDB). This mode implements a complex three-tier cross-referencing hierarchy to resolve protein hits into genomic coordinates, utilizing `KEGG`, `ENA`, and `UniProt` APIs.
+
+### System Architecture and Data Flow
+
+The `RemoteSearch` class extends the base `Search` class `[cfoldseeker/remote.py:28-46]()`. It manages the lifecycle of a remote query, from submission to the final identification of genomic clusters.
+
+#### Code Entity Map: Remote Search Workflow
+The following diagram maps the high-level workflow to the specific functions and classes in the codebase.
+
+```mermaid
+graph TD
+    subgraph "RemoteSearch Class [remote.py]"
+        Start["run()"] --> Submit["run_foldseek()"]
+        Submit --> ParseJSON["parse_foldseek_results()"]
+        ParseJSON --> MapIDs["cross_reference_hits()"]
+        MapIDs --> Resolve["resolve_scaffold_versions()"]
+        Resolve --> BaseClass["identify_clusters() [Search class]"]
+    end
+
+    subgraph "Communication Layer [communication.py]"
+        Submit -- "requests.post" --> FS_API["FoldSeek API"]
+        MapIDs -- "pull_from_ena" --> ENA["ENA Browser API"]
+        MapIDs -- "pull_from_unisave" --> UniProt["UniProt REST API"]
+    end
+
+    subgraph "Parsing Layer [remote_parsers.py]"
+        MapIDs -- "extract_genomic_information_kegg" --> KEGG_P["KEGG Parser"]
+        MapIDs -- "extract_genomic_information_ena" --> ENA_P["ENA Parser"]
+    end
+```
+**Sources:** `[cfoldseeker/remote.py:28-80]()`, `[cfoldseeker/communication.py:15-131]()`, `[cfoldseeker/remote_parsers.py:12-127]()`.
+
+---
+
+### FoldSeek Webserver Communication
+
+Remote search begins by submitting structural queries to the FoldSeek API via `submit_foldseek_query` `[cfoldseeker/communication.py:15-76]()`.
+
+1.  **Submission**: Queries are sent in parallel using `thread_map` `[cfoldseeker/remote.py:158-160]()`.
+2.  **Polling**: The system monitors job status via `check_query_status` `[cfoldseeker/communication.py:78-98]()`.
+3.  **Retrieval**: Once "COMPLETE", results are downloaded as JSON `[cfoldseeker/communication.py:101-129]()`.
+4.  **Parsing**: `parse_foldseek_results` converts the JSON hits into internal `Hit` objects, capturing metrics like E-value, TM-score, and RMSD `[cfoldseeker/remote.py:177-226]()`.
+
+**Sources:** `[cfoldseeker/remote.py:154-226]()`, `[cfoldseeker/communication.py:15-129]()`.
+
+---
+
+### Three-Tier Cross-Referencing Hierarchy
+
+The core challenge of remote structural search is that FoldSeek results often lack genomic coordinates. `RemoteSearch` resolves this through `cross_reference_hits` `[cfoldseeker/remote.py:323-456]()` using a prioritized fallback strategy.
+
+| Tier | Source | Logic | Code Reference |
+| :--- | :--- | :--- | :--- |
+| **1** | **KEGG** | Joins hits against a local UniProt mapping table to find KEGG Gene IDs. Pulls records via `kegg_pull`. | `[cfoldseeker/remote.py:343-376]()` |
+| **2** | **ENA/GenPept** | If KEGG fails, attempts to find EMBL-CDS IDs in the mapping table and pulls GenPept records from ENA. | `[cfoldseeker/remote.py:378-406]()` |
+| **3** | **UniSave/WGS** | Fallback for UniProt IDs. Pulls historical records from UniSave or searches WGS-GenPept. | `[cfoldseeker/remote.py:408-444]()` |
+
+#### Hit Sanitisation
+Because a single UniProt ID may map to multiple genomic locations (e.g., identical proteins in different strains), the `_sanitise_hit_attr` method standardizes the hit list `[cfoldseeker/remote.py:87-152]()`. If a hit has multiple cross-references, the method "explodes" it into multiple `Hit` instances, each representing a unique genomic locus `[cfoldseeker/remote.py:118-129]()`.
+
+**Sources:** `[cfoldseeker/remote.py:87-152]()`, `[cfoldseeker/remote.py:323-456]()`.
+
+---
+
+### Scaffold Version Resolution
+
+Genomic coordinates retrieved from remote sources often reference accessions without version numbers (e.g., `CP000001` instead of `CP000001.1`). To ensure compatibility with downstream tools like `cblaster`, `RemoteSearch` performs scaffold resolution.
+
+```mermaid
+sequenceDiagram
+    participant R as RemoteSearch.resolve_scaffold_versions
+    participant E as NCBI Entrez (efetch)
+    
+    R->>R: Group hits by scaffold ID
+    loop For each unique scaffold
+        R->>E: Query NCBI for latest version
+        E-->>R: Return versioned accession (e.g., .1)
+    end
+    R->>R: Update all Hit objects with versioned ID
+```
+
+This process uses `Bio.Entrez` to fetch the correct versioned accession `[cfoldseeker/remote.py:537-586]()`. To optimize performance, queries are batched and executed concurrently using `thread_map` `[cfoldseeker/remote.py:557-558]()`.
+
+**Sources:** `[cfoldseeker/remote.py:537-586]()`.
+
+---
+
+### Key Functions Reference
+
+| Function | Role | Source |
+| :--- | :--- | :--- |
+| `__init__` | Loads the UniProt mapping table as a Polars `LazyFrame`. | `[cfoldseeker/remote.py:48-80]()` |
+| `run_foldseek` | Orchestrates parallel submission and retrieval of FoldSeek jobs. | `[cfoldseeker/remote.py:154-175]()` |
+| `cross_reference_hits` | The main engine for resolving protein IDs to genomic coordinates. | `[cfoldseeker/remote.py:323-456]()` |
+| `extract_genomic_information_kegg` | Parses KEGG text records for `POSITION` and `strand`. | `[cfoldseeker/remote_parsers.py:12-50]()` |
+| `extract_genomic_information_ena` | Parses ENA EMBL records using `Bio.SeqIO`. | `[cfoldseeker/remote_parsers.py:99-127]()` |
+| `resolve_scaffold_versions` | Updates hit scaffolds to include NCBI version suffixes. | `[cfoldseeker/remote.py:537-586]()` |
+
+**Sources:** `[cfoldseeker/remote.py:1-586]()`, `[cfoldseeker/remote_parsers.py:1-127]()`.
+
+---
+
+# Page: Local Search Mode (local.py)
+
+# Local Search Mode (local.py)
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [cfoldseeker/local.py](cfoldseeker/local.py)
+
+</details>
+
+
+
+The `LocalSearch` mode is designed for structural homology searches against user-provided local FoldSeek databases. It leverages the `foldseek easy-search` binary to compare query protein structures (CIF format) against a target database, subsequently cross-referencing hits with a pre-built CDS coordinate database to enable genomic context analysis.
+
+### System Overview and Code Mapping
+
+The following diagram maps the logical components of a local search to their respective implementations in `cfoldseeker/local.py`.
+
+**Local Search Entity Map**
+```mermaid
+graph TD
+    subgraph "Natural Language Space"
+        "Search Execution"
+        "Output Parsing"
+        "Coordinate Lookup"
+        "Result Filtering"
+    end
+
+    subgraph "Code Entity Space"
+        "Search Execution" --> FS_RUN["LocalSearch.run_foldseek()"]
+        "Output Parsing" --> FS_PARSE["LocalSearch.parse_foldseek_results()"]
+        "Coordinate Lookup" --> COORD_JOIN["LocalSearch.coord_db (Polars LazyFrame)"]
+        "Result Filtering" --> HIT_FILT["LocalSearch.identify_hits()"]
+        
+        FS_RUN --> STR_READ["_stream_reader()"]
+        FS_PARSE --> PARSE_COORDS["LocalSearch._parse_coordinate_string()"]
+    end
+
+    FS_RUN -- "Invokes via Subprocess" --> B_FS["foldseek easy-search"]
+    COORD_JOIN -- "Reads from" --> TSV_DB["CDS TSV Database"]
+```
+Sources: [cfoldseeker/local.py:47-62](), [cfoldseeker/local.py:107-127](), [cfoldseeker/local.py:186-200]()
+
+---
+
+### Implementation Details
+
+#### 1. FoldSeek Execution and Stream Handling
+The search begins by invoking the `foldseek` binary via `subprocess.Popen` [cfoldseeker/local.py:155-155](). To ensure the application remains responsive and logs are captured in real-time without blocking the main thread, the module implements a threaded stream reader.
+
+*   **`_stream_reader`**: A utility function that continuously reads binary chunks from a pipe, decodes them as UTF-8, and passes them to a logging callback [cfoldseeker/local.py:18-45]().
+*   **Command Configuration**: The `easy-search` command is configured with `--exhaustive-search 1` to ensure sensitivity [cfoldseeker/local.py:150-150]() and outputs a specific TSV format containing `query, target, qstart, qend, tstart, tend, pident, qcov, tcov, evalue, bits` [cfoldseeker/local.py:145-145]().
+
+Sources: [cfoldseeker/local.py:18-45](), [cfoldseeker/local.py:138-151]()
+
+#### 2. Data Flow and Coordinate Integration
+A key feature of `LocalSearch` is the integration of structural hits with genomic metadata. This is achieved through a `Polars` join operation.
+
+**Data Flow: From Structure Hit to Genomic Hit**
+```mermaid
+graph LR
+    subgraph "FoldSeek Output"
+        A["foldseek_result.txt"] -- "Read as LazyFrame" --> B["Search Results"]
+    end
+
+    subgraph "CDS Database"
+        C["coord_db_path"] -- "Scan CSV" --> D["Coordinate LazyFrame"]
+    end
+
+    B -- "Join on 'target' == 'gene_tag'" --> E["Enriched Hits"]
+    E -- "Filter by Score/E-value" --> F["Hit Objects"]
+    
+    F -- "identify_clusters()" --> G["Gene Clusters"]
+```
+Sources: [cfoldseeker/local.py:95-99](), [cfoldseeker/local.py:202-230]()
+
+*   **Lazy Loading**: The CDS database is scanned using `pl.scan_csv`, which creates a `LazyFrame`. This allows `cfoldseeker` to handle massive coordinate databases (e.g., whole-genome collections) without high memory overhead [cfoldseeker/local.py:87-99]().
+*   **Coordinate Parsing**: The `_parse_coordinate_string` method handles the conversion of string-based genomic coordinates (e.g., `100-500,600-800`) into a sorted list of integer tuples `[(100, 500), (600, 800)]`, accounting for strand orientation [cfoldseeker/local.py:269-307]().
+
+Sources: [cfoldseeker/local.py:96-99](), [cfoldseeker/local.py:269-307]()
+
+#### 3. Result Parsing and Filtering
+After the join, results are processed in `parse_foldseek_results()` [cfoldseeker/local.py:186-267]().
+
+| Step | Action | Code Reference |
+| :--- | :--- | :--- |
+| **Loading** | Read FoldSeek TSV with defined schema. | [cfoldseeker/local.py:202-212]() |
+| **Joining** | Inner join with `self.coord_db` on the gene identifier. | [cfoldseeker/local.py:221-222]() |
+| **Filtering** | Apply `min_score` and `min_coverage` thresholds. | [cfoldseeker/local.py:224-227]() |
+| **Instantiation** | Convert Polars rows into `Hit` class instances. | [cfoldseeker/local.py:240-264]() |
+
+Sources: [cfoldseeker/local.py:202-264]()
+
+### Key Methods
+
+#### `run(self)`
+The primary entry point that orchestrates the workflow:
+1.  Calls `run_foldseek()` to generate the raw structural alignment file [cfoldseeker/local.py:176-176]().
+2.  Calls `parse_foldseek_results()` to link structures to genomic coordinates [cfoldseeker/local.py:177-177]().
+3.  Executes `identify_clusters()` (inherited from `Search`) to group hits based on intergenic distance [cfoldseeker/local.py:178-178]().
+
+#### `_parse_coordinate_string(self, coord_str, strand)`
+Handles the transformation of genomic location data. It uses regex `(\d+)-(\d+)` to extract start and end positions from the database string [cfoldseeker/local.py:288-288](). If the strand is negative (`-`), it ensures the internal representation maintains sorted order for downstream distance calculations [cfoldseeker/local.py:293-303]().
+
+Sources: [cfoldseeker/local.py:173-184](), [cfoldseeker/local.py:269-307]()
+
+---
+
+# Page: Local-Clustered Search Mode (local_clustered.py)
+
+# Local-Clustered Search Mode (local_clustered.py)
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [cfoldseeker/local.py](cfoldseeker/local.py)
+- [cfoldseeker/local_clustered.py](cfoldseeker/local_clustered.py)
+
+</details>
+
+
+
+The `LocalClusteredSearch` mode is a specialized structural search strategy designed for efficiency when dealing with massive target databases. Instead of searching every individual protein structure, it performs a FoldSeek search against a database of **sequence cluster representatives** and then expands the resulting hits to include all members of those clusters. This approach significantly reduces the structural search space while maintaining sensitivity by leveraging sequence-level redundancy.
+
+### Implementation Overview
+
+The `LocalClusteredSearch` class [cfoldseeker/local_clustered.py:14-38]() inherits from `LocalSearch` [cfoldseeker/local.py:47-62](). It extends the standard local search workflow by introducing a sequence expansion step between the FoldSeek result parsing and the final hit collection.
+
+#### Data Flow: Representative-First Search
+
+1.  **Structural Search**: FoldSeek `easy-search` is executed against a database containing only representative structures [cfoldseeker/local.py:107-151]().
+2.  **Clustering Join**: The search results (representatives) are joined with an MMseqs2 clustering TSV to identify all related sequence members [cfoldseeker/local_clustered.py:84-123]().
+3.  **Genomic Context Retrieval**: The expanded hit set is joined against the CDS coordinate database (`coord_db`) to obtain genomic locations [cfoldseeker/local_clustered.py:147]().
+4.  **Cluster Identification**: The standard graph-based spatial clustering logic is applied to the expanded hits.
+
+### System Mapping: Logic to Code Entities
+
+The following diagram maps the logical steps of the clustered search to the specific class methods and data structures used in the implementation.
+
+**Clustered Search Workflow Mapping**
+```mermaid
+graph TD
+    subgraph "Structural Space"
+        A["Query CIFs"] --> B["LocalClusteredSearch.run()"]
+        B --> C["LocalSearch.run_foldseek()"]
+        C --> D["foldseek_result.txt"]
+    end
+
+    subgraph "Sequence Expansion Space"
+        D --> E["LocalClusteredSearch.identify_hits()"]
+        E --> F["LocalSearch.parse_foldseek_results()"]
+        F --> G["LocalClusteredSearch.expand_sequence_clusters()"]
+        H["seq_clust (Polars LazyFrame)"] --> G
+    end
+
+    subgraph "Genomic Space"
+        G --> I["LocalSearch.collect_hits()"]
+        J["coord_db (Polars LazyFrame)"] --> I
+        I --> K["identify_clusters()"]
+    end
+
+    style H stroke-dasharray: 5 5
+    style J stroke-dasharray: 5 5
+```
+**Sources:** [cfoldseeker/local_clustered.py:126-158](), [cfoldseeker/local.py:96-99](), [cfoldseeker/local_clustered.py:74-75]()
+
+### Sequence Expansion Logic
+
+The core of this mode is the `expand_sequence_clusters` method. It uses the **Polars** library to perform high-performance joins between the structural hits and the sequence clustering data.
+
+#### The MMseqs2 Clustering Table
+The class expects an MMseqs2 clustering TSV (loaded as `self.seq_clust`). This table is scanned as a `LazyFrame` with two columns: `representative` and `protein` [cfoldseeker/local_clustered.py:74-75]().
+
+#### Join and Deduplication Process
+The expansion follows a strict pipeline to ensure data integrity and performance:
+1.  **Prefiltering**: The large `seq_clust` table is filtered to only include rows where the `representative` column matches a hit found in the FoldSeek results [cfoldseeker/local_clustered.py:105-109]().
+2.  **Materialization**: The filtered table is collected into memory (`.collect()`) to optimize the subsequent join [cfoldseeker/local_clustered.py:110]().
+3.  **Inner Join**: The hits are joined with the cluster members. Every member of a cluster inherits the structural metrics (E-value, Score, Coverage) of its representative [cfoldseeker/local_clustered.py:114]().
+4.  **Deduplication**: Duplicate protein/query pairs are dropped using `.unique(subset=['protein', 'query'])` to handle cases where identical labels might appear in different assemblies [cfoldseeker/local_clustered.py:118]().
+
+**Data Transformation Architecture**
+```mermaid
+graph LR
+    subgraph "Input Dataframes"
+        FS["FoldSeek Results<br/>(target, query, evalue, ...)"]
+        SC["seq_clust<br/>(representative, protein)"]
+    end
+
+    subgraph "Polars Join Operations"
+        FS -- "target" --> JOIN{"Join"}
+        SC -- "representative" --> JOIN
+        JOIN --> EXP["Expanded DataFrame"]
+    end
+
+    subgraph "Refinement"
+        EXP --> DUP["unique(protein, query)"]
+        DUP --> REN["rename(protein -> target)"]
+        REN --> FINAL["Hit Objects Creation"]
+    end
+```
+**Sources:** [cfoldseeker/local_clustered.py:84-123]()
+
+### Inherited Hit Identification
+
+After expansion, `LocalClusteredSearch` leverages the `collect_hits()` method from `LocalSearch` [cfoldseeker/local_clustered.py:147](). This method:
+1.  Joins the expanded hit table with the `coord_db` (CDS coordinates) [cfoldseeker/local.py:96-99]().
+2.  Instantiates `Hit` objects for every valid sequence/coordinate pair [cfoldseeker/local.py:207-220]().
+3.  Feeds these `Hit` objects into the `identify_clusters()` method (inherited from the `Search` base class) to perform spatial grouping of genes on contigs [cfoldseeker/classes.py:533-548]().
+
+### Key Functions and Classes
+
+| Entity | Role | Source |
+| :--- | :--- | :--- |
+| `LocalClusteredSearch` | Main class for clustered search orchestration. | [cfoldseeker/local_clustered.py:14]() |
+| `expand_sequence_clusters()` | Joins structural hits with sequence cluster members. | [cfoldseeker/local_clustered.py:84]() |
+| `identify_hits()` | Overridden method to include the expansion step. | [cfoldseeker/local_clustered.py:126]() |
+| `seq_clust` | `pl.LazyFrame` containing MMseqs2 representative/member mappings. | [cfoldseeker/local_clustered.py:74]() |
+| `coord_db` | `pl.LazyFrame` containing genomic coordinates for all proteins. | [cfoldseeker/local.py:96]() |
+
+**Sources:** [cfoldseeker/local_clustered.py:1-158](), [cfoldseeker/local.py:47-101]()
+
+---
+
+# Page: External Communication Layer (communication.py and remote_parsers.py)
+
+# External Communication Layer (communication.py and remote_parsers.py)
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [cfoldseeker/__init__.py](cfoldseeker/__init__.py)
+- [cfoldseeker/communication.py](cfoldseeker/communication.py)
+- [cfoldseeker/remote_parsers.py](cfoldseeker/remote_parsers.py)
+
+</details>
+
+
+
+The External Communication Layer serves as the stateless HTTP gateway and data translation engine for `cfoldseeker`. It manages all interactions with remote bioinformatics services—primarily the FoldSeek webserver, KEGG, ENA, and UniProt—while providing robust error handling, rate-limit management, and coordinate normalization.
+
+## Stateless HTTP Gateway (communication.py)
+
+The `communication.py` module encapsulates the logic for interacting with external REST APIs. It implements a ticket-based lifecycle for FoldSeek searches and a retrieval system for genomic metadata.
+
+### FoldSeek Ticket Lifecycle
+Remote searches follow a three-step process: submission, status polling, and result retrieval. This is managed by `submit_foldseek_query`, `check_query_status`, and `retrieve_foldseek_results`.
+
+| Function | Endpoint | Description |
+| :--- | :--- | :--- |
+| `submit_foldseek_query` | `/api/ticket` | Posts a `.cif` or `.pdb` file with DB and taxfilter parameters. Returns a job ID. |
+| `check_query_status` | `/api/ticket/{job_id}` | Polls the API to check if the status is "COMPLETE". |
+| `retrieve_foldseek_results` | `/api/result/{job_id}/0` | Downloads the final JSON payload once the job is finished. |
+
+**Sources:** [`cfoldseeker/communication.py:15-36`](), [`cfoldseeker/communication.py:78-98`](), [`cfoldseeker/communication.py:101-129`]()
+
+### Remote Metadata Retrieval
+To reconstruct genomic contexts for remote hits, `cfoldseeker` pulls sequence records from multiple archives.
+
+*   **ENA (European Nucleotide Archive):** `pull_from_ena` fetches EMBL/GenPept records via the ENA Browser API [`cfoldseeker/communication.py:132-176`]().
+*   **UniSave:** `pull_from_unisave` retrieves historical UniProt entries [`cfoldseeker/communication.py:179-222`]().
+*   **KEGG:** `pull_from_kegg` fetches Gene and Genome records [`cfoldseeker/communication.py:225-265`]().
+*   **NCBI Entrez:** `pull_from_entrez` is used to resolve scaffold versions for accessions that lack them [`cfoldseeker/communication.py:268-311`]().
+
+### Rate-Limit and Retry Logic
+All HTTP requests are wrapped in retry loops to handle network instability and API rate limits (HTTP 429).
+*   **Retry Mechanism:** Functions typically allow up to 3 attempts [`cfoldseeker/communication.py:153-154`]().
+*   **Backoff:** Upon receiving a 429 status code, the system waits 5 seconds before retrying [`cfoldseeker/communication.py:60-63`]().
+
+**Sources:** [`cfoldseeker/communication.py:53-75`](), [`cfoldseeker/communication.py:153-176`]()
+
+---
+
+## Remote Parser Translation Layer (remote_parsers.py)
+
+The `remote_parsers.py` module acts as a translation layer, converting raw text responses from various biological databases into a standardized dictionary format containing genomic coordinates and scaffold identifiers.
+
+### KEGG Record Parsing
+KEGG requires a two-step parsing approach because Gene records often use internal scaffold identifiers that must be mapped back to GenBank/RefSeq accessions using the Genome record.
+
+*   **`extract_genomic_information_kegg`**: Parses the `POSITION` line of a KEGG Gene record. It uses regex `\d+\.\.\d+` to extract exon boundaries and identifies the strand by checking for the `complement` keyword [`cfoldseeker/remote_parsers.py:12-50`]().
+*   **`extract_scaffold_mapping_kegg`**: Parses the `CHROMOSOME` and `PLASMID` fields of a KEGG Genome record to create a lookup table between internal IDs and public accessions [`cfoldseeker/remote_parsers.py:53-96`]().
+
+### ENA EMBL Parsing
+`extract_genomic_information_ena` utilizes `Bio.SeqIO` to process EMBL-formatted records. It specifically targets the `CDS` feature and handles multi-part locations (exons) [`cfoldseeker/remote_parsers.py:99-127`]().
+
+### Data Normalization
+A critical role of this layer is coordinate normalization. For instance, BioPython's 0-based start coordinates are incremented by 1 to maintain consistency with standard 1-based genomic notations used elsewhere in the pipeline [`cfoldseeker/remote_parsers.py:112`]().
+
+**Sources:** [`cfoldseeker/remote_parsers.py:32-43`](), [`cfoldseeker/remote_parsers.py:108-112`]()
+
+---
+
+## Data Flow: From Remote Hit to Genomic Context
+
+The following diagram illustrates how the `communication.py` and `remote_parsers.py` entities interact to transform a remote FoldSeek hit into a structured `Hit` object.
+
+### Interaction Logic: Remote Data Retrieval
+```mermaid
+graph TD
+    subgraph "communication.py"
+        FS[submit_foldseek_query] --> Poll[check_query_status]
+        Poll --> Res[retrieve_foldseek_results]
+        ENA[pull_from_ena]
+        KEGG[pull_from_kegg]
+    end
+
+    subgraph "remote_parsers.py"
+        P_ENA[extract_genomic_information_ena]
+        P_KEGG_G[extract_genomic_information_kegg]
+        P_KEGG_M[extract_scaffold_mapping_kegg]
+    end
+
+    Res -- "Hit Accession" --> ENA
+    Res -- "KEGG ID" --> KEGG
+    
+    ENA -- "EMBL Text" --> P_ENA
+    KEGG -- "Gene Record" --> P_KEGG_G
+    KEGG -- "Genome Record" --> P_KEGG_M
+    
+    P_ENA -- "Coords/Strand/Scaffold" --> HitObj["Hit Object (classes.py)"]
+    P_KEGG_G -- "Internal Coords" --> HitObj
+    P_KEGG_M -- "Accession Map" --> HitObj
+```
+**Sources:** [`cfoldseeker/communication.py:101-129`](), [`cfoldseeker/remote_parsers.py:12-50`](), [`cfoldseeker/remote_parsers.py:99-127`]()
+
+---
+
+## Entity Mapping: Code to Natural Language
+
+This diagram maps specific code entities to their functional roles in the external communication lifecycle.
+
+### Code Entity Space to Natural Language Space
+```mermaid
+classDiagram
+    class FoldSeek_API {
+        <<Service>>
+        submit_foldseek_query()
+        retrieve_foldseek_results()
+    }
+    class Genomic_Archives {
+        <<Service>>
+        pull_from_ena()
+        pull_from_kegg()
+        pull_from_unisave()
+    }
+    class Translation_Layer {
+        <<Logic>>
+        extract_genomic_information_kegg()
+        extract_genomic_information_ena()
+        extract_scaffold_mapping_kegg()
+    }
+
+    FoldSeek_API --|> Genomic_Archives : "Provides Accessions"
+    Genomic_Archives --|> Translation_Layer : "Provides Raw Text"
+    Translation_Layer --|> Hit_Metadata : "Produces Normalized Dict"
+```
+**Sources:** [`cfoldseeker/communication.py:15-129`](), [`cfoldseeker/communication.py:132-265`](), [`cfoldseeker/remote_parsers.py:12-127`]()
+
+## Key Functions Summary
+
+| File | Function | Role |
+| :--- | :--- | :--- |
+| `communication.py` | `submit_foldseek_query` | Entry point for remote search; handles `multipart/form-data` upload [`cfoldseeker/communication.py:15-59`](). |
+| `communication.py` | `pull_from_entrez` | Resolves `scaffold_version` for NCBI accessions via E-utils [`cfoldseeker/communication.py:268-311`](). |
+| `remote_parsers.py` | `extract_genomic_information_kegg` | Regex-based parser for KEGG `POSITION` lines; handles `complement()` and `join()` [`cfoldseeker/remote_parsers.py:12-50`](). |
+| `remote_parsers.py` | `extract_genomic_information_ena` | BioPython-based parser for ENA EMBL files; extracts multi-exon coordinates [`cfoldseeker/remote_parsers.py:99-127`](). |
+
+**Sources:** [`cfoldseeker/communication.py:15-311`](), [`cfoldseeker/remote_parsers.py:12-127`]()
+
+---
+
+# Page: Utility Tools
+
+# Utility Tools
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [bioconda_recipe/meta.yaml](bioconda_recipe/meta.yaml)
+- [env.yml](env.yml)
+- [pyproject.toml](pyproject.toml)
+
+</details>
+
+
+
+`cfoldseeker` provides two auxiliary Command Line Interface (CLI) tools designed to manage the data lifecycle before and after a structural search. These tools facilitate the construction of local genomic databases and the extraction of sequences from identified gene clusters. Both tools are exposed as entry points in the package distribution [pyproject.toml:48-49]().
+
+### Workflow Integration
+The utility tools act as the "bookends" of the `cfoldseeker` search workflow:
+1.  **Pre-search**: `cfoldseeker-cds` processes raw genomic data (GenBank, NCBI datasets, etc.) into a structured CSV database used by `LocalSearch` and `LocalClusteredSearch` to resolve structural hits to genomic coordinates.
+2.  **Post-search**: `cfoldseeker-seqs` consumes the `session.json` output from a search to retrieve physical FASTA sequences (nucleotide or protein) for downstream analysis or visualization.
+
+### Tool Connectivity Overview
+
+The following diagram illustrates how these utilities interface with the core search engine and the filesystem.
+
+**Figure 1: Utility Tool Data Flow**
+```mermaid
+graph TD
+    subgraph "Pre-Processing"
+        A["Genomic Files (.gbff, .tsv, NCBI Package)"] --> B["cfoldseeker-cds<br/>(build_cds_db.py)"]
+        B --> C[("CDS Database<br/>(Structured CSV)")]
+    end
+
+    subgraph "Core Search"
+        C --> D["cfoldseeker Search Engine<br/>(local.py / local_clustered.py)"]
+        E["Query .cif/.pdb"] --> D
+        D --> F["session.json"]
+    end
+
+    subgraph "Post-Processing"
+        F --> G["cfoldseeker-seqs<br/>(extract_sequences.py)"]
+        A --> G
+        G --> H["Cluster FASTA Files"]
+        G --> I["cblaster plot/clinker"]
+    end
+```
+**Sources:** [pyproject.toml:46-49](), [cfoldseeker/main.py:1-20]() (inferred workflow).
+
+---
+
+## 5.1 CDS Database Builder (cfoldseeker-cds)
+
+The `cfoldseeker-cds` tool (implemented in `build_cds_db.py`) is responsible for creating a high-performance genomic coordinate index. This index allows `cfoldseeker` to instantly map a FoldSeek hit (identified by a protein accession) to its specific location on a contig, including its orientation and neighboring genes.
+
+### Key Capabilities
+*   **ETL Pipeline**: Utilizes the `Polars` library to perform lazy evaluation and streaming ETL (Extract, Transform, Load), ensuring that large genomic datasets (e.g., entire NCBI RefSeq categories) can be processed without exhausting system memory.
+*   **Input Flexibility**: Supports multiple formats including standard NCBI `.gbff` files, Bakta-annotated GenBank files, and raw TSV inputs.
+*   **Coordinate Handling**: Correctly handles complex genomic features, such as multi-exon genes and trans-spliced entries, ensuring the final database contains accurate start/stop boundaries for the `cfoldseeker` cluster detection algorithm.
+*   **Taxon Resolution**: Integrates with NCBI Entrez to resolve taxonomic IDs to scientific names, enriching the database for better hit reporting.
+
+For a detailed reference on database schemas, supported flags, and the transformation logic, see **[5.1 CDS Database Builder (build_cds_db.py)](#)**.
+
+**Sources:** [cfoldseeker/build_cds_db.py:1-10](), [pyproject.toml:48]()
+
+---
+
+## 5.2 Sequence Extractor (cfoldseeker-seqs)
+
+The `cfoldseeker-seqs` tool (implemented in `extract_sequences.py`) bridges the gap between tabular search results and biological sequence analysis. Once `cfoldseeker` identifies potential Biosynthetic Gene Clusters (BGCs), this utility extracts the relevant sequence data from the original source files.
+
+### Key Capabilities
+*   **Session Management**: Loads `cfoldseeker` session files using `convert_session()` to reconstruct the state of a completed search.
+*   **Precision Extraction**: Uses `locate_nucleotide_sequences()` and `locate_protein_sequences()` to slice specific genomic regions based on the hits found during the search, minimizing the need to load entire genomes into memory.
+*   **Parallelism**: Employs `thread_map` to handle multi-threaded extraction across hundreds of clusters simultaneously, significantly speeding up the transition to downstream tools.
+*   **Downstream Compatibility**: Formats outputs for direct use in `cblaster` visualization or `BigScape` similarity networking.
+
+For a detailed reference on extraction modes and integration with the `csuite` ecosystem, see **[5.2 Sequence Extractor (extract_sequences.py)](#)**.
+
+**Sources:** [cfoldseeker/extract_sequences.py:1-15](), [pyproject.toml:49]()
+
+---
+
+## Technical Mapping
+
+The following table maps the CLI tools to their respective implementation modules and primary library dependencies.
+
+| CLI Command | Module Reference | Primary Logic | Dependencies |
+| :--- | :--- | :--- | :--- |
+| `cfoldseeker-cds` | `cfoldseeker/build_cds_db.py` | `main()` | `polars`, `biopython` |
+| `cfoldseeker-seqs` | `cfoldseeker/extract_sequences.py` | `main()` | `cblaster`, `tqdm`, `biopython` |
+
+**Sources:** [pyproject.toml:24-32](), [bioconda_recipe/meta.yaml:15-18]()
+
+---
+
+# Page: CDS Database Builder (build_cds_db.py)
+
+# CDS Database Builder (build_cds_db.py)
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [cfoldseeker/build_cds_db.py](cfoldseeker/build_cds_db.py)
+- [docs/guide/usage.rst](docs/guide/usage.rst)
+
+</details>
+
+
+
+The `cfoldseeker-cds` utility (implemented in `cfoldseeker/build_cds_db.py`) is a high-performance ETL (Extract, Transform, Load) tool designed to construct a genomic context database. This database maps protein identifiers to their exact genomic coordinates (contig, start, end, strand) and taxonomic metadata, enabling `cfoldseeker` to identify biosynthetic gene clusters (BGCs) from structural search hits.
+
+## System Overview and Data Flow
+
+The builder utilizes **Polars** for lazy evaluation and streaming output, allowing it to process thousands of GenBank files or massive NCBI datasets with a low memory footprint.
+
+### Data Flow Diagram
+This diagram illustrates how biological records are transformed into the unified `cfoldseeker` database format.
+
+```mermaid
+graph TD
+    subgraph "Input Layer"
+        A1["NCBI GBFF Files"]
+        A2["NCBI Dataset Package"]
+        A3["Bakta GBFF Files"]
+        A4["Custom TSV"]
+    end
+
+    subgraph "cfoldseeker/build_cds_db.py"
+        B["main() Entrypoint"]
+        C["create_parser()"]
+        D["parse_and_validate_arguments()"]
+        
+        subgraph "Extraction Pipeline"
+            E1["parse_ncbi_gbff()"]
+            E2["parse_bakta_gbff()"]
+            E3["parse_tsv()"]
+        end
+
+        F["Coordinate Handling (Multi-exon/Complement)"]
+        G["Taxon Resolution (NCBI Entrez)"]
+        H["Polars LazyFrame Pipeline"]
+    end
+
+    subgraph "Output"
+        I["sink_csv() / Gzip"]
+        J[".gz / .tsv Database"]
+    end
+
+    A1 & A2 --> E1
+    A3 --> E2
+    A4 --> E3
+    E1 & E2 & E3 --> F
+    F --> G
+    G --> H
+    H --> I
+    I --> J
+
+    C -.-> B
+    D -.-> B
+```
+**Sources:** [cfoldseeker/build_cds_db.py:32-82](), [cfoldseeker/build_cds_db.py:116-170](), [cfoldseeker/build_cds_db.py:536-618]()
+
+## Supported Input Modes
+
+The tool supports four distinct parsing modes via the `--mode` flag [cfoldseeker/build_cds_db.py:60-62]():
+
+| Mode | Description | Implementation |
+| :--- | :--- | :--- |
+| `ncbi-gbff` | Standard NCBI GenBank Flat File format. | `parse_ncbi_gbff` [cfoldseeker/build_cds_db.py:204-266]() |
+| `ncbi-package` | Folders structured by the NCBI Datasets CLI. | `parse_ncbi_gbff` [cfoldseeker/build_cds_db.py:204-266]() |
+| `bakta-gbff` | GenBank files produced by the Bakta annotator. | `parse_bakta_gbff` [cfoldseeker/build_cds_db.py:269-328]() |
+| `tsv` | Pre-parsed tab-separated values. | `parse_tsv` [cfoldseeker/build_cds_db.py:331-364]() |
+
+## Core Implementation Details
+
+### Multi-Exon and Coordinate Handling
+The builder extracts coordinates from `SeqFeature` objects. It specifically handles:
+1.  **Strand Normalization**: Converts Biopython strand integers (-1, 1) to string symbols ('-', '+') [cfoldseeker/build_cds_db.py:246-247]().
+2.  **Location Joining**: For multi-exon genes, it extracts the start of the first operator and the end of the last operator to define the total genomic span [cfoldseeker/build_cds_db.py:244-245]().
+3.  **Protein IDs**: Prioritizes `protein_id` tags, falling back to `locus_tag` if the former is missing [cfoldseeker/build_cds_db.py:249-251]().
+
+### Taxon Name Resolution
+A key feature of `cfoldseeker-cds` is the ability to resolve human-readable taxon names instead of relying on cryptic file accessions.
+
+*   **Automatic (NCBI)**: When `-tna` is used, the tool extracts `taxon_id` from the GenBank features and queries the **NCBI Entrez** API to fetch the `ScientificName` [cfoldseeker/build_cds_db.py:440-474]().
+*   **Manual Mapping**: Users can provide a TSV file via `-tnf` to map file labels to specific names [cfoldseeker/build_cds_db.py:477-501]().
+
+### The Polars ETL Pipeline
+The system uses a `Polars` pipeline to deduplicate contigs and clean the data before export.
+
+```mermaid
+graph LR
+    node_df["Raw List of Dicts"]
+    node_pl["pl.from_dicts()"]
+    node_unique["Unique Contig Check"]
+    node_cast["Type Casting (Int64)"]
+    node_sink["sink_csv()"]
+
+    node_df --> node_pl
+    node_pl --> node_unique
+    node_unique --> node_cast
+    node_cast --> node_sink
+```
+**Sources:** [cfoldseeker/build_cds_db.py:596-618]()
+
+## Key Functions Reference
+
+### `parse_ncbi_gbff(input_path, mode, ...)`
+Iterates through GenBank files using `SeqIO.parse`. It handles the directory recursion logic for `ncbi-package` vs `ncbi-gbff` and yields dictionaries for each CDS feature [cfoldseeker/build_cds_db.py:204-266]().
+
+### `fetch_taxon_names_ncbi(taxids)`
+Uses `Entrez.efetch` with `db="taxonomy"` to retrieve scientific names in batches of 20 to respect NCBI rate limits [cfoldseeker/build_cds_db.py:440-474]().
+
+### `main()`
+The orchestration logic:
+1.  Initializes logging and validates paths [cfoldseeker/build_cds_db.py:536-563]().
+2.  Triggers the appropriate parser based on `args.mode` [cfoldseeker/build_cds_db.py:570-580]().
+3.  Collects results into a list of dictionaries [cfoldseeker/build_cds_db.py:583-594]().
+4.  Processes the data via Polars and writes to the final `.gz` or `.tsv` file [cfoldseeker/build_cds_db.py:596-618]().
+
+## Duplicate Contig Detection
+To prevent issues during local search joins, the builder detects if multiple files contain the same contig accession. If detected, it logs a warning and keeps only the first occurrence to ensure genomic coordinate integrity [cfoldseeker/build_cds_db.py:603-609]().
+
+**Sources:** 
+- [cfoldseeker/build_cds_db.py:204-266]() (NCBI Parsing)
+- [cfoldseeker/build_cds_db.py:440-474]() (Entrez Integration)
+- [cfoldseeker/build_cds_db.py:596-618]() (Polars Pipeline)
+- [docs/guide/usage.rst:41-80]() (User Guide context)
+
+---
+
+# Page: Sequence Extractor (extract_sequences.py)
+
+# Sequence Extractor (extract_sequences.py)
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [cfoldseeker/extract_sequences.py](cfoldseeker/extract_sequences.py)
+- [docs/guide/usage.rst](docs/guide/usage.rst)
+
+</details>
+
+
+
+The `cfoldseeker-seqs` utility (implemented in `extract_sequences.py`) is a helper tool designed to extract genomic regions (gene clusters) from source GenBank files based on the results of a `cfoldseeker` search session. It serves as a bridge between structural search hits and downstream comparative genomics tools like `cblaster` and `clinker` by automating the retrieval of multi-gene loci from large genomic datasets.
+
+### Overview and Integration
+`extract_sequences.py` integrates directly with the `cblaster` API to perform the heavy lifting of GenBank parsing and cluster extraction. It acts as a wrapper that translates `cfoldseeker` session data into a format compatible with `cblaster.extract_clusters`, while adding specific features such as parallel processing via `thread_map` and support for "BigScape flavour" GenBank files.
+
+Sources: `cfoldseeker/extract_sequences.py:12-14` [], `cfoldseeker/extract_sequences.py:47-49` []
+
+---
+
+### System Architecture and Data Flow
+
+The extraction process follows a pipeline that moves from a JSON session file to filtered DataFrames, and finally to physical GenBank files on disk.
+
+#### Logic Flow Diagram
+"Logic Flow of cfoldseeker-seqs"
+```mermaid
+graph TD
+    subgraph "Input Space"
+        Session["session.json"]
+        GBK_Dir["GenBank Directory (.gbk/.gbff)"]
+    end
+
+    subgraph "Processing Space (extract_sequences.py)"
+        Load["convert_session()"]
+        Filt["Apply Filters (score, organism, scaffold)"]
+        LocateProt["locate_protein_sequences()"]
+        LocateNuc["locate_nucleotide_sequences()"]
+        
+        subgraph "Parallel Extraction"
+            TM["thread_map (Tqdm)"]
+            CBL["cblaster.extract_clusters.cluster_to_record"]
+        end
+    end
+
+    subgraph "Output Space"
+        FL["BigScape Flavour Adjustment"]
+        Disk["Cluster GenBanks (.gbk)"]
+    end
+
+    Session --> Load
+    Load --> Filt
+    Filt --> LocateProt
+    Filt --> LocateNuc
+    LocateProt --> TM
+    LocateNuc --> TM
+    GBK_Dir --> TM
+    TM --> CBL
+    CBL --> FL
+    FL --> Disk
+```
+Sources: `cfoldseeker/extract_sequences.py:206-218` [], `cfoldseeker/extract_sequences.py:230-245` [], `cfoldseeker/extract_sequences.py:314-345` []
+
+---
+
+### Core Implementation Details
+
+#### Session Conversion and Filtering
+The tool begins by loading a `cfoldseeker` session using `cblaster.classes.Session.load()` [cfoldseeker/extract_sequences.py:206-208](). The `convert_session()` function then transforms this hierarchical session object into two Polars DataFrames:
+1.  **Protein Sequences**: Maps every hit in every cluster to its specific genomic coordinates.
+2.  **Nucleotide Sequences**: Maps clusters to their scaffold/contig boundaries.
+
+Filtering is applied at the DataFrame level using criteria such as `score_threshold`, `organisms` (via regex), and specific `scaffolds` [cfoldseeker/extract_sequences.py:230-245]().
+
+#### Parallel Extraction with thread_map
+To handle large datasets efficiently, the extraction process is parallelized using `tqdm.contrib.concurrent.thread_map` [cfoldseeker/extract_sequences.py:314-345](). This function distributes the extraction of individual clusters across multiple CPU cores (defined by the `--cores` argument). 
+
+Inside each thread:
+1.  The tool identifies the source GenBank file in the provided directory that matches the hit's `filelabel` [cfoldseeker/extract_sequences.py:321-332]().
+2.  It calls `cblaster.extract_clusters.cluster_to_record()` to slice the genomic region [cfoldseeker/extract_sequences.py:334-335]().
+
+#### BigScape Flavour Support
+If the `--flavour bigscape` flag is used, the script modifies the extracted GenBank records to ensure compatibility with the BigScape pipeline. This includes:
+*   Ensuring the `description` field is populated [cfoldseeker/extract_sequences.py:341]().
+*   Standardizing the `source` and `organism` fields [cfoldseeker/extract_sequences.py:342-343]().
+
+Sources: `cfoldseeker/extract_sequences.py:72-73` [], `cfoldseeker/extract_sequences.py:337-343` []
+
+---
+
+### Code Entity Space Mapping
+
+The following diagrams bridge the gap between user-facing concepts and the specific Python entities in the codebase.
+
+#### Data Entity Mapping
+"Mapping of Search Concepts to Code Entities"
+```mermaid
+classDiagram
+    class "Session Object" as Session {
+        +load(path)
+        +clusters: List[Cluster]
+    }
+    class "Polars DataFrame" as DF {
+        +locate_protein_sequences()
+        +locate_nucleotide_sequences()
+    }
+    class "Extraction Logic" as Extract {
+        +thread_map()
+        +cluster_to_record()
+    }
+
+    Session --|> DF : convert_session()
+    DF --|> Extract : feeds cluster metadata
+```
+Sources: `cfoldseeker/extract_sequences.py:12-13` [], `cfoldseeker/extract_sequences.py:206-218` []
+
+#### Functional Pipeline Mapping
+"CLI Execution to Internal Functions"
+```mermaid
+graph LR
+    CLI["cfoldseeker-seqs CLI"] --> P["create_parser()"]
+    P --> V["parse_and_validate_arguments()"]
+    V --> M["main()"]
+    
+    subgraph "Internal Logic"
+        M --> CS["convert_session()"]
+        CS --> LP["locate_protein_sequences()"]
+        LP --> TM["thread_map()"]
+    end
+```
+Sources: `cfoldseeker/extract_sequences.py:27-87` [], `cfoldseeker/extract_sequences.py:121-166` [], `cfoldseeker/extract_sequences.py:202-355` []
+
+---
+
+### Command Line Interface Reference
+
+The `create_parser()` function defines the following key argument groups:
+
+| Group | Argument | Description |
+| :--- | :--- | :--- |
+| **General** | `-c`, `--cores` | Number of parallel workers for extraction. |
+| | `-f`, `--force` | Overwrite existing output directories. |
+| **I/O** | `-s`, `--session` | Path to the `cfoldseeker` `session.json`. |
+| | `-gb`, `--genbanks` | Path to the folder containing source `.gbk`/`.gbff` files. |
+| | `--flavour` | Output format: `genbank` (standard) or `bigscape`. |
+| **Filters** | `--score-threshold` | Minimum cluster score to extract. |
+| | `--organisms` | Regex list to filter by taxon name. |
+
+Sources: `cfoldseeker/extract_sequences.py:52-85` []
+
+#### Usage Example
+To extract clusters from a session with a score higher than 10.0 using 4 cores:
+```bash
+cfoldseeker-seqs -s results/session.json -gb ./data/genbanks -o ./extracted_clusters -c 4 --score-threshold 10.0
+```
+Sources: `docs/guide/usage.rst:147-151` []
+
+---
+
+# Page: Output Formats and Downstream Integration
+
+# Output Formats and Downstream Integration
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [cfoldseeker/classes.py](cfoldseeker/classes.py)
+- [example/cfoldseeker_search/binary.txt](example/cfoldseeker_search/binary.txt)
+- [example/cfoldseeker_search/clusters.tsv](example/cfoldseeker_search/clusters.tsv)
+- [example/cfoldseeker_search/foldseek_result.txt](example/cfoldseeker_search/foldseek_result.txt)
+- [example/cfoldseeker_search/hits.tsv](example/cfoldseeker_search/hits.tsv)
+- [example/cfoldseeker_search/session.json](example/cfoldseeker_search/session.json)
+- [example/cfoldseeker_search/summary.txt](example/cfoldseeker_search/summary.txt)
+
+</details>
+
+
+
+This page serves as a technical reference for the various output artefacts generated by `cfoldseeker`. It describes the file structures, data content, and how these files facilitate downstream analysis using tools like `cblaster` and `clinker`.
+
+## Overview of Output Artefacts
+
+`cfoldseeker` produces a suite of files designed for both human readability and programmatic consumption. The workflow culminates in the `generate_output()` method of the `Search` base class, which orchestrates the writing of TSV, JSON, and text summaries [cfoldseeker/classes.py:581-628]().
+
+### Core Result Files
+
+| File | Format | Description |
+| :--- | :--- | :--- |
+| `hits.tsv` | TSV | Comprehensive list of all structural hits passing filters, including genomic coordinates. |
+| `clusters.tsv` | TSV | Identified Biosynthetic Gene Clusters (BGCs) based on hit proximity. |
+| `session.json` | JSON | A `cblaster`-compatible session file containing all search metadata and results. |
+| `binary.txt` | TSV | A presence/absence matrix of query proteins across identified genomic loci. |
+| `summary.txt` | Text | A human-readable summary of hits organized by organism and scaffold. |
+| `foldseek_result.txt` | TSV | The raw output from the FoldSeek binary (Local modes) or API (Remote). |
+
+Sources: [cfoldseeker/classes.py:581-628](), [example/cfoldseeker_search/hits.tsv:1-4](), [example/cfoldseeker_search/binary.txt:1-2]()
+
+---
+
+## Data Structures and TSV Formats
+
+### Hits Table (`hits.tsv`)
+The `hits.tsv` file is generated by converting `Hit` objects into dictionaries via `Hit.as_dict()` [cfoldseeker/classes.py:102-126](). It provides the primary link between structural similarity and genomic context.
+
+*   **Genomic Coordinates**: Stored as `start..end` pairs. For multi-exon genes, these are comma-separated (e.g., `100..200,300..400`) [cfoldseeker/classes.py:125]().
+*   **Cross-referencing**: The `crossref_method` column indicates how the structural hit was mapped to a genomic locus (e.g., `KEGG`, `GenPept`, or `local`) [cfoldseeker/classes.py:80]().
+
+### Clusters Table (`clusters.tsv`)
+This file summarizes the clusters identified using `identify_clusters()` [cfoldseeker/classes.py:488-579]().
+*   **Score**: The cumulative FoldSeek bitscore of all hits within the cluster.
+*   **Intergenic Distance**: Clusters are formed if hits are within a user-defined `max_interspecific` distance (default 20kbp) [cfoldseeker/classes.py:504]().
+
+### Binary Matrix (`binary.txt`)
+The binary matrix provides a high-level view of hit distribution.
+*   **Rows**: Represent unique genomic loci (Organism + Scaffold + Coordinates).
+*   **Columns**: Represent Query proteins.
+*   **Values**: `0` (absent), `1` (present), or `>1` (multiple hits for that query in the locus) [example/cfoldseeker_search/binary.txt:1-5]().
+
+Sources: [cfoldseeker/classes.py:21-46](), [cfoldseeker/classes.py:102-126](), [cfoldseeker/classes.py:488-579]()
+
+---
+
+## The Session File and cblaster Integration
+
+The `session.json` file is the primary vehicle for downstream integration. It implements the `cblaster.classes.Session` schema, allowing `cfoldseeker` results to be treated as native `cblaster` outputs.
+
+### Session Construction Lifecycle
+
+The following diagram illustrates how internal `Hit` and `Cluster` objects are transformed into a `cblaster` Session.
+
+**Diagram: Session Object Assembly**
+```mermaid
+graph TD
+    subgraph "cfoldseeker Data Space"
+        H["Hit Objects"]
+        C["Cluster Objects"]
+    end
+
+    subgraph "cblaster Integration Logic"
+        TO_CBL["Search._to_cblaster()"]
+        GEN_SESS["Session()"]
+    end
+
+    subgraph "Output Files"
+        SJ["session.json"]
+    end
+
+    H --> TO_CBL
+    C --> TO_CBL
+    TO_CBL --> GEN_SESS
+    GEN_SESS --> SJ
+    
+    style H fill:none,stroke-width:2px
+    style C fill:none,stroke-width:2px
+    style TO_CBL fill:none,stroke-dasharray: 5 5
+    style GEN_SESS fill:none,stroke-width:2px
+```
+
+### Visualisation with cblaster
+Because `cfoldseeker` produces a standard `cblaster` session, users can immediately generate plots:
+1.  **Cluster Plot**: `cblaster plot session.json` invokes `cblaster.plot.plot_session` [cfoldseeker/classes.py:14]().
+2.  **Heatmap**: The binary matrix data is embedded in the session for generating `cblaster` heatmaps.
+
+Sources: [cfoldseeker/classes.py:13-15](), [cfoldseeker/classes.py:614-616](), [cfoldseeker/classes.py:642-658]()
+
+---
+
+## Downstream Extraction and clinker
+
+`cfoldseeker` provides a dedicated utility, `cfoldseeker-seqs` (implemented in `extract_sequences.py`), to bridge structural hits to sequence-based comparative genomics.
+
+### Sequence Extraction Pipeline
+The `SequenceExtractor` class handles the retrieval of nucleotide or protein sequences for identified clusters [cfoldseeker/extract_sequences.py:34-45]().
+
+**Diagram: Sequence Extraction and clinker Flow**
+```mermaid
+graph LR
+    subgraph "Input"
+        SESS["session.json"]
+        GBK["GenBank/Local CDS DB"]
+    end
+
+    subgraph "extract_sequences.py"
+        EX_FUNC["extract_clusters()"]
+        CONV["convert_session()"]
+    end
+
+    subgraph "Downstream"
+        FASTA["Fasta Files"]
+        CLINK["clinker HTML"]
+    end
+
+    SESS --> CONV
+    CONV --> EX_FUNC
+    GBK --> EX_FUNC
+    EX_FUNC --> FASTA
+    EX_FUNC --> CLINK
+    
+    style EX_FUNC fill:none,stroke-width:2px
+    style CONV fill:none,stroke-width:2px
+    style CLINK fill:none,stroke-dasharray: 5 5
+```
+
+### clinker Integration
+By passing the `--clinker` flag to `cfoldseeker-seqs`, the tool generates a `clinker` visualization.
+*   The tool creates a temporary directory of GenBank files for each cluster [cfoldseeker/extract_sequences.py:466-480]().
+*   It then invokes `clinker` to perform all-vs-all sequence alignments and produce an interactive HTML plot [cfoldseeker/extract_sequences.py:514]().
+
+Sources: [cfoldseeker/extract_sequences.py:34-45](), [cfoldseeker/extract_sequences.py:466-480](), [cfoldseeker/extract_sequences.py:514]()
+
+---
+
+## Summary of Implementation Logic
+
+The output generation is centralized in the `Search` base class to ensure consistency across Remote and Local modes.
+
+*   **Graph-based Clustering**: `identify_clusters` uses `networkx.Graph` to find connected components of hits [cfoldseeker/classes.py:526-532]().
+*   **Filtering**: Final output is subject to `min_identity`, `min_coverage`, and `require` (must-have query) filters [cfoldseeker/classes.py:408-417]().
+*   **Polars Integration**: Local search results are processed as `LazyFrames` for performance before being materialized into the final `hits.tsv` [cfoldseeker/local.py:175-195]().
+
+Sources: [cfoldseeker/classes.py:526-532](), [cfoldseeker/classes.py:408-417](), [cfoldseeker/local.py:175-195]()
+
+---
+
+# Page: Deployment and Distribution
+
+# Deployment and Distribution
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.readthedocs.yaml](.readthedocs.yaml)
+- [bioconda_recipe/meta.yaml](bioconda_recipe/meta.yaml)
+- [docker/Dockerfile](docker/Dockerfile)
+- [docs/Makefile](docs/Makefile)
+- [docs/api_ref.rst](docs/api_ref.rst)
+- [docs/conf.py](docs/conf.py)
+- [docs/make.bat](docs/make.bat)
+- [env.yml](env.yml)
+- [pyproject.toml](pyproject.toml)
+
+</details>
+
+
+
+The `cfoldseeker` project utilizes modern Python packaging standards and bioinformatics-specific distribution channels to ensure reproducibility and ease of use across different computing environments. This page provides a high-level overview of how the codebase is packaged, distributed via Bioconda, containerized with Docker, and documented using Sphinx on ReadTheDocs.
+
+The deployment infrastructure is designed to handle both Python-level dependencies and binary requirements, such as the `foldseek` executable, which is critical for local search operations.
+
+### Deployment Architecture and Code Map
+
+The following diagram bridges the high-level distribution concepts to the specific files in the repository that manage them.
+
+**Distribution Entity Mapping**
+```mermaid
+graph TD
+    subgraph "Python Packaging"
+        A["pyproject.toml"] -- "Defines" --> B["setuptools build"]
+        A -- "Exposes" --> C["cfoldseeker CLI"]
+        A -- "Exposes" --> D["cfoldseeker-cds CLI"]
+        A -- "Exposes" --> E["cfoldseeker-seqs CLI"]
+    end
+
+    subgraph "Conda/Bioconda"
+        F["bioconda_recipe/meta.yaml"] -- "Wraps" --> A
+        G["env.yml"] -- "Mirrors" --> F
+    end
+
+    subgraph "Containerization"
+        H["docker/Dockerfile"] -- "Installs" --> F
+    end
+
+    subgraph "Documentation"
+        I[".readthedocs.yaml"] -- "Builds" --> J["Sphinx Documentation"]
+        J -- "Configured by" --> K["docs/conf.py"]
+        J -- "Automates" --> L["docs/api_ref.rst"]
+    end
+
+    [cfoldseeker.main:main] -.-> C
+    [cfoldseeker.build_cds_db:main] -.-> D
+    [cfoldseeker.extract_sequences:main] -.-> E
+```
+**Sources:** [pyproject.toml:46-49](), [bioconda_recipe/meta.yaml:15-18](), [docker/Dockerfile:10-11](), [.readthedocs.yaml:26-27]()
+
+---
+
+## Python Packaging and Conda Distribution
+
+The core of `cfoldseeker` is packaged as a standard Python library using `setuptools` as the build backend [pyproject.toml:1-3](). The package defines its metadata, including supported Python versions (>=3.12) and mandatory dependencies such as `polars`, `biopython`, and `cblaster` [pyproject.toml:24-38](). 
+
+Key aspects of distribution include:
+*   **Entry Points:** The package registers three primary command-line interfaces: `cfoldseeker`, `cfoldseeker-cds`, and `cfoldseeker-seqs` [pyproject.toml:46-49]().
+*   **Bioconda Recipe:** To manage non-Python dependencies like the `foldseek` binary, a Bioconda recipe is provided. This recipe ensures that `foldseek` is available in the environment [bioconda_recipe/meta.yaml:33-33]().
+*   **Noarch Strategy:** The Bioconda build uses `noarch: python`, signifying that the Python code itself is architecture-independent, while the environment management handles the architecture-specific binaries [bioconda_recipe/meta.yaml:14-14]().
+
+For details on dependency resolution, build scripts, and the Conda environment configuration, see [Python Packaging and Conda Distribution](#7.1).
+
+**Sources:** [pyproject.toml:1-52](), [bioconda_recipe/meta.yaml:1-54](), [env.yml:1-15]()
+
+---
+
+## Docker and Documentation Infrastructure
+
+To ensure a "plug-and-play" experience and consistent documentation, the project maintains a Dockerfile and a Sphinx-based documentation suite.
+
+### Containerization
+The `Dockerfile` provides a minimal runtime environment based on `miniconda`. It automates the installation of `cfoldseeker` via the Bioconda channel, ensuring that all structural search dependencies are pre-configured [docker/Dockerfile:1-11](). This is particularly useful for HPC environments where users may not have permission to manage local Conda environments.
+
+### Documentation Lifecycle
+Documentation is generated from the source code docstrings using the Sphinx `autodoc` extension [docs/conf.py:22-22](). The build process is integrated with ReadTheDocs via a configuration file that specifies the build environment and requirements [ .readthedocs.yaml:1-35]().
+
+**Documentation Build Flow**
+```mermaid
+graph LR
+    subgraph "Local Dev"
+        M["docs/Makefile"] -- "Triggers" --> N["sphinx-build"]
+    end
+
+    subgraph "ReadTheDocs"
+        O[".readthedocs.yaml"] -- "Sets OS/Python" --> P["mambaforge"]
+        P -- "Installs" --> Q["env.yml"]
+        Q -- "Builds HTML" --> R["Public Wiki/API Ref"]
+    end
+
+    N -- "Uses" --> S["docs/conf.py"]
+    S -- "Scans" --> T["cfoldseeker/*.py"]
+```
+**Sources:** [docs/Makefile:7-13](), [.readthedocs.yaml:8-16](), [docs/conf.py:7-8]()
+
+For details on the Docker volume-mapping patterns and how to build or extend the Sphinx API reference locally, see [Docker and Documentation Infrastructure](#7.2).
+
+**Sources:** [docker/Dockerfile:1-11](), [docs/api_ref.rst:1-74](), [docs/conf.py:1-33](), [.readthedocs.yaml:1-34]()
+
+---
+
+# Page: Python Packaging and Conda Distribution
+
+# Python Packaging and Conda Distribution
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [bioconda_recipe/meta.yaml](bioconda_recipe/meta.yaml)
+- [env.yml](env.yml)
+- [pyproject.toml](pyproject.toml)
+
+</details>
+
+
+
+This page details the configuration and strategies used to package, distribute, and manage dependencies for `cfoldseeker`. The project utilizes a modern Python packaging workflow centered around `pyproject.toml` and leverages the Bioconda ecosystem to handle complex bioinformatics binary dependencies.
+
+## Build System and Metadata
+
+`cfoldseeker` uses `setuptools` as its build backend, as defined in the `[build-system]` table of the configuration [pyproject.toml:1-3](). The project metadata specifies a minimum Python version of `3.12.0` [pyproject.toml:38-38]() and categorizes the tool under Science/Research and Bio-Informatics [pyproject.toml:21-22]().
+
+### Entry Points
+The package registers three distinct CLI commands through the `[project.scripts]` table. These map user-facing commands to specific `main` functions within the codebase:
+
+| Command | Module Path | Function |
+| :--- | :--- | :--- |
+| `cfoldseeker` | `cfoldseeker.main` | `main` |
+| `cfoldseeker-cds` | `cfoldseeker.build_cds_db` | `main` |
+| `cfoldseeker-seqs` | `cfoldseeker.extract_sequences` | `main` |
+
+**Sources:** [pyproject.toml:46-49]()
+
+## Dependency Management
+
+The project distinguishes between core runtime dependencies, optional documentation dependencies, and environment-level binary dependencies.
+
+### Python Dependencies
+Core dependencies are managed in `pyproject.toml` and include high-performance data handling (`polars`), graph theory for cluster identification (`networkx`), and bioinformatics utilities (`biopython`, `cblaster`, `kegg-pull`) [pyproject.toml:24-32](). 
+
+Optional dependencies for building the Sphinx-based documentation are grouped under the `doc` extra [pyproject.toml:40-44]().
+
+### Binary Dependencies
+While Python-specific dependencies are handled by `pip`, the `foldseek` binary is a critical requirement for local search modes. To ensure this is available, `cfoldseeker` is distributed via Conda/Bioconda, which manages the non-Python binary alongside the Python environment [env.yml:10-10]().
+
+### Dependency Mapping Diagram
+
+The following diagram illustrates how abstract requirements in the Natural Language Space map to specific Code Entities and package definitions.
+
+**Requirement to Entity Mapping**
+```mermaid
+graph TD
+    subgraph "Natural Language Space"
+        R1["Structure Alignment"]
+        R2["Genomic Context Analysis"]
+        R3["Data Processing"]
+        R4["Documentation"]
+    end
+
+    subgraph "Code Entity Space"
+        E1["foldseek (Binary)"]
+        E2["cblaster (Package)"]
+        E3["polars (Package)"]
+        E4["sphinx (Package)"]
+    end
+
+    subgraph "Distribution Definitions"
+        D1["env.yml"]
+        D2["pyproject.toml [project.dependencies]"]
+        D3["pyproject.toml [project.optional-dependencies]"]
+    end
+
+    R1 --> E1
+    R2 --> E2
+    R3 --> E3
+    R4 --> E4
+
+    E1 --> D1
+    E2 --> D2
+    E3 --> D2
+    E4 --> D3
+```
+**Sources:** [pyproject.toml:24-32](), [pyproject.toml:40-44](), [env.yml:5-15]()
+
+## Bioconda Distribution
+
+The Bioconda recipe (defined in `meta.yaml`) enables the installation of `cfoldseeker` and all its dependencies (including the `foldseek` binary) with a single command.
+
+### The `noarch: python` Strategy
+The recipe uses the `noarch: python` build strategy [bioconda_recipe/meta.yaml:14-14](). This indicates that the Python package itself does not contain compiled C/C++ extensions and can be installed on any architecture (macOS, Linux, Windows) using a single package build. However, the `run` requirements include `foldseek` [bioconda_recipe/meta.yaml:33-33](), which ensures that the architecture-specific `foldseek` binary is pulled into the environment during installation.
+
+### Build and Test Lifecycle
+1.  **Source**: The recipe pulls the source tarball from PyPI [bioconda_recipe/meta.yaml:8-10]().
+2.  **Host Requirements**: Includes `python`, `pip`, and `setuptools` to build the wheel [bioconda_recipe/meta.yaml:24-27]().
+3.  **Script**: Executes a standard `pip install` without build isolation [bioconda_recipe/meta.yaml:19-19]().
+4.  **Test**: A basic smoke test is performed by running `cfoldseeker -h` to verify the entry point and dependency resolution [bioconda_recipe/meta.yaml:39-41]().
+
+**Sources:** [bioconda_recipe/meta.yaml:1-54]()
+
+## Environment Specification
+
+For developers or users building from source, `env.yml` provides the canonical environment definition. It combines the Bioconda and Conda-Forge channels to resolve all necessary components.
+
+**Environment Component Flow**
+```mermaid
+graph LR
+    subgraph "Channels"
+        C1["bioconda"]
+        C2["conda-forge"]
+    end
+
+    subgraph "Environment: cfoldseeker"
+        P1["python >=3.12"]
+        P2["foldseek"]
+        P3["cblaster >=1.4.0"]
+        P4["polars >=1.0.0"]
+        P5["kegg_pull"]
+    end
+
+    C1 --> P2
+    C1 --> P3
+    C1 --> P5
+    C2 --> P1
+    C2 --> P4
+```
+**Sources:** [env.yml:1-15]()
+
+## Packaging Metadata Summary
+
+| Feature | Implementation |
+| :--- | :--- |
+| **Build Backend** | `setuptools.build_meta` [pyproject.toml:3-3]() |
+| **Python Requirement** | `>=3.12.0` [pyproject.toml:38-38]() |
+| **Main Entry Point** | `cfoldseeker.main:main` [pyproject.toml:47-47]() |
+| **Data Engine** | `polars >=1.0.0` [pyproject.toml:28-28]() |
+| **License** | MIT [pyproject.toml:36-36]() |
+| **Conda Build** | `noarch: python` [bioconda_recipe/meta.yaml:14-14]() |
+
+**Sources:** [pyproject.toml:1-52](), [bioconda_recipe/meta.yaml:1-54]()
+
+---
+
+# Page: Docker and Documentation Infrastructure
+
+# Docker and Documentation Infrastructure
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [.readthedocs.yaml](.readthedocs.yaml)
+- [docker/Dockerfile](docker/Dockerfile)
+- [docs/Makefile](docs/Makefile)
+- [docs/api_ref.rst](docs/api_ref.rst)
+- [docs/conf.py](docs/conf.py)
+- [docs/guide/index.rst](docs/guide/index.rst)
+- [docs/make.bat](docs/make.bat)
+
+</details>
+
+
+
+This page documents the containerization and documentation lifecycle of `cfoldseeker`. It covers the configuration of the Docker image for reproducible runs, the volume-mapping patterns required for local search modes, and the Sphinx-based documentation infrastructure that powers the official API reference and user guides.
+
+## Docker Infrastructure
+
+The `cfoldseeker` Docker image provides a pre-configured environment containing all necessary binary dependencies (such as FoldSeek) and the Python runtime environment.
+
+### Dockerfile Implementation
+The image is built on a Miniconda base and installs `cfoldseeker` via the Bioconda channel to ensure all system-level dependencies are correctly resolved [docker/Dockerfile:1-11]().
+
+| Layer | Purpose | Code Reference |
+| :--- | :--- | :--- |
+| **Base Image** | `vanallenlab/miniconda:3.12` | [docker/Dockerfile:1]() |
+| **Package Manager** | Installs via `bioconda` and `conda-forge` | [docker/Dockerfile:10]() |
+| **Environment** | Updates `PATH` to include the `cfoldseeker` environment | [docker/Dockerfile:11]() |
+
+### Containerized Execution Flow
+When running `cfoldseeker` in a container, users must map local directories to the container to provide input structures and retrieve output sessions.
+
+**System Architecture: Containerized Run**
+```mermaid
+graph TD
+    subgraph "Host System"
+        InputPDBs["Query PDB Files"]
+        LocalDB["Local CDS/Structure DB"]
+        ResultsDir["Output Directory"]
+    end
+
+    subgraph "Docker Container (lucodevro/cfoldseeker)"
+        CfoldMain["cfoldseeker/main.py"]
+        FoldSeekBin["foldseek binary"]
+        CfoldCDS["cfoldseeker-cds"]
+    end
+
+    InputPDBs -- "v-mount" --> CfoldMain
+    LocalDB -- "v-mount" --> CfoldMain
+    CfoldMain -- "exec" --> FoldSeekBin
+    CfoldMain -- "write" --> ResultsDir
+```
+*Sources: [docker/Dockerfile:1-11](), [docs/guide/index.rst:11-12]()*
+
+---
+
+## Documentation Infrastructure
+
+The `cfoldseeker` documentation is built using Sphinx and hosted on ReadTheDocs. It integrates handwritten guides with automated API references generated from the source code docstrings.
+
+### Sphinx Configuration (`conf.py`)
+The configuration enables several key extensions to bridge the gap between natural language documentation and the Python codebase:
+*   `sphinx.ext.napoleon`: Parses Google/NumPy style docstrings.
+*   `sphinx.ext.autodoc`: Automatically pulls documentation from code entities.
+*   `sphinx.ext.viewcode`: Adds links to the source code for each documented function/class.
+
+The documentation system prepends the root directory to `sys.path` to ensure the `cfoldseeker` package is importable during the build process [docs/conf.py:6-8]().
+
+### API Reference Mapping
+The `docs/api_ref.rst` file acts as the bridge between the documentation structure and the actual Python modules.
+
+**Entity Mapping: Documentation to Code**
+```mermaid
+graph LR
+    subgraph "docs/api_ref.rst"
+        RefMain["main"]
+        RefClasses["classes"]
+        RefRemote["remote"]
+        RefLocal["local"]
+        RefBuild["build_cds_db"]
+    end
+
+    subgraph "cfoldseeker Source"
+        ModMain["cfoldseeker.main"]
+        ModClasses["cfoldseeker.classes"]
+        ModRemote["cfoldseeker.remote"]
+        ModLocal["cfoldseeker.local"]
+        ModBuild["cfoldseeker.build_cds_db"]
+    end
+
+    RefMain -- "automodule" --> ModMain
+    RefClasses -- "automodule" --> ModClasses
+    RefRemote -- "automodule" --> ModRemote
+    RefLocal -- "automodule" --> ModLocal
+    RefBuild -- "automodule" --> ModBuild
+```
+*Sources: [docs/api_ref.rst:1-74](), [docs/conf.py:22-22]()*
+
+### Build Automation
+The project supports both local and remote builds:
+
+1.  **Local Builds**: Users can generate HTML documentation using the provided `Makefile` or `make.bat` [docs/Makefile:1-20](), [docs/make.bat:1-35]().
+    *   Command: `make html` (Linux/macOS) or `.\make.bat html` (Windows).
+2.  **ReadTheDocs (RTD)**: The `.readthedocs.yaml` file defines the remote build environment. It uses `mambaforge` to handle the `env.yml` environment file, ensuring that all dependencies required for `autodoc` are present [ .readthedocs.yaml:8-15]().
+
+| Component | File Path | Role |
+| :--- | :--- | :--- |
+| **RTD Config** | `.readthedocs.yaml` | Defines OS (Ubuntu 24.04) and Python environment [ .readthedocs.yaml:9-11]() |
+| **Sphinx Config** | `docs/conf.py` | Sets theme (`sphinx_rtd_theme`) and versioning [docs/conf.py:13-32]() |
+| **Entry Point** | `docs/guide/index.rst` | Main landing page explaining tool purpose [docs/guide/index.rst:1-15]() |
+| **API Map** | `docs/api_ref.rst` | Defines the `automodule` directives for the whole package [docs/api_ref.rst:1-74]() |
+
+*Sources: [docs/conf.py:1-33](), [.readthedocs.yaml:1-34](), [docs/Makefile:1-20](), [docs/api_ref.rst:1-74]()*
+
+---
+
+# Page: Glossary
+
+# Glossary
+
+<details>
+<summary>Relevant source files</summary>
+
+The following files were used as context for generating this wiki page:
+
+- [LICENSE](LICENSE)
+- [README.md](README.md)
+- [cfoldseeker/__init__.py](cfoldseeker/__init__.py)
+- [cfoldseeker/build_cds_db.py](cfoldseeker/build_cds_db.py)
+- [cfoldseeker/classes.py](cfoldseeker/classes.py)
+- [cfoldseeker/communication.py](cfoldseeker/communication.py)
+- [cfoldseeker/extract_sequences.py](cfoldseeker/extract_sequences.py)
+- [cfoldseeker/local.py](cfoldseeker/local.py)
+- [cfoldseeker/local_clustered.py](cfoldseeker/local_clustered.py)
+- [cfoldseeker/main.py](cfoldseeker/main.py)
+- [cfoldseeker/remote.py](cfoldseeker/remote.py)
+- [cfoldseeker/remote_parsers.py](cfoldseeker/remote_parsers.py)
+- [docs/guide/usage.rst](docs/guide/usage.rst)
+
+</details>
+
+
+
+This page provides definitions for codebase-specific terms, bioinformatics jargon, and domain concepts used within the `cfoldseeker` project. It serves as a reference for onboarding engineers to understand the implementation details and data structures.
+
+## Core Concepts
+
+### Hit
+A `Hit` represents a single protein structure match identified by FoldSeek. It is the primary data unit used to bridge structural similarity with genomic context.
+*   **Implementation**: Defined as the `Hit` class in `cfoldseeker/classes.py`.
+*   **Key Attributes**: Includes `db_id` (database identifier), `query` (the query protein it matched), structural metrics (`evalue`, `score`, `seqid`, `qcov`, `tcov`), and genomic metadata (`scaff`, `coords`, `strand`).
+*   **Sources**: [cfoldseeker/classes.py:21-96](), [cfoldseeker/classes.py:102-126]()
+
+### Cluster
+A `Cluster` is a group of `Hit` objects that are genomically colocalised (physically close to each other on a scaffold).
+*   **Implementation**: Defined as the `Cluster` class in `cfoldseeker/classes.py`.
+*   **Logic**: Clusters are identified using a graph-based approach where hits are nodes, and edges are drawn between hits on the same scaffold if their intergenic distance is below `max_gap`.
+*   **Sources**: [cfoldseeker/classes.py:165-217](), [cfoldseeker/classes.py:657-695]()
+
+### Search Lifecycle
+The abstract base class `Search` defines the workflow for all search modes (Remote, Local, Local-Clustered).
+*   **Data Flow**: `run_foldseek()` (Search) -> `identify_hits()` (Parse results) -> `identify_clusters()` (Graph clustering) -> `generate_output()` (Serialization).
+*   **Sources**: [cfoldseeker/classes.py:389-445](), [cfoldseeker/classes.py:560-575]()
+
+## Bioinformatics Jargon & Domain Terms
+
+| Term | Definition | Code Pointer |
+| :--- | :--- | :--- |
+| **3Di Alphabet** | FoldSeek's internal 3-dimensional interaction alphabet used to represent protein tertiary structures as sequences. | [docs/guide/usage.rst:81-84]() |
+| **AFDB** | AlphaFold Database. `cfoldseeker` supports remote searches against `afdb50`, `afdb-proteome`, and `afdb-swissprot`. | [cfoldseeker/main.py:90-91]() |
+| **CDS Database** | A local TSV/CSV file containing genomic coordinates for Coding Sequences, typically generated by `cfoldseeker-cds`. | [cfoldseeker/build_cds_db.py:52-54]() |
+| **Cross-referencing** | The process of mapping a structural hit (e.g., UniProt ID) to a genomic scaffold and coordinate set via external APIs (KEGG, ENA, UniSave). | [cfoldseeker/remote.py:34-36]() |
+| **Intergenic Gap** | The distance in base pairs between two genes. Controlled by the `--max-gap` parameter. | [cfoldseeker/main.py:82-82]() |
+| **ProstT5** | A protein language model used by FoldSeek to predict 3Di sequences from amino acid sequences without full folding. | [docs/guide/usage.rst:81-84]() |
+| **Scaffold** | A contiguous genomic sequence (e.g., a chromosome, contig, or plasmid). | [cfoldseeker/classes.py:93-93]() |
+
+## Code Architecture Mapping
+
+### Natural Language to Code Entity Space: Search Execution
+The following diagram maps the high-level search concepts to the specific Python classes and functions that execute them.
+
+**Search Execution Mapping**
+```mermaid
+graph TD
+    subgraph "Natural Language Space"
+        UserCmd["'cfoldseeker --mode local'"]
+        SearchLogic["Search Execution"]
+        FoldSeekRun["Run FoldSeek Binary"]
+        ResultParse["Parse TSV Results"]
+    end
+
+    subgraph "Code Entity Space"
+        Main["cfoldseeker/main.py: run_workflow()"]
+        LocalSearch["cfoldseeker/local.py: LocalSearch"]
+        RunFS["LocalSearch.run_foldseek()"]
+        ParseFS["LocalSearch.parse_foldseek_results()"]
+    end
+
+    UserCmd --> Main
+    Main --> LocalSearch
+    SearchLogic --> LocalSearch
+    FoldSeekRun --> RunFS
+    ResultParse --> ParseFS
+```
+*   **Sources**: [cfoldseeker/main.py:192-212](), [cfoldseeker/local.py:47-62](), [cfoldseeker/local.py:107-151]()
+
+### Data Entity Mapping: Structural Hit to Genomic Context
+This diagram illustrates how a structural hit is transformed into a genomic context via the `Hit` and `Cluster` objects.
+
+**Data Flow Mapping**
+```mermaid
+graph LR
+    subgraph "External/Data Space"
+        FS_Out["FoldSeek TSV/JSON"]
+        CDS_DB["CDS Coordinate DB"]
+    end
+
+    subgraph "Code Objects (classes.py)"
+        HitObj["Hit class"]
+        ClustObj["Cluster class"]
+        SessionObj["cblaster.classes.Session"]
+    end
+
+    FS_Out -- "Instantiates" --> HitObj
+    CDS_DB -- "Populates coords/scaff" --> HitObj
+    HitObj -- "Grouped into" --> ClustObj
+    ClustObj -- "Serialized to" --> SessionObj
+```
+*   **Sources**: [cfoldseeker/classes.py:21-46](), [cfoldseeker/classes.py:165-180](), [cfoldseeker/classes.py:734-750]()
+
+## Abbreviations
+
+*   **BGC**: Biosynthetic Gene Cluster.
+*   **ENA**: European Nucleotide Archive (source for GenPept/EMBL records). [cfoldseeker/communication.py:132-148]()
+*   **KEGG**: Kyoto Encyclopedia of Genes and Genomes. [cfoldseeker/remote_parsers.py:1-10]()
+*   **NCBI**: National Center for Biotechnology Information.
+*   **QRS**: Queries. Often used in `min_cov_qrs` (minimum queries required to cover a cluster). [cfoldseeker/main.py:85-85]()
+*   **TSV**: Tab-Separated Values.
+
+## Implementation Details
+
+### Graph-Based Clustering
+`cfoldseeker` uses the `networkx` library to identify clusters.
+1.  Hits are sorted by scaffold and start position.
+2.  Edges are created between hits if `distance <= max_gap`.
+3.  Connected components in the graph are identified as candidate clusters.
+4.  Candidates are filtered by `min_hits`, `min_cov_qrs`, and `max_length`.
+*   **Sources**: [cfoldseeker/classes.py:657-700]()
+
+### Coordinate Parsing
+Genomic coordinates are stored as a list of lists `[[start, end], ...]` to support multi-exon genes.
+*   **Implementation**: `Hit.start()` returns the minimum coordinate across all exons, and `Hit.end()` returns the maximum.
+*   **Sources**: [cfoldseeker/classes.py:130-160]()
+
+### Remote Cross-referencing Tiered Logic
+Remote mode attempts to find genomic coordinates in a specific order:
+1.  **UniProt Mapping Table**: Direct lookup using the provided `.gz` mapping file.
+2.  **KEGG API**: Fallback using `kegg_pull` for genes with KEGG identifiers.
+3.  **ENA Browser API**: Final fallback to retrieve EMBL records for GenPept accessions.
+*   **Sources**: [cfoldseeker/remote.py:34-36](), [cfoldseeker/remote.py:263-290]()

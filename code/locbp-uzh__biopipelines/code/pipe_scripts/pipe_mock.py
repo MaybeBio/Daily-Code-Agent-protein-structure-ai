@@ -1,0 +1,296 @@
+"""Runtime helper for the Mock tool.
+
+Reads mock_config.json and emits:
+  - empty files per ID for file-based streams
+  - a map_table CSV per stream (with provenance columns when available)
+  - tables with either auto-filled rows or explicit rows
+
+Handles lazy `children` patterns by applying each `produce` suffix to every
+parent ID at runtime. Drops IDs listed in `missing` (matches either expanded
+IDs or parents)."""
+
+import csv
+import json
+import os
+import sys
+
+
+def _is_lazy(value):
+    return isinstance(value, str) and "[" in value and "]" in value
+
+
+def _strip_brackets(value):
+    if not isinstance(value, str):
+        return value
+    out, depth = [], 0
+    for ch in value:
+        if ch == "[":
+            depth += 1
+            continue
+        if ch == "]":
+            depth = max(depth - 1, 0)
+            continue
+        if depth == 0:
+            out.append(ch)
+    return "".join(out)
+
+
+def _expand_range_or_set(pattern):
+    """Expand <a..b> or <A B C>. Returns list of strings."""
+    import re
+
+    m = re.search(r"<([^<>\[\]]+)>", pattern)
+    if not m:
+        return [pattern]
+    token = m.group(1)
+    pre, post = pattern[: m.start()], pattern[m.end():]
+
+    if ".." in token:
+        lo, hi = token.split("..")
+        parts = [str(i) for i in range(int(lo), int(hi) + 1)]
+    else:
+        parts = token.split()
+
+    out = []
+    for p in parts:
+        out.extend(_expand_range_or_set(f"{pre}{p}{post}"))
+    return out
+
+
+def _load_source_ids(source_json_path):
+    with open(source_json_path) as f:
+        data = json.load(f)
+    ids = data.get("ids", [])
+    map_table = data.get("map_table")
+    if map_table and os.path.exists(map_table):
+        with open(map_table) as mf:
+            rows = list(csv.DictReader(mf))
+        if rows:
+            return [r["id"] for r in rows]
+    return list(ids)
+
+
+def _cell(table_cfg, col):
+    fill = table_cfg.get("fill")
+    if isinstance(fill, dict):
+        return fill.get(col, "")
+    if fill is not None:
+        return fill
+    return ""
+
+
+def _resolve_parent_ids(cfg):
+    """Re-resolve parent IDs at runtime from source stream JSONs, if any.
+
+    For lazy upstream streams, this reads the runtime-populated map_table, picking up whatever the upstream tool actually wrote. Naming goes through the framework's composer so that what Mock produces is what it declared.
+
+    Returns ``(parent_ids, contributions)``, where each contribution records what every axis put into that id -- kept from composition because an id cannot be decomposed back by splitting on the separator.
+    """
+    sources = cfg.get("source_streams") or []
+    if not sources:
+        return list(cfg["parent_ids"]), []
+
+    sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from biopipelines.combinatorics import predict_single_output_id, predict_single_provenance
+
+    ids_by_position = [_load_source_ids(src["path"]) for src in sources]
+    ids_by_stream = {src["name"]: ids for src, ids in zip(sources, ids_by_position)}
+    axes = cfg.get("axes") or []
+    if not axes:
+        # Pre-axes configs: one stream is one iterated axis, in declared order.
+        axes = [{"name": src["name"], "mode": "each", "streams": [i]}
+                for i, src in enumerate(sources)]
+
+    def _ids_for(keys):
+        collected = []
+        for key in keys:
+            # Streams are recorded by index; a config written before that used the stream name.
+            collected.extend(ids_by_position[key] if isinstance(key, int)
+                             else ids_by_stream.get(key, []))
+        return collected
+
+    per_axis = []
+    for axis in axes:
+        axis_ids = _ids_for(axis.get("streams") or [axis["name"]])
+        static_ids = _ids_for(axis.get("static_streams") or [])
+        per_axis.append((axis["name"], axis.get("mode", "each"), axis_ids,
+                         static_ids, bool(axis.get("static_first"))))
+
+    # A bundled axis contributes one prefix however many ids it holds, so only iterated axes multiply.
+    iterated = [(name, ids) for name, mode, ids, _s, _f in per_axis if mode != "bundle"]
+    combinations = _index_combinations([len(ids) for _name, ids in iterated])
+    iterated_names = [name for name, _ in iterated]
+
+    out, contributions = [], []
+    for combination in combinations:
+        picked = dict(zip(iterated_names, combination))
+        selection = {}
+        for name, mode, ids, static_ids, static_first in per_axis:
+            idx = picked.get(name) if mode != "bundle" else None
+            selection[name] = (mode, ids, idx, static_ids, static_first)
+        out.append(predict_single_output_id(**selection))
+        # Recorded while composing rather than recovered by splitting the id afterwards: a bundled
+        # axis contributes several '+'-joined parts and is hoisted ahead of the iterated ones.
+        contributions.append(predict_single_provenance(**selection))
+    return out, contributions
+
+
+def _index_combinations(lengths):
+    """Row-major index tuples over the given per-axis lengths, left-to-right."""
+    combos = [()]
+    for length in lengths:
+        combos = [combo + (i,) for combo in combos for i in range(length)]
+    return combos
+
+
+def _apply_children(parent_ids, cfg):
+    """Expand parent IDs using cfg['children'] + cfg['produce']. Returns
+    (expanded_ids, parent_per_expanded_id)."""
+    children = cfg.get("children")
+    if not children:
+        return list(parent_ids), list(parent_ids)
+
+    if _is_lazy(children):
+        produce = cfg.get("produce") or []
+        expanded, parents_mapped = [], []
+        for pid in parent_ids:
+            for suffix in produce:
+                # lazy brackets were around the suffix (e.g. "[_<#><A V>]")
+                # so we just concatenate the produce entry.
+                expanded.append(f"{pid}{suffix}")
+                parents_mapped.append(pid)
+        return expanded, parents_mapped
+
+    # Deterministic pattern: expand and concatenate per parent.
+    suffixes = _expand_range_or_set(children)
+    expanded, parents_mapped = [], []
+    for pid in parent_ids:
+        for s in suffixes:
+            expanded.append(f"{pid}_{s}")
+            parents_mapped.append(pid)
+    return expanded, parents_mapped
+
+
+def _apply_missing(ids, parents_mapped, missing):
+    """Drop IDs whose value is in `missing` OR whose parent is in `missing`."""
+    if not missing:
+        return ids, parents_mapped
+    miss = set(missing)
+    keep_ids, keep_parents = [], []
+    for i, p in zip(ids, parents_mapped):
+        if i in miss or p in miss:
+            continue
+        keep_ids.append(i)
+        keep_parents.append(p)
+    return keep_ids, keep_parents
+
+
+def _provenance_from_contributions(contributions, axis_names):
+    """Per-axis provenance as recorded during composition, one row per parent id."""
+    return {axis: [row.get(axis, "") for row in contributions] for axis in axis_names}
+
+
+def main(config_path):
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    os.makedirs(cfg["output_folder"], exist_ok=True)
+
+    parent_ids, contributions = _resolve_parent_ids(cfg)
+    axis_names = list((cfg.get("provenance") or {}).keys()) or list(cfg.get("axis_names") or [])
+    if cfg.get("source_streams") and axis_names:
+        cfg["provenance"] = _provenance_from_contributions(contributions, axis_names)
+    else:
+        cfg["provenance"] = cfg.get("provenance") or {}
+    cfg["parent_ids"] = list(parent_ids)
+    expanded_ids, parents_mapped = _apply_children(parent_ids, cfg)
+    expanded_ids, parents_mapped = _apply_missing(
+        expanded_ids, parents_mapped, cfg.get("missing") or []
+    )
+
+    # Streams: files + map_tables
+    for name, spec in (cfg.get("streams") or {}).items():
+        template = spec.get("file")
+        values = spec.get("values")
+        map_path = spec.get("map_table")
+        # Per-stream folder set by the Mock config-time code. Older configs
+        # without this field fall back to joining at output_folder, which
+        # preserves the pre-refactor flat layout.
+        stream_folder = spec.get("stream_folder") or cfg["output_folder"]
+
+        if template:
+            os.makedirs(stream_folder, exist_ok=True)
+            for sid in expanded_ids:
+                path = os.path.join(stream_folder, template.replace("<id>", str(sid)))
+                os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+                open(path, "w").close()
+
+        if map_path:
+            os.makedirs(os.path.dirname(map_path) or ".", exist_ok=True)
+            with open(map_path, "w", newline="") as mf:
+                w = csv.writer(mf)
+                headers = ["id", "file", "value"]
+                # Axis-provenance columns from config time, if any. Provenance
+                # is indexed per parent (len == len(parent_ids)); when children
+                # fans out we look it up via the parent_ids index, not the
+                # expanded row index.
+                prov = cfg.get("provenance") or {}
+                parent_index = {pid: i for i, pid in enumerate(cfg["parent_ids"])}
+                axis_cols = [f"{axis}.id" for axis in prov.keys()]
+                # Always emit the parent-link column when children is set, so
+                # downstream tools can reconstruct the fan-out lineage. For
+                # passthrough (no children), parent == id so the column is
+                # redundant and omitted.
+                parent_axis = f"{name}.parent" if cfg.get("children") else None
+                if parent_axis is not None:
+                    axis_cols.append(parent_axis)
+                headers.extend(axis_cols)
+                w.writerow(headers)
+
+                for idx, sid in enumerate(expanded_ids):
+                    file_val = (
+                        os.path.join(stream_folder, template.replace("<id>", str(sid)))
+                        if template else ""
+                    )
+                    parent = parents_mapped[idx]
+                    pidx = parent_index.get(parent)
+                    # Values may be per-parent; if so, propagate the parent's value.
+                    if values is not None and pidx is not None:
+                        val = values[pidx]
+                    else:
+                        val = ""
+                    row = [sid, file_val, val]
+                    for axis in prov.keys():
+                        if pidx is not None and pidx < len(prov[axis]):
+                            row.append(prov[axis][pidx])
+                        else:
+                            row.append("")
+                    if parent_axis is not None:
+                        row.append(parent)
+                    w.writerow(row)
+
+    # Tables
+    for name, spec in (cfg.get("tables") or {}).items():
+        cols = spec["columns"]
+        rows = spec.get("rows")
+        os.makedirs(os.path.dirname(spec["path"]) or ".", exist_ok=True)
+        with open(spec["path"], "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(cols)
+            if rows is not None:
+                for row in rows:
+                    w.writerow(row)
+            else:
+                for sid in expanded_ids:
+                    row = [sid if c == "id" else _cell(spec, c) for c in cols]
+                    w.writerow(row)
+
+    print(
+        f"Mock: wrote {len(cfg.get('streams') or {})} stream(s) and "
+        f"{len(cfg.get('tables') or {})} table(s) for {len(expanded_ids)} "
+        f"ID(s) (from {len(parent_ids)} parent ID(s))"
+    )
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])

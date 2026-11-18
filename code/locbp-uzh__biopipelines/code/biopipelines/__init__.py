@@ -1,0 +1,294 @@
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+"""
+biopipelines Module
+
+Unified pipeline system for protein modeling workflows.
+Provides tool configurations, pipeline orchestration, and seamless integration.
+"""
+
+__version__ = "1.6.0"
+
+from .pipeline import Pipeline, Bundle, Each, Grouped, Folder, Resources, Suffix, Save, Dependencies, Parallel, Run, Service
+from .base_config import BaseConfig, ToolOutput, IndexedTableContainer
+from .combinatorics import Bundle, Each, Grouped, CombinatoricsConfig, generate_combinatorics_config, get_mode
+from .datastream import DataStream, create_map_table
+from .datastream_resolver import DataStreamResolver, resolve_to_datastream, resolve_input_to_datastream
+from .idset import IdSet, compose_axes
+from .file_paths import Path
+from .table_utils import get_table, get_table_path, list_tables, table_exists, get_indexed_table
+from .rfdiffusion import RFdiffusion
+from .rfdiffusion_allatom import RFdiffusionAllAtom, RFDAA_PrepareLigand
+from .rfdiffusion2 import RFdiffusion2
+from .rfdiffusion3 import RFdiffusion3
+from .rfd4proteina import RFD4Proteina
+from .flowr import FLOWR
+from .hbdesigner import HBDesigner
+from .protein_mpnn import ProteinMPNN, SolubleMPNN
+from .frame2seq import Frame2Seq
+from .alphafold import AlphaFold
+from .ligand import Ligand, Compound
+from .sequence import Sequence
+from .ligand_mpnn import LigandMPNN
+from .lasermpnn import LASErMPNN
+from .boltz2 import Boltz2
+from .boltzgen import BoltzGen, BoltzGenMerge
+from .compound_library import CompoundLibrary
+from .extract_metrics import ExtractMetrics
+from .folders import FolderManager
+from .conformational_change import ConformationalChange
+from .contacts import Contacts
+from .distance import Distance
+from .angle import Angle
+from .stitch_sequences import StitchSequences
+from .dna_encoder import DNAEncoder
+from .rbs_designer import RBSDesigner
+from .load import Load, LoadMultiple
+from .sequence_metric_correlation import SequenceMetricCorrelation
+from .pymol import PyMOL
+from .fuse import Fuse
+from .plot import Plot
+from .panda import Panda
+from .msa import MSA
+from .mmseqs2 import MMseqs2, MMseqs2Server
+from .remap import ReMap
+from .mock import Mock
+from .gnina import Gnina, Vina
+from .diffdock import DiffDock
+from .pocketgen import PocketGen
+from .placer import PLACER
+from .dynamicbind import DynamicBind
+from .neuralplexer import NeuralPLexer
+from .openfold3 import OpenFold3
+from .rf3 import RF3
+from .posebusters import PoseBusters
+from .admet_ai import ADMETAI
+from .aizynthfinder import AiZynthFinder
+from .reinvent4 import REINVENT4
+from .binding_data import BindingData
+from .embedding import Embedding
+from .esm2 import ESM2
+from .esmfold import ESMFold
+from .esmfold2 import ESMFold2
+from .uniprot import UniProt
+from .rdkit_descriptors import RDKit
+from .openbabel import OpenBabel
+from .plip import PLIP
+from .prodigy import Prodigy
+from .prolif import ProLIF
+from .protenix import Protenix
+from .fpocket import FPocket
+from .p2rank import P2Rank
+from .af2bind import AF2BIND
+from .dssp import DSSP
+from .apbs import APBS
+from .openmm import OpenMM
+from .reduce import Reduce
+from .xtb import XTB
+from .rtmscore import RTMScore
+from .gems import GEMS
+from .bioemu import BioEmu
+from .bioemu2 import BioEmu2
+from .cabsflex import CABSflex
+from .ensemble_analysis import EnsembleAnalysis
+from .structure_cluster import StructureCluster
+from .foldseek import Foldseek
+from .foldcomp import Foldcomp
+from .usalign import USalign
+from .tmalign import TMalign
+from .foundry_mpnn import FoundryMPNN
+from .sequence_identity_gate import SequenceIdentityGate
+from .scripting import Scripting
+from .mutagenesis import Mutagenesis
+from .selection import Selection
+from .selection_transfer import SelectionTransfer
+from .distance_selector import DistanceSelector
+from .ligand_atom_selector import LigandAtomSelector
+from .bfactor import BFactor
+from .ipsae import IPSAE
+from .consensus import Consensus
+from .mutation_profiler import MutationProfiler
+from .mutation_composer import MutationComposer
+from .pool import Pool
+from .pdb import PDB, Structure
+from .sasa import SASA
+from .pose_change import PoseChange
+from .peppr import Peppr
+from .bayesian_adjuster import BayesianAdjuster
+from .thermompnn import ThermoMPNN
+from .vespag import VespaG
+from .aggrescan3d import Aggrescan3D
+from .plm_sol import PLM_Sol
+from .ppi_ddg import PPIDdG
+from .ligand_ddg import LigandDdG
+from .converters import *
+from .entities import *
+
+__all__ = [
+    # Core pipeline components
+    'Pipeline',
+    'Folder',
+    'Resources',
+    'Suffix',
+    'Save',
+    'Dependencies',
+    'Parallel',
+    'Service',
+    'BaseConfig',
+    'ToolOutput',
+    'FolderManager',
+
+    # DataStream I/O
+    'DataStream',
+    'create_map_table',
+    'DataStreamResolver',
+    'resolve_to_datastream',
+    'resolve_input_to_datastream',
+
+    # Id sets
+    'IdSet',
+    'compose_axes',
+
+    # File path descriptor
+    'Path',
+
+    # Table utilities
+    'IndexedTableContainer',
+    'get_table',
+    'get_table_path',
+    'get_indexed_table',
+    'list_tables',
+    'table_exists',
+
+    # Combinatorics for input handling
+    'Bundle',
+    'Each',
+    'Grouped',
+    'CombinatoricsConfig',
+    'generate_combinatorics_config',
+    'get_mode',
+
+    # Modeling tools
+    'RFdiffusion',
+    'RFdiffusionAllAtom',
+    'RFDAA_PrepareLigand',
+    'RFdiffusion2',
+    'RFdiffusion3',
+    'RFD4Proteina',
+    'FLOWR',
+    'HBDesigner',
+    'ProteinMPNN',
+    'SolubleMPNN',
+    'Frame2Seq',
+    'AlphaFold',
+    'Ligand',
+    'Compound',  # same tool as Ligand, named for the compounds stream it emits
+    'Sequence',
+    'LigandMPNN',
+    'LASErMPNN',
+    'Boltz2',
+    'BoltzGen',
+    'BoltzGenMerge',
+    'CompoundLibrary',
+    'ExtractMetrics',
+    'ConformationalChange',
+    'Contacts',
+    'Distance',
+    'Angle',
+    'StitchSequences',
+    'DNAEncoder',
+    'RBSDesigner',
+    'Load',
+    'LoadMultiple',
+    'SequenceMetricCorrelation',
+    'PyMOL',
+    'Fuse',
+    'Plot',
+    'Panda',
+    'MSA',
+    'MMseqs2',
+    'MMseqs2Server',
+    'ReMap',
+    'Mock',
+    'Gnina',
+    'Vina',
+    'DiffDock',
+    'PocketGen',
+    'PLACER',
+    'DynamicBind',
+    'NeuralPLexer',
+    'OpenFold3',
+    'RF3',
+    'PoseBusters',
+    'ADMETAI',
+    'AiZynthFinder',
+    'REINVENT4',
+    'BindingData',
+    'Embedding',
+    'ESM2',
+    'ESMFold',
+    'ESMFold2',
+    'UniProt',
+    'RDKit',
+    'OpenBabel',
+    'PLIP',
+    'Prodigy',
+    'ProLIF',
+    'Protenix',
+    'FPocket',
+    'P2Rank',
+    'AF2BIND',
+    'DSSP',
+    'APBS',
+    'OpenMM',
+    'Reduce',
+    'XTB',
+    'RTMScore',
+    'GEMS',
+    'BioEmu',
+    'BioEmu2',
+    'CABSflex',
+    'EnsembleAnalysis',
+    'StructureCluster',
+    'Foldseek',
+    'Foldcomp',
+    'USalign',
+    'TMalign',
+    'FoundryMPNN',
+    'SequenceIdentityGate',
+    'Scripting',
+    'Mutagenesis',
+    'Selection',
+    'SelectionTransfer',
+    'DistanceSelector',
+    'LigandAtomSelector',
+    'BFactor',
+    'IPSAE',
+    'Consensus',
+    'MutationProfiler',
+    'MutationComposer',
+    'Pool',
+    'PDB',
+    'Structure',  # same tool as PDB, named for the structures stream it emits
+    'RCSB',
+    'Table',
+    'SASA',
+    'PoseChange',
+    'Peppr',
+    'BayesianAdjuster',
+    'ThermoMPNN',
+    'VespaG',
+    'Aggrescan3D',
+    'PLM_Sol',
+    'PPIDdG',
+    'LigandDdG',
+
+    # Utility functions
+    'pdb_to_jsonl',
+    'fasta_to_csv',
+    'validate_pdb',
+    'validate_fasta',
+    'combine_fasta_files'
+]

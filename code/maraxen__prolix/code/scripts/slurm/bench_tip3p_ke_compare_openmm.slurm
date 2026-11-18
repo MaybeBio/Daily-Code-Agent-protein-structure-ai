@@ -1,0 +1,59 @@
+#!/bin/bash
+# TIP3P KE diagnostic — **OpenMM only** (``Reference``): ``getKineticEnergy`` vs Σ½m|v|².
+# CPU-only; no JAX. Expects workspace venv at ``~/projects``.
+#
+# debt 937 audit (2026-07-28, corrected): tip3p_ke_compare.py imports
+# prolix.physics.regression_explicit_pme unconditionally at module scope,
+# regardless of --engine -- this script is NOT import-free. It is safe from the
+# isolated-worktree UV_PROJECT bug for a different reason: the script derives
+# _REPO from its own __file__ and manually prepends "${_REPO}/src" onto
+# sys.path ahead of site-packages, so the prolix import always resolves to this
+# job's own checkout and never depends on which venv `uv run` activates.
+# Forcing UV_PROJECT to the shared workspace here is intentional (this script
+# needs the shared venv's other deps, e.g. openmm) and unrelated to prolix
+# import resolution. Left as-is.
+#
+#SBATCH --job-name=plx-tip3p-ke-omm
+#SBATCH --partition=mit_preemptable
+#SBATCH --time=1:30:00
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=16G
+#SBATCH --exclude=node4009
+
+set -euo pipefail
+
+# SLURM copies scripts to spool dir — BASH_SOURCE[0] points there, not the repo.
+# Use SLURM_SUBMIT_DIR (set by sbatch) when running as a job; BASH_SOURCE fallback for
+# direct execution. Must submit from project root: cd ~/projects/<proj> && sbatch ...
+_PROJ="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+cd "${_PROJ}"
+
+# shellcheck source=/dev/null
+export PROLIX_UV_OPT_OUT=1  # manages its own uv env (workspace mode / --python); no myxcel lock-keyed venv
+source "scripts/slurm/_common_env.sh"
+
+WORKSPACE_ROOT="${ENGAGING_WORKSPACE_ROOT:-${HOME}/projects}"
+export UV_PROJECT="${WORKSPACE_ROOT}"
+
+NW="${TIP3P_KE_N_WATERS:-4}"
+ST="${TIP3P_KE_STEPS:-3000}"
+BR="${TIP3P_KE_BURN:-1200}"
+SE="${TIP3P_KE_SAMPLE:-20}"
+
+echo "engine=openmm workspace_root=${WORKSPACE_ROOT} job=${SLURM_JOB_ID:-} host=$(hostname) nwaters=${NW} steps=${ST} burn=${BR}"
+
+[[ -d "${WORKSPACE_ROOT}/.venv" ]] || {
+  echo "missing ${WORKSPACE_ROOT}/.venv; run bench_workspace_uv_sync.slurm first" >&2
+  exit 2
+}
+
+mkdir -p "${LOG_ROOT}/app"
+uv run python scripts/explore/tip3p_ke_compare.py \
+  --engine openmm \
+  --n-waters "${NW}" \
+  --steps "${ST}" \
+  --burn "${BR}" \
+  --sample-every "${SE}" \
+  2>&1 | tee "${LOG_ROOT}/app/tip3p_ke_compare_openmm_${SLURM_JOB_ID:-local}.log"
+
+echo "tip3p_ke_compare_openmm finished OK"

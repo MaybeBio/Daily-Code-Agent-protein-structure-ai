@@ -1,0 +1,76 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # Check all PR
+
+jobs:
+  min:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            python-version: "3.10"
+          - os: ubuntu-26.04
+            python-version: "3.15"
+          - os: macos-26
+            python-version: "3.15"
+          - os: windows-2025
+            python-version: "3.15"
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v7
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: activate MSVC (for torch.compile)
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+    - run: python -m pip install tox coverage[toml]
+    - name: run Python minimal tests
+      run: tox -e tests-min
+
+  all:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-26.04
+            python-version: "3.10"
+          # TODO: move to 3.15 once metatensor-torch and metatomic-torch allow
+          # torch >= 2.15, the first release with Python 3.15 wheels.
+          - os: ubuntu-26.04
+            python-version: "3.14"
+          - os: macos-26
+            python-version: "3.14"
+          - os: windows-2025
+            python-version: "3.14"
+
+    steps:
+    - uses: actions/checkout@v7
+      with:
+        fetch-depth: 0
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v7
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: activate MSVC (for torch.compile / inductor codegen)
+      if: runner.os == 'Windows'
+      uses: ilammy/msvc-dev-cmd@v1
+    - run: python -m pip install tox coverage[toml]
+    - name: run Python tests
+      run: tox -e tests
+    - name: generate coverage report
+      run: coverage xml
+    - name: upload to codecov.io
+      uses: codecov/codecov-action@v7
+      with:
+        fail_ci_if_error: false
+        files: tests/coverage.xml
+        token: ${{ secrets.CODECOV_TOKEN }}

@@ -1,0 +1,145 @@
+"""Parameter coverage for biopipelines.rfdiffusion3.RFdiffusion3."""
+
+import pytest
+
+from ._helpers import assert_substrings_in, read_all_emitted_artifacts
+
+
+pytestmark = pytest.mark.tool_parameters
+
+
+def _build(local_config, isolated_cwd, new_pipeline, **kwargs):
+    from biopipelines.rfdiffusion3 import RFdiffusion3
+
+    kwargs.setdefault("length", 80)
+
+    pipeline = new_pipeline("rfd3_params")
+    with pipeline:
+        RFdiffusion3(**kwargs)
+        script_path = pipeline.save()
+    return read_all_emitted_artifacts(script_path)
+
+
+# Assertions pair the flag with its value: a bare number is subsumed by numbers already in the artifacts (default length=80 satisfies "8"; "100" satisfies "10") and passes regardless of the parameter.
+
+def test_length(local_config, isolated_cwd, new_pipeline):
+    content = _build(local_config, isolated_cwd, new_pipeline, length=120)
+    assert '"length": "120"' in content
+
+
+def test_num_designs(local_config, isolated_cwd, new_pipeline):
+    content = _build(local_config, isolated_cwd, new_pipeline, num_designs=8)
+    assert "--num_designs 8" in content
+
+
+def test_num_models(local_config, isolated_cwd, new_pipeline):
+    content = _build(local_config, isolated_cwd, new_pipeline, num_models=2)
+    assert "--num_models 2" in content
+
+
+def test_design_startnum(local_config, isolated_cwd, new_pipeline):
+    content = _build(local_config, isolated_cwd, new_pipeline, design_startnum=99)
+    assert "--design_startnum 99" in content
+
+
+def test_smoke_all_params(local_config, isolated_cwd, new_pipeline):
+    content = _build(
+        local_config, isolated_cwd, new_pipeline,
+        length=100,
+        num_designs=4,
+        num_models=3,
+        design_startnum=10,
+    )
+    assert_substrings_in(content, [
+        '"length": "100"',
+        "--num_designs 4",
+        "--num_models 3",
+        "--design_startnum 10",
+    ])
+
+
+def test_symmetry_string(local_config, isolated_cwd, new_pipeline):
+    # String shorthand -> {"id": "C3"} in the JSON template, and the symmetry
+    # sampler is auto-selected on the run line.
+    content = _build(local_config, isolated_cwd, new_pipeline, length=110, symmetry="C3")
+    assert_substrings_in(content, ['"symmetry"', '"id"', "C3", "inference_sampler.kind=symmetry"])
+
+
+def test_cfg_and_sampler_knobs(local_config, isolated_cwd, new_pipeline):
+    # Diffused-ligand binder paper settings map to inference_sampler.* overrides.
+    content = _build(
+        local_config, isolated_cwd, new_pipeline,
+        length=100, cfg=True, cfg_scale=2.0,
+        step_scale=1.5, noise_scale=0.6, num_steps=200,
+    )
+    assert_substrings_in(content, [
+        "inference_sampler.use_classifier_free_guidance=True",
+        "inference_sampler.cfg_scale=2.0",
+        "inference_sampler.step_scale=1.5",
+        "inference_sampler.gamma_0=0.6",
+        "inference_sampler.num_timesteps=200",
+    ])
+
+
+def test_contigs_is_a_synonym_for_contig(local_config, isolated_cwd, new_pipeline):
+    # The plural its three sibling wrappers take must bind the parameter, not
+    # reach hydra as an unknown `contigs=` override with the motif discarded.
+    content = _build(local_config, isolated_cwd, new_pipeline, contigs="80-150")
+    assert '"contig": "80-150"' in content
+    assert "contigs=" not in content
+
+
+def test_unindex_motif(local_config, isolated_cwd, new_pipeline):
+    # Atomic-motif enzyme path: unindexed motif key in the JSON template.
+    content = _build(local_config, isolated_cwd, new_pipeline, contig="80-150", unindex="A50-52")
+    assert_substrings_in(content, ['"unindex"', "A50-52"])
+
+
+def test_partial_diffusion_rejects_length(local_config, isolated_cwd, new_pipeline):
+    import pytest as _pytest
+    with _pytest.raises(Exception):
+        _build(local_config, isolated_cwd, new_pipeline, length=100, partial_t=10.0)
+
+
+def test_coord_selector_without_input_rejected(local_config, isolated_cwd, new_pipeline):
+    # select_buried needs coordinates; de-novo (no pdb, bare-code ligand) has none.
+    import pytest as _pytest
+    with _pytest.raises(Exception):
+        _build(local_config, isolated_cwd, new_pipeline, length=100, select_buried="B1")
+
+
+def test_bare_ligand_without_input_rejected(local_config, isolated_cwd, new_pipeline):
+    # foundry appends a ligand to an input atom array; a bare code with
+    # length-only design has nothing to bind to.
+    from biopipelines.ligand import Ligand
+    import pytest as _pytest
+    with _pytest.raises(Exception):
+        _build(local_config, isolated_cwd, new_pipeline, length=100, ligand=Ligand(code="SAM"))
+
+
+def test_chain_break_contig_allowed(local_config, isolated_cwd, new_pipeline):
+    # A multi-chain contig — every binder design — spells the chain break "/0",
+    # the literal token foundry's get_design_pattern_with_constraints compares
+    # against. The wrapper used to reject any "/", making binder design
+    # impossible to express at all.
+    content = _build(local_config, isolated_cwd, new_pipeline,
+                     length=None, contig="60-95,/0,B1-114")
+    assert_substrings_in(content, ["60-95,/0,B1-114"])
+
+
+def test_backslash_chain_break_rejected(local_config, isolated_cwd, new_pipeline):
+    # "\0" is NOT the chain-break token; foundry falls through to int("\0") and
+    # dies only after the model has loaded on the GPU. Fail at config time with
+    # a message naming the right syntax.
+    import pytest as _pytest
+    with _pytest.raises(Exception, match=r"/0"):
+        _build(local_config, isolated_cwd, new_pipeline,
+               length=None, contig=r"60-95,\0,B1-114")
+
+
+def test_contig_rejects_other_shell_metacharacters(local_config, isolated_cwd, new_pipeline):
+    # Masking "\0" must not open the door to real injection vectors.
+    import pytest as _pytest
+    for bad in [r"60-95,\n,B1-114", '60-95,"x",B1-114', "60-95,$(id),B1-114"]:
+        with _pytest.raises(Exception):
+            _build(local_config, isolated_cwd, new_pipeline, length=None, contig=bad)

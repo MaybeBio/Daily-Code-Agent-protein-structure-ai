@@ -1,0 +1,5 @@
+- inference.input_pdb=input_pdbs/1bcf.pdb
+- inference.output_prefix=example_outputs/pgel_train
+- contigmap.contigs=[17-17/A18-25/21-21/A47-54/37-37/A92-99/23-23/A123-130/28-28]
+- inference.num_designs=10
+- inference.inversion_train=True

@@ -1,0 +1,60 @@
+[experiment]
+hypothesis = """
+The HP4 Lane A ensemble (≥16 mols, replicated to ensemble size N) converges
+bonded force-field parameters under Phase C's training loop (force MSE +
+α·energy MSE + harmonic prior) over 500 Adam steps. Both looped and batched
+paths are correctness-equivalent (Phase C v3 gate, rtol=1e-3). The §7.1
+ensemble-scaling sweep characterizes substrate throughput across
+N ∈ {16, 32, 64, 128, 256, 512} × {looped, batched} × {float32, float64}
+on pi_so3 — the speedup curve, not just a single data point.
+
+Pre-registration: this campaign uses REPLICATED Lane A (16 base mols tiled
+to N) so chemistry distribution stays constant at every N — isolates vmap
+substrate behavior from chemistry-diversity confounds. A separate
+follow-up campaign (hp4-s71-distinct-N512) will repeat the sweep with
+distinct molecules drawn from a 512-curated subset to validate
+chemistry-independence.
+"""
+
+[outcomes.pass]
+condition = "COALESCE(looped_final_loss_max, batched_final_loss_max) IS NOT NULL AND COALESCE(looped_final_loss_max, batched_final_loss_max) < 1e10 AND wallclock_s > 0"
+decision = "Proceed to Phase D rendering. The run produced finite per-mol final losses within a reasonable upper bound; cluster pipeline + bath ingest worked end-to-end. Cross-cell comparison (looped vs batched, f32 vs f64) happens via bth campaign review."
+reasoning = "We don't yet have a calibrated 'good' loss threshold — initial 3-step smoke gave ~450k loss with the geometry-init params. After 500 steps the loss should be much lower but the absolute magnitude is workload-dependent. The 1e10 cap catches NaN/Inf or runaway gradients; everything else is a 'completed' run whose interpretation lives in the cross-cell aggregation."
+
+[outcomes.fail]
+condition = "COALESCE(looped_final_loss_max, batched_final_loss_max) IS NULL OR COALESCE(looped_final_loss_max, batched_final_loss_max) >= 1e10 OR wallclock_s IS NULL OR wallclock_s <= 0"
+decision = "Investigate: (a) NaN/Inf in the loss (gradient blow-up — check learning rate, harmonic prior σ); (b) wallclock not recorded (script crashed before timer); (c) data path missing (script exited before training). Inspect the bth run log and the stdout/stderr file."
+reasoning = "Any of these conditions means the run did not produce usable §7.1 figure data. The is_residual=true catches everything not explicitly passing."
+is_residual = true
+
+[result_schema]
+mode = "str"
+precision = "str"
+n_steps = "int"
+n_molecules = "int"
+n_molecules_lane_a = "int"
+n_molecules_lane_b = "int"
+n_mols_target = "int"
+n_conf_cap = "int"
+n_warmup = "int"
+n_trials = "int"
+wallclock_s = "float"
+execution_median_s = "float"
+execution_min_s = "float"
+execution_max_s = "float"
+compile_time_estimate_s = "float"
+speedup_ratio = "float"
+batched_final_loss_max = "float"
+looped_final_loss_max = "float"
+grad_clip_norm = "float"
+backend = "str"
+device = "str"
+learning_rate = "float"
+alpha = "float"
+w_reg = "float"
+seed = "int"
+
+[metadata]
+campaign_id = "hp4-s71-fit"
+campaign_mode = "exploration"
+tags = ["cluster", "hp4", "s71", "fit"]

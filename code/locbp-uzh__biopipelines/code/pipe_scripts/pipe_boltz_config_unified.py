@@ -1,0 +1,789 @@
+#!/usr/bin/env python3
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+"""
+Unified Boltz2 YAML config file generator.
+
+Generates Boltz2 YAML configuration files based on combinatorics config,
+supporting all input combinations (Bundle/Each for proteins and ligands).
+
+Replaces:
+- pipe_boltz_config.py (old library replacement)
+- pipe_build_boltz_config_with_msas.py
+- pipe_build_boltz_config_with_global_cache.py
+- pipe_boltz_protein_ligand_configs.py
+"""
+
+import argparse
+import json
+import os
+import sys
+import csv
+from typing import Dict, List, Any, Optional
+
+import pandas as pd
+import yaml
+
+# Two path entries because two import styles are in use here: the bare module names below resolve
+# against the package directory, while the package-qualified import needs the repo root.
+_biopipelines_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'biopipelines')
+sys.path.insert(0, _biopipelines_dir)
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from combinatorics import predict_single_output_id, CombinatoricsConfig
+from ligand_utils import auth_ligand_field
+from biopipelines.biopipelines_io import write_skipped_queries
+from biopipelines.id_map_utils import MissingAlignment, MsaLookup, get_mapped_ids
+import id_patterns
+from pipe_axis_data import load_axis_data, group_records
+from nucleic_acids import (AXIS_NAME_TO_ENTITY_TYPE, DOUBLE_STRANDED_ENTITY_TYPES,
+                           reverse_complement)
+
+
+# Custom YAML representer for inline list formatting in constraints
+class FlowList(list):
+    """Wrapper class to force flow-style (inline) representation for lists in YAML"""
+    pass
+
+
+def flow_list_representer(dumper, data):
+    """YAML representer that renders lists in flow style (inline format)"""
+    return dumper.represent_sequence('tag:yaml.org,2002:seq', data, flow_style=True)
+
+
+yaml.add_representer(FlowList, flow_list_representer)
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description='Generate Boltz2 config files based on combinatorics config'
+    )
+    parser.add_argument(
+        '--combinatorics-config', required=True,
+        help='Path to combinatorics config JSON file'
+    )
+    parser.add_argument(
+        '--output-dir', required=True,
+        help='Directory to write YAML config files'
+    )
+    parser.add_argument(
+        '--msa-table',
+        help='Path to the msas map_table CSV (columns: id, sequence, file)'
+    )
+    parser.add_argument(
+        '--affinity', action='store_true',
+        help='Enable affinity calculation'
+    )
+    # Template parameters
+    parser.add_argument('--template', help='Path to PDB template file')
+    parser.add_argument('--template-chains', help='Comma-separated chain IDs for template')
+    parser.add_argument('--template-force', action='store_true', help='Force template usage')
+    parser.add_argument('--template-threshold', type=float, default=5.0, help='Template RMSD threshold')
+    # Pocket constraint parameters
+    parser.add_argument('--pocket-residues', help='Pocket residues as Python list string')
+    parser.add_argument('--pocket-max-distance', type=float, default=7.0, help='Max distance for pocket')
+    parser.add_argument('--pocket-force', action='store_true', help='Force pocket constraint')
+    # Glycosylation parameters
+    parser.add_argument('--glycosylation', help='JSON dict mapping chain IDs to Asn positions')
+    # Covalent linkage parameters
+    parser.add_argument('--covalent-linkage', help='JSON dict for covalent attachment')
+    # Contact constraint parameters
+    parser.add_argument('--contacts', help='JSON list of contact constraints')
+    # Disulfide bond constraints (cys-cys SG-SG bonds)
+    parser.add_argument('--disulfide-bonds', help='JSON list of disulfide bond constraints')
+    # Metal coordination bond constraints
+    parser.add_argument('--metal-coord', help='JSON list of metal coordination bond constraints')
+    # Sequences output
+    # Boltz's single-sequence mode; the wrapper emits this flag, so the parser has to declare it.
+    parser.add_argument('--single-sequence', action='store_true',
+                        help="Fold without an MSA (sets msa: empty on every protein chain)")
+    parser.add_argument('--sequences-csv', help='Path to write protein sequences CSV (id, sequence)')
+    parser.add_argument('--skipped-csv', required=True,
+                        help='Path to write the configs left out because a protein chain has no supplied alignment (id, cause)')
+    parser.add_argument('--sequence-ids', help='Path for sequence_ids.csv (defaults to parent of --output-dir)')
+
+    return parser.parse_args()
+
+
+def load_combinatorics_config(config_path: str) -> Dict:
+    """Load combinatorics configuration from JSON file."""
+    with open(config_path, 'r') as f:
+        return json.load(f)
+
+
+def get_msa_file(protein: Dict, msas: Optional[MsaLookup]) -> Optional[str]:
+    """The alignment of one protein chain, None when no msas were supplied.
+
+    With msas supplied, a protein with no alignment raises MissingAlignment: Boltz would otherwise fold it single-sequence (the `msa: empty` backfill) without a word.
+    """
+    if msas is None:
+        return None
+    path = msas.require(protein['id'], protein.get('sequence', ''))
+    if not os.path.exists(path):
+        raise MissingAlignment(f"the alignment {path} of {protein['id']} does not exist")
+    return path
+
+
+def add_template_to_config(config: Dict, args) -> Dict:
+    """Add template section to config if specified."""
+    if not args.template:
+        return config
+
+    template_entry = {
+        'pdb': args.template,
+        'force': args.template_force,
+        'threshold': args.template_threshold
+    }
+    if args.template_chains:
+        template_entry['chain_id'] = [c.strip() for c in args.template_chains.split(',')]
+
+    config['templates'] = [template_entry]
+    return config
+
+
+def add_pocket_to_config(config: Dict, args, ligand_chain_id: str) -> Dict:
+    """Add pocket constraint to config if specified."""
+    if not args.pocket_residues:
+        return config
+
+    import ast
+    pocket_residues = ast.literal_eval(args.pocket_residues)
+
+    constraint = {
+        'pocket': {
+            'binder': ligand_chain_id,
+            'contacts': pocket_residues,
+            'max_distance': args.pocket_max_distance,
+            'force': args.pocket_force
+        }
+    }
+
+    if 'constraints' not in config:
+        config['constraints'] = []
+    config['constraints'].append(constraint)
+
+    return config
+
+
+def add_glycosylation_to_config(config: Dict, glycosylation: Dict) -> Dict:
+    """Add NAG ligands and bond constraints for N-glycosylation."""
+    if not glycosylation:
+        return config
+
+    existing_chain_count = len(config['sequences'])
+
+    for chain_id, positions in glycosylation.items():
+        for pos in positions:
+            nag_chain_id = chr(65 + existing_chain_count)
+
+            config['sequences'].append({
+                'ligand': {
+                    'id': nag_chain_id,
+                    'ccd': 'NAG'
+                }
+            })
+
+            if 'constraints' not in config:
+                config['constraints'] = []
+            config['constraints'].append({
+                'bond': {
+                    'atom1': FlowList([chain_id, pos, 'ND2']),
+                    'atom2': FlowList([nag_chain_id, 1, 'C1'])
+                }
+            })
+
+            existing_chain_count += 1
+            print(f"Added NAG ligand (chain '{nag_chain_id}') linked to {chain_id}:{pos}")
+
+    return config
+
+
+def add_covalent_linkage_to_config(config: Dict, covalent_linkage: Dict, ligand_chain_id: str) -> Dict:
+    """Add bond constraint for covalent ligand attachment."""
+    if not covalent_linkage:
+        return config
+
+    chain = covalent_linkage.get('chain')
+    position = covalent_linkage.get('position')
+    protein_atom = covalent_linkage.get('protein_atom', 'SG')
+    ligand_atom = covalent_linkage.get('ligand_atom')
+    ligand_residue = covalent_linkage.get('ligand_residue', 1)
+
+    if not all([chain, position, ligand_atom]):
+        print("Warning: covalent_linkage missing required fields")
+        return config
+
+    # position may be a selection string (e.g. "C in ILIPCH") resolved per-structure
+    # against this chain's sequence — finds the residue regardless of renumbering.
+    if isinstance(position, str) and not position.lstrip('-').isdigit():
+        seq = next((e['protein']['sequence'] for e in config.get('sequences', [])
+                    if 'protein' in e and e['protein'].get('id') == chain), None)
+        if seq is None:
+            raise ValueError(f"covalent_linkage: no protein chain '{chain}' to resolve "
+                             f"position selection {position!r}")
+        from pdb_parser import resolve_selection_in_sequence
+        hits = resolve_selection_in_sequence(position, seq, chain=chain)
+        if len(hits) != 1:
+            raise ValueError(f"covalent_linkage position {position!r} resolved to "
+                             f"{len(hits)} residues {hits} in chain '{chain}'; need exactly one")
+        position = hits[0]
+
+    if 'constraints' not in config:
+        config['constraints'] = []
+    config['constraints'].append({
+        'bond': {
+            'atom1': FlowList([chain, position, protein_atom]),
+            'atom2': FlowList([ligand_chain_id, ligand_residue, ligand_atom])
+        }
+    })
+
+    print(f"Added covalent linkage: {chain}:{position} {protein_atom} -> {ligand_chain_id}:{ligand_residue} {ligand_atom}")
+    return config
+
+
+def add_contacts_to_config(config: Dict, contacts: List[Dict]) -> Dict:
+    """Add contact constraints to config."""
+    if not contacts:
+        return config
+
+    if 'constraints' not in config:
+        config['constraints'] = []
+
+    # Determine which chain IDs are ligands (non-polymer)
+    ligand_chain_ids = set()
+    for seq in config.get('sequences', []):
+        if 'ligand' in seq:
+            ligand_chain_ids.add(seq['ligand']['id'])
+
+    for contact in contacts:
+        for key in ('token1', 'token2'):
+            token = contact[key]
+            chain_id = token[0]
+            token_value = token[1]
+            if chain_id in ligand_chain_ids and isinstance(token_value, int):
+                raise ValueError(
+                    f"Contact constraint {key}={token}: chain '{chain_id}' is a ligand, "
+                    f"so the second element must be an atom name (string, e.g. 'C8'), "
+                    f"not a residue index (integer). "
+                    f"Predict the exact atom names ahead of time with "
+                    f"Boltz2.predict_atom_names(<your ligand>), which returns a labelled "
+                    f"2-D image and a name lookup."
+                )
+
+        entry = {
+            'contact': {
+                'token1': FlowList(contact['token1']),
+                'token2': FlowList(contact['token2']),
+            }
+        }
+        if 'max_distance' in contact:
+            entry['contact']['max_distance'] = contact['max_distance']
+        if 'force' in contact:
+            entry['contact']['force'] = contact['force']
+        config['constraints'].append(entry)
+
+    print(f"Added {len(contacts)} contact constraint(s)")
+    return config
+
+
+def add_disulfide_bonds_to_config(config: Dict, disulfide_bonds: List[Dict]) -> Dict:
+    """Add disulfide bond constraints (Cys SG -- Cys SG) to config."""
+    if not disulfide_bonds:
+        return config
+
+    if 'constraints' not in config:
+        config['constraints'] = []
+
+    for bond in disulfide_bonds:
+        chain1, residue1 = bond['token1']
+        chain2, residue2 = bond['token2']
+        config['constraints'].append({
+            'bond': {
+                'atom1': FlowList([chain1, residue1, 'SG']),
+                'atom2': FlowList([chain2, residue2, 'SG']),
+            }
+        })
+
+    print(f"Added {len(disulfide_bonds)} disulfide bond constraint(s)")
+    return config
+
+
+def add_metal_coord_to_config(config: Dict, metal_coord: List[Dict]) -> Dict:
+    """Add metal coordination bond constraints to config."""
+    if not metal_coord:
+        return config
+
+    if 'constraints' not in config:
+        config['constraints'] = []
+
+    for entry in metal_coord:
+        config['constraints'].append({
+            'bond': {
+                'atom1': FlowList(entry['atom1']),
+                'atom2': FlowList(entry['atom2']),
+            }
+        })
+
+    print(f"Added {len(metal_coord)} metal coordination bond constraint(s)")
+    return config
+
+
+def get_ligand_identity(ligand_entry: Dict) -> Optional[str]:
+    """Get the identity string (smiles or ccd) of a ligand entry for duplicate detection."""
+    lig = ligand_entry.get('ligand', {})
+    if lig.get('smiles'):
+        return f"smiles:{lig['smiles']}"
+    if lig.get('ccd'):
+        return f"ccd:{lig['ccd']}"
+    return None
+
+
+def has_duplicate_ligand(config: Dict, binder_chain_id: str) -> bool:
+    """
+    Check if the affinity binder ligand has duplicate copies in the config.
+
+    Boltz does not allow affinity calculation for a ligand that appears
+    multiple times in the same config. Returns True if duplicates are found.
+    """
+    # Find the binder ligand entry and its identity
+    binder_identity = None
+    for entry in config.get('sequences', []):
+        if 'ligand' in entry and entry['ligand'].get('id') == binder_chain_id:
+            binder_identity = get_ligand_identity(entry)
+            break
+
+    if binder_identity is None:
+        return False
+
+    # Count how many ligands share the same identity
+    count = 0
+    for entry in config.get('sequences', []):
+        if 'ligand' in entry and get_ligand_identity(entry) == binder_identity:
+            count += 1
+
+    return count > 1
+
+
+def build_protein_entry(protein: Dict, chain_id: str, msa_file: Optional[str]) -> Dict:
+    """Build a protein entry for Boltz2 config."""
+    entry = {
+        'protein': {
+            'id': chain_id,
+            'sequence': protein['sequence']
+        }
+    }
+    if msa_file:
+        entry['protein']['msa'] = msa_file
+    return entry
+
+
+def backfill_empty_msa(config: Dict) -> Dict:
+    """Backfill ``msa: empty`` on un-recycled protein chains when recycling is active.
+
+    If any protein chain in this config resolved a recycled MSA path, Boltz refuses
+    to mix custom MSAs with auto-generated ones. ``empty`` is Boltz's single-sequence
+    sentinel and counts as neither, so it can coexist with explicit paths. Chains
+    sharing a sequence with a recycled chain inherit its path (set at build time),
+    so only chains with no msa at all are backfilled.
+    """
+    protein_entries = [e['protein'] for e in config.get('sequences', []) if 'protein' in e]
+    any_recycled = any(p.get('msa') for p in protein_entries)
+    if not any_recycled:
+        return config
+    for p in protein_entries:
+        if not p.get('msa'):
+            p['msa'] = 'empty'
+    return config
+
+
+def build_dna_entry(dna: Dict, chain_id: str, rev_comp: bool = False) -> Dict:
+    """Build a DNA entry for Boltz2 config."""
+    seq = dna['sequence']
+    if rev_comp:
+        seq = reverse_complement(seq, 'dna')
+    return {
+        'dna': {
+            'id': chain_id,
+            'sequence': seq
+        }
+    }
+
+
+def build_rna_entry(rna: Dict, chain_id: str, rev_comp: bool = False) -> Dict:
+    """Build an RNA entry for Boltz2 config."""
+    seq = rna['sequence']
+    if rev_comp:
+        seq = reverse_complement(seq, 'rna')
+    return {
+        'rna': {
+            'id': chain_id,
+            'sequence': seq
+        }
+    }
+
+
+def build_ligand_entry(ligand: Dict, chain_id: str) -> Dict:
+    """Build a ligand entry for Boltz2 config."""
+    field, value = auth_ligand_field(ligand)
+    return {'ligand': {'id': chain_id, field: value}}
+
+
+# Entity types that support MSA lookup
+MSA_ENTITY_TYPES = {'protein'}
+
+# Entity types that are ligand-like (for affinity/pocket/covalent)
+LIGAND_ENTITY_TYPES = {'ligand'}
+
+
+
+def build_entry(entity_type: str, item: Dict, chain_id: str, msas: Optional[MsaLookup],
+                rev_comp: bool = False) -> Dict:
+    """Build a YAML sequence entry based on entity_type."""
+    # A polymer with no residues is never a legitimate request, and it does not
+    # announce itself: an empty FASTA read through pandas arrives here as the
+    # FLOAT nan, YAML writes it as `.nan`, and Boltz fails per-config with
+    # "'float' object is not iterable" while the surrounding step still reports
+    # post-processing "successfully". One production run lost all 210 of its
+    # jobs that way. Fail here, where the id says which input is at fault.
+    if entity_type not in ('ligand',):
+        seq = item.get('sequence', '')
+        if not isinstance(seq, str) or not seq.strip():
+            raise ValueError(
+                f"{entity_type} '{item.get('id', '?')}' (chain {chain_id}) has an "
+                f"empty sequence ({seq!r}) — check the FASTA or table it came from")
+    if entity_type == 'protein':
+        msa_file = get_msa_file(item, msas)
+        return build_protein_entry(item, chain_id, msa_file)
+    elif entity_type in ('dna', 'ssdna', 'dsdna'):
+        return build_dna_entry(item, chain_id, rev_comp=rev_comp)
+    elif entity_type in ('rna', 'ssrna', 'dsrna'):
+        return build_rna_entry(item, chain_id, rev_comp=rev_comp)
+    elif entity_type == 'ligand':
+        return build_ligand_entry(item, chain_id)
+    else:
+        raise ValueError(f"Unknown entity_type: {entity_type}")
+
+
+def generate_configs(axis_data: Dict[str, Dict], msas: Optional[MsaLookup], args) -> tuple:
+    """
+    Generate all config dicts for N axes with independent Each/Bundle modes.
+
+    For each axis:
+    - 'each' mode: iterate over items (one per config)
+    - 'bundle' mode without nested Each: all items static (appear in every config)
+    - 'bundle' mode with nested Each: iterate over Each items, static items appear in every config
+
+    The cartesian product is taken across all axes that have iteration.
+
+    Args:
+        axis_data: Dict mapping axis_name -> {entity_type, mode, iterated, static, static_first}
+        msas: the supplied alignments, or None when Boltz searches its own
+        args: Command line arguments
+
+    Returns:
+        ([(config_id, config_dict), ...], {config_id: cause}): the configs written and the ones skipped
+        because a protein chain has no supplied alignment.
+    """
+    import itertools
+
+    glycosylation = json.loads(args.glycosylation) if args.glycosylation else None
+    covalent_linkage = json.loads(args.covalent_linkage) if args.covalent_linkage else None
+    contacts = json.loads(args.contacts) if args.contacts else None
+    disulfide_bonds = json.loads(args.disulfide_bonds) if args.disulfide_bonds else None
+    metal_coord = json.loads(args.metal_coord) if args.metal_coord else None
+
+    # Classify axes into iteration axes vs static-only axes
+    axis_order = list(axis_data.keys())
+    iteration_axes = []  # Axes contributing to the cartesian product
+    static_only_axes = []  # Pure bundle axes (everything is static)
+
+    for axis_name in axis_order:
+        ad = axis_data[axis_name]
+        entity_type = ad['entity_type']
+        mode = ad['mode']
+        iterated = ad['iterated']
+        static = ad['static']
+        static_first = ad['static_first']
+
+        if mode == 'each':
+            items_to_iterate = iterated if iterated else static
+            static_items = static if iterated else []
+            all_ids = [item['id'] for item in items_to_iterate]
+            iteration_axes.append({
+                'axis_name': axis_name, 'entity_type': entity_type,
+                'items': items_to_iterate, 'static': static_items,
+                'static_first': static_first, 'mode': mode, 'all_ids': all_ids,
+            })
+        elif mode == 'bundle':
+            if iterated:
+                # Bundle with nested Each: iterate over iterated items
+                all_ids = [item['id'] for item in iterated]
+                iteration_axes.append({
+                    'axis_name': axis_name, 'entity_type': entity_type,
+                    'items': iterated, 'static': static,
+                    'static_first': static_first, 'mode': mode, 'all_ids': all_ids,
+                })
+            else:
+                # Pure bundle: everything is static
+                static_only_axes.append({
+                    'axis_name': axis_name, 'entity_type': entity_type,
+                    'items': static, 'static_first': static_first,
+                })
+
+    def next_chain_id(counter):
+        cid = chr(65 + counter[0])
+        counter[0] += 1
+        return cid
+
+    def add_one_item(config, entity_type, item, chain_counter):
+        """Add one iteration element: a single record, or a group's members as consecutive chains."""
+        first_ligand_chain = None
+        for member in item.get('__members__', [item]):
+            chain_id = next_chain_id(chain_counter)
+            config['sequences'].append(build_entry(entity_type, member, chain_id, msas))
+            if entity_type in LIGAND_ENTITY_TYPES and first_ligand_chain is None:
+                first_ligand_chain = chain_id
+            # Double-stranded: add a second chain with the reverse complement
+            if entity_type in DOUBLE_STRANDED_ENTITY_TYPES:
+                chain_id2 = next_chain_id(chain_counter)
+                config['sequences'].append(build_entry(entity_type, member, chain_id2, msas, rev_comp=True))
+        return first_ligand_chain
+
+    def add_axis_items_to_config(config, entity_type, items, chain_counter):
+        """Add all items from an axis to the config, tracking first ligand chain."""
+        first_ligand_chain = None
+        for item in items:
+            flc = add_one_item(config, entity_type, item, chain_counter)
+            if first_ligand_chain is None:
+                first_ligand_chain = flc
+        return first_ligand_chain
+
+    def apply_decorations(config, first_ligand_chain):
+        """Apply template, glycosylation, affinity, covalent, pocket, contacts."""
+        if getattr(args, "single_sequence", False):
+            # `msa: empty` is how Boltz expresses single-sequence. Applied to
+            # every protein chain, unconditionally -- backfill_empty_msa() only
+            # fills chains left un-recycled when some other chain HAS an MSA,
+            # which is a different question and a no-op when nothing is recycled.
+            for entry in config.get('sequences', []):
+                if 'protein' in entry:
+                    entry['protein']['msa'] = 'empty'
+        config = backfill_empty_msa(config)
+        config = add_template_to_config(config, args)
+        config = add_glycosylation_to_config(config, glycosylation)
+        if first_ligand_chain:
+            if args.affinity:
+                if has_duplicate_ligand(config, first_ligand_chain):
+                    print(f"Warning: Affinity binder ligand (chain {first_ligand_chain}) has duplicates - skipping affinity")
+                else:
+                    config['properties'] = [{'affinity': {'binder': first_ligand_chain}}]
+            config = add_covalent_linkage_to_config(config, covalent_linkage, first_ligand_chain)
+            config = add_pocket_to_config(config, args, first_ligand_chain)
+        config = add_contacts_to_config(config, contacts)
+        config = add_disulfide_bonds_to_config(config, disulfide_bonds)
+        config = add_metal_coord_to_config(config, metal_coord)
+        return config
+
+    # If no iteration axes, single config with everything bundled
+    if not iteration_axes:
+        axis_selections = {
+            sa['axis_name']: ('bundle', [s['id'] for s in sa['items']], None, [], False)
+            for sa in static_only_axes
+        }
+        config_id = predict_single_output_id(**axis_selections)
+        config = {'sequences': []}
+        chain_counter = [0]
+        first_ligand_chain = None
+        try:
+            for sa in static_only_axes:
+                flc = add_axis_items_to_config(config, sa['entity_type'], sa['items'], chain_counter)
+                if first_ligand_chain is None:
+                    first_ligand_chain = flc
+            config = apply_decorations(config, first_ligand_chain)
+        except MissingAlignment as exc:
+            return [], {config_id: str(exc)}
+        return [(config_id, config)], {}
+
+    # Compute cartesian product of all iteration axes
+    item_lists = [list(enumerate(ia['items'])) for ia in iteration_axes]
+    product = list(itertools.product(*item_lists))
+
+    configs = []
+    skipped = {}
+    for combo in product:
+        config = {'sequences': []}
+        chain_counter = [0]
+        first_ligand_chain = None
+        axis_selections = {}
+        for i, ia in enumerate(iteration_axes):
+            idx, _item = combo[i]
+            axis_selections[ia['axis_name']] = (ia['mode'], ia['all_ids'], idx,
+                                                [s['id'] for s in ia.get('static', [])],
+                                                ia.get('static_first', False))
+        for sa in static_only_axes:
+            axis_selections[sa['axis_name']] = ('bundle', [s['id'] for s in sa['items']], None, [], False)
+        config_id = predict_single_output_id(**axis_selections)
+
+        try:
+            # Add entries from iteration axes
+            for i, ia in enumerate(iteration_axes):
+                idx, item = combo[i]
+                entity_type = ia['entity_type']
+                static_items = ia['static']
+                static_first = ia['static_first']
+
+                if ia['mode'] == 'bundle' and static_first and static_items:
+                    # Static items first (for Bundle(cofactor, Each(library)) pattern)
+                    flc = add_axis_items_to_config(config, entity_type, static_items, chain_counter)
+                    if first_ligand_chain is None:
+                        first_ligand_chain = flc
+                    # Then iterated item
+                    flc = add_one_item(config, entity_type, item, chain_counter)
+                    if first_ligand_chain is None:
+                        first_ligand_chain = flc
+                else:
+                    # Iterated item first
+                    flc = add_one_item(config, entity_type, item, chain_counter)
+                    if first_ligand_chain is None:
+                        first_ligand_chain = flc
+                    # Then static items
+                    if static_items:
+                        flc = add_axis_items_to_config(config, entity_type, static_items, chain_counter)
+                        if first_ligand_chain is None:
+                            first_ligand_chain = flc
+
+            # Add entries from static-only (pure bundle) axes
+            for sa in static_only_axes:
+                flc = add_axis_items_to_config(config, sa['entity_type'], sa['items'], chain_counter)
+                if first_ligand_chain is None:
+                    first_ligand_chain = flc
+
+            config = apply_decorations(config, first_ligand_chain)
+        except MissingAlignment as exc:
+            skipped[config_id] = str(exc)
+            continue
+        configs.append((config_id, config))
+
+    return configs, skipped
+
+
+def write_configs(configs: List[tuple], output_dir: str) -> List[str]:
+    """Write config files and return list of generated IDs."""
+    os.makedirs(output_dir, exist_ok=True)
+    generated_ids = []
+
+    for config_id, config in configs:
+        config_path = os.path.join(output_dir, f"{config_id}.yaml")
+        with open(config_path, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+        generated_ids.append(config_id)
+        print(f"Created config: {config_id}.yaml")
+
+    return generated_ids
+
+
+def write_sequence_ids(ids: List[str], output_dir: str, explicit_path: str = None):
+    """Write sequence_ids.csv file."""
+    ids_file = explicit_path or os.path.join(os.path.dirname(output_dir), "sequence_ids.csv")
+    with open(ids_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['id'])
+        for seq_id in ids:
+            writer.writerow([seq_id])
+    print(f"Created sequence IDs file: {ids_file}")
+
+
+def write_protein_sequences(configs: List[tuple], output_path: str):
+    """Write protein sequences CSV with id and sequence columns.
+
+    Uses config_id as the sequence ID to ensure consistency with
+    generated_ids used by the rest of the pipeline.
+    """
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['id', 'sequence'])
+        seen = set()
+        for config_id, config in configs:
+            if config_id and config_id not in seen:
+                # Extract protein sequence from the first protein entry in the config
+                seq = ''
+                for entry in config.get('sequences', []):
+                    if 'protein' in entry:
+                        seq = entry['protein'].get('sequence', '')
+                        break
+                writer.writerow([config_id, seq])
+                seen.add(config_id)
+    print(f"Created protein sequences file: {output_path}")
+
+
+def main():
+    args = parse_arguments()
+
+    # Load combinatorics config (includes pre-computed predictions and provenance)
+    comb_config = load_combinatorics_config(args.combinatorics_config)
+    stored_predicted_ids = comb_config.get('predicted_ids', [])
+    stored_provenance = comb_config.get('provenance', {})
+    axes = comb_config.get('axes', {})
+
+    if not axes:
+        print("Error: no axes found in combinatorics config")
+        sys.exit(1)
+
+    # Load all axes generically
+    axis_data = {}
+    for axis_name, axis_config in axes.items():
+        # Resolve entity_type: use stored value, fall back to name-based mapping
+        entity_type = axis_config.get('entity_type')
+        if entity_type is None:
+            entity_type = AXIS_NAME_TO_ENTITY_TYPE.get(axis_name)
+        if entity_type is None:
+            print(f"Error: cannot determine entity_type for axis '{axis_name}'. "
+                  f"Known axis names: {list(AXIS_NAME_TO_ENTITY_TYPE.keys())}")
+            sys.exit(1)
+
+        mode = axis_config.get('mode', 'each')
+        iterated, static, static_first = load_axis_data(axis_config)
+
+        print(f"Axis '{axis_name}' (entity_type={entity_type}, mode={mode}): "
+              f"{len(iterated)} iterated, {len(static)} static"
+              f"{', static first' if static_first else ''}")
+
+        axis_data[axis_name] = {
+            'entity_type': entity_type,
+            'mode': mode,
+            'iterated': iterated,
+            'static': static,
+            'static_first': static_first,
+        }
+
+    # The supplied alignments, when there are any
+    msas = MsaLookup.load(args.msa_table) if args.msa_table else None
+    if msas is not None:
+        print(f"Loaded {len(msas.ids)} alignment row(s) from {args.msa_table}")
+
+    # Generate configs
+    configs, skipped = generate_configs(axis_data, msas, args)
+    write_skipped_queries(args.skipped_csv, skipped)
+    for config_id, cause in skipped.items():
+        print(f"WARNING: config {config_id} skipped: {cause}")
+
+    # Write configs
+    generated_ids = write_configs(configs, args.output_dir)
+
+    # Write sequence_ids.csv
+    write_sequence_ids(generated_ids, args.output_dir, args.sequence_ids)
+
+    # Write protein sequences CSV with id and sequence columns
+    if args.sequences_csv:
+        write_protein_sequences(configs, args.sequences_csv)
+
+    print(f"\nGenerated {len(configs)} config files")
+    # Nothing left to predict is a step error: boltz predict on an empty folder would fail later with a vaguer message.
+    if not configs and skipped:
+        print("ERROR: every config was skipped")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

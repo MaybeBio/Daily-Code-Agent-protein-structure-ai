@@ -1,0 +1,18 @@
+[package]
+name = "pimd-estimators"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+pimd-core.workspace = true
+pimd-integrators.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+pimd-potentials.workspace = true
+
+[features]
+# Long statistical validation runs (WORKFLOW "Long validation"); run by CHECK_LONG=1 scripts/check.sh.
+long-validation = []

@@ -1,0 +1,72 @@
+#!/bin/bash
+# P2a-B2 investigation: ``dt_fs`` × ``gamma_ps`` matrix (OpenMM + Prolix) via ``tip3p_dt_gamma_matrix.py``.
+# One job runs the full matrix; output is one JSON document in the app log.
+#
+# Environment (optional):
+#   TIP3P_MATRIX_DT_LIST     default 1,2
+#   TIP3P_MATRIX_GAMMA_LIST  default 0.5,1,2
+#   TIP3P_MATRIX_N_WATERS    default 8
+#   TIP3P_MATRIX_STEPS       default 12000
+#   TIP3P_MATRIX_BURN        default 4000
+#   TIP3P_MATRIX_REPLICAS    default 3
+#   TIP3P_MATRIX_PROJECTION_SITE  default post_settle_vel
+#   TIP3P_MATRIX_SETTLE_ITERS     default 20
+#
+#SBATCH --job-name=plx-tip3p-dt-g
+#SBATCH --partition=mit_preemptable
+#SBATCH --time=8:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+#SBATCH --gres=gpu:1
+
+set -euo pipefail
+
+# SLURM copies scripts to spool dir — BASH_SOURCE[0] points there, not the repo.
+# Use SLURM_SUBMIT_DIR (set by sbatch) when running as a job; BASH_SOURCE fallback for
+# direct execution. Must submit from project root: cd ~/projects/<proj> && sbatch ...
+_PROJ="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+cd "${_PROJ}"
+
+# shellcheck source=/dev/null
+export PROLIX_UV_OPT_OUT=1  # manages its own uv env (workspace mode / --python); no myxcel lock-keyed venv
+source "scripts/slurm/_common_env.sh"
+
+WORKSPACE_ROOT="${ENGAGING_WORKSPACE_ROOT:-${HOME}/projects}"
+# shellcheck source=/dev/null
+source "scripts/slurm/_uv_project_guard.sh"
+_resolve_uv_project_for_workspace "${WORKSPACE_ROOT}"
+
+DT_LIST="${TIP3P_MATRIX_DT_LIST:-1,2}"
+G_LIST="${TIP3P_MATRIX_GAMMA_LIST:-0.5,1,2}"
+NW="${TIP3P_MATRIX_N_WATERS:-8}"
+ST="${TIP3P_MATRIX_STEPS:-12000}"
+BR="${TIP3P_MATRIX_BURN:-4000}"
+REP="${TIP3P_MATRIX_REPLICAS:-3}"
+PSITE="${TIP3P_MATRIX_PROJECTION_SITE:-post_settle_vel}"
+SITERS="${TIP3P_MATRIX_SETTLE_ITERS:-20}"
+
+export JAX_PLATFORMS="${JAX_PLATFORMS:-cuda}"
+export JAX_ENABLE_X64="${JAX_ENABLE_X64:-1}"
+
+if [[ -n "${UV_PROJECT:-}" ]]; then
+  [[ -d "${WORKSPACE_ROOT}/.venv" ]] || {
+    echo "missing ${WORKSPACE_ROOT}/.venv; run bench_workspace_uv_sync.slurm first" >&2
+    exit 2
+  }
+fi
+
+mkdir -p "${LOG_ROOT}/app"
+echo "dt_gamma_matrix job=${SLURM_JOB_ID:-} dt_list=${DT_LIST} gamma_list=${G_LIST} nw=${NW} steps=${ST} burn=${BR} replicas=${REP} projection_site=${PSITE}"
+
+uv run "${UV_SYNC_EXTRAS[@]}" python scripts/benchmarks/tip3p_dt_gamma_matrix.py \
+  --dt-list "${DT_LIST}" \
+  --gamma-list "${G_LIST}" \
+  --n-waters "${NW}" \
+  --steps "${ST}" \
+  --burn "${BR}" \
+  --replicas "${REP}" \
+  --projection-site "${PSITE}" \
+  --settle-velocity-iters "${SITERS}" \
+  2>&1 | tee "${LOG_ROOT}/app/tip3p_dt_gamma_matrix_${SLURM_JOB_ID:-local}.log"
+
+echo "tip3p_dt_gamma_matrix finished OK"

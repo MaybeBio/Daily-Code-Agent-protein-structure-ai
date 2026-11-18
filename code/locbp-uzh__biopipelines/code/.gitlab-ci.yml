@@ -1,0 +1,61 @@
+stages:
+  - test
+  - deploy
+
+# Pytest matrix mirroring .github/workflows/tests.yml so the same
+# regressions get caught here BEFORE the mirror-to-github step exposes
+# them on the public repo.
+.pytest-template: &pytest-template
+  stage: test
+  image: python:${PYTHON_VERSION}-slim
+  before_script:
+    # tests/test_templates.py shells out to `git ls-files` to check that the
+    # whitelisted templates are actually committed. python:*-slim has no git,
+    # so without this those tests die with FileNotFoundError rather than
+    # testing anything.
+    - apt-get update && apt-get install -y --no-install-recommends git
+    - python -m pip install --upgrade pip
+    # `[mcp]` too: without it tests/test_mcp_server.py skips and bp-mcp ships untested.
+    - python -m pip install -e ".[test,mcp]"
+  script:
+    # -m overrides the local addopts deselect, so the network tests run here.
+    - pytest tests/ -v -m "not tool_parameters"
+    # The per-tool parameter suites need neither GPU nor network and are opt-in locally, so CI runs them.
+    - pytest tests/tool_parameters -v -m tool_parameters
+  rules:
+    # Run on every push to any branch, and on merge requests.
+    - if: '$CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+pytest:py310:
+  <<: *pytest-template
+  variables:
+    PYTHON_VERSION: "3.10"
+
+pytest:py311:
+  <<: *pytest-template
+  variables:
+    PYTHON_VERSION: "3.11"
+
+pytest:py312:
+  <<: *pytest-template
+  variables:
+    PYTHON_VERSION: "3.12"
+
+pytest:py313:
+  <<: *pytest-template
+  variables:
+    PYTHON_VERSION: "3.13"
+
+mirror-to-github:
+  stage: deploy
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "public"'
+  # Implicit dependency on the test stage: with `stages: [test, deploy]`,
+  # this job only runs after every job in `test` has succeeded for this
+  # pipeline. A red pytest -> no mirror push to GitHub.
+  script:
+    - git clone --branch public --single-branch "$CI_REPOSITORY_URL" repo
+    - cd repo
+    - git remote add github https://x-access-token:${GITHUB_PUSH_TOKEN}@github.com/locbp-uzh/biopipelines.git
+    - git push github public:main

@@ -1,0 +1,22 @@
+# preset that will explicitly request gcc/g++ compilers with support for MPI and OpenMP
+
+find_program(GCC_CXX NAMES g++ g++-20 g++-19 g++-18 g++-17 g++-16 g++-15 g++-14 g++-13 g++-12 g++-11 g++-10 g++-9)
+find_program(GCC_CC NAMES gcc gcc-20 gcc-19 gcc-18 gcc-17 gcc-16 gcc-15 gcc-14 gcc-13 gcc-12 gcc-11 gcc-10 gcc-9)
+find_program(GCC_FC NAMES gfortran gfortran-20 gfortran-19 gfortran-18 gfortran-17 gfortran-16 gfortran-15 gfortran-14 gfortran-13 gfortran-12 gfortran-11 gfortran-10 gfortran-9)
+
+set(CMAKE_CXX_COMPILER "${GCC_CXX}" CACHE STRING "" FORCE)
+set(CMAKE_C_COMPILER "${GCC_CC}" CACHE STRING "" FORCE)
+set(CMAKE_Fortran_COMPILER "${GCC_FC}" CACHE STRING "" FORCE)
+set(CMAKE_CXX_FLAGS_DEBUG "-Wall -Og -g" CACHE STRING "" FORCE)
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-g -O2 -DNDEBUG" CACHE STRING "" FORCE)
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
+set(MPI_CXX "${GCC_CXX}" CACHE STRING "" FORCE)
+set(MPI_C "${GCC_CC}" CACHE STRING "" FORCE)
+set(CMAKE_C_FLAGS_DEBUG "-Wall -Og -g" CACHE STRING "" FORCE)
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "-g -O2 -DNDEBUG" CACHE STRING "" FORCE)
+set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG" CACHE STRING "" FORCE)
+set(MPI_Fortran "${GCC_FC}" CACHE STRING "" FORCE)
+set(CMAKE_Fortran_FLAGS_DEBUG "-Wall -Og -g -std=f2003" CACHE STRING "" FORCE)
+set(CMAKE_Fortran_FLAGS_RELWITHDEBINFO "-g -O2 -DNDEBUG -std=f2003" CACHE STRING "" FORCE)
+set(CMAKE_Fortran_FLAGS_RELEASE "-O3 -DNDEBUG -std=f2003" CACHE STRING "" FORCE)
+unset(HAVE_OMP_H_INCLUDE CACHE)

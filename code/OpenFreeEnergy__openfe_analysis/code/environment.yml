@@ -1,0 +1,22 @@
+name: openfe_analysis_env
+channels:
+  - conda-forge
+dependencies:
+  - click
+  - matplotlib-base
+  - MDAnalysis
+  - MDAnalysisTests
+  - netCDF4
+  - openff-units
+  - pip
+  - tqdm
+  - pyyaml
+  # for testing
+  - coverage
+  - pooch >=1.9.0  # min for https://github.com/fatiando/pooch/issues/502
+  - pytest
+  - pytest-cov
+  - pytest-xdist
+  - pytest-rerunfailures
+  - spyrmsd
+  - rdkit !=2026.03.3 # see https://github.com/rdkit/rdkit/issues/9335

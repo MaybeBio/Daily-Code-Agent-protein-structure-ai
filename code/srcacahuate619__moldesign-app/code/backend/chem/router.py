@@ -1,0 +1,514 @@
+"""
+chem/router.py
+
+FastAPI router que expone el servicio químico como endpoints HTTP.
+
+Tres endpoints principales:
+
+    POST /chem/validate
+        Valida un SMILES y retorna propiedades básicas.
+        Rápido (~10ms). Llamado en tiempo real desde el editor Ketcher
+        mientras el usuario escribe/modifica la molécula.
+
+    POST /chem/properties
+        Calcula todas las propiedades fisicoquímicas de una molécula válida.
+        Rápido (~50ms). Llamado después de que el usuario confirma una molécula.
+
+    POST /chem/conformer
+        Genera la estructura 3D y la guarda en disco local.
+        Moderado (~500ms-3s según complejidad). Llamado antes del docking.
+        Retorna la ruta lógica local, no el archivo en sí.
+
+Relación con el resto del pipeline:
+    El frontend llama a estos endpoints en secuencia antes de enviar
+    el job de docking al dispatcher local. El docking (chem/router.py
+    no lo maneja — eso es services/docking/queue_handler.py) necesita
+    que el conformer ya exista en el storage local.
+
+Decisión de diseño: validación en el router vs. en el servicio.
+    Los routers validan el formato del request (Pydantic automático).
+    Los servicios validan la semántica científica (SMILES, valencia).
+    Esta separación significa que un SMILES llega al servicio químico
+    siempre como string bien formado, pero puede ser inválido
+    científicamente — y eso lo detecta chem/validator.py.
+"""
+
+from typing import Literal
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
+
+from chem.conformer import generate_conformer
+from chem.properties import calculate_properties, summarize_adme_profile
+from chem.validator import validate_smiles, validate_smiles_or_raise
+from core.database import get_db
+from api.dependencies import get_current_user_optional
+from api.routers.evaluation_access import require_owned_molecule
+from db.repository import Repository
+from core.models import UserORM
+from core.models import MoleculeORM
+import uuid
+from sqlalchemy import select
+from fastapi import Response
+from chem.elevacion import (
+    SEMILLAS_CRITERIO,
+    ElevacionNoDisponible,
+    dibujo_2d,
+    evidencia_de_la_corrida,
+    modelo_de_la_especie_acoplada,
+    modelo_desde_conformador,
+    modelo_desde_pose,
+)
+from rdkit import Chem
+from core.models import (
+    PhysicochemicalProperties,
+    ValidationResult,
+)
+from utils.cache import CacheKey, LocalRuntimeStore, get_cache
+from utils.logger import bind_context, get_logger
+
+log = get_logger(__name__)
+
+router = APIRouter(
+    prefix="/chem",
+    tags=["Química computacional"],
+)
+
+
+# ── Schemas de request/response ───────────────────────────────────────────────
+
+class ValidateRequest(BaseModel):
+    smiles: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="SMILES de la molécula a validar",
+        examples=["CC(=O)Oc1ccccc1C(=O)O"],
+    )
+
+
+class PropertiesRequest(BaseModel):
+    smiles: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="SMILES de la molécula. Se valida internamente.",
+        examples=["CN1C=NC2=C1C(=O)N(C(=O)N2C)C"],
+    )
+
+
+class ConformerRequest(BaseModel):
+    smiles: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="SMILES de la molécula. Se valida y canonicaliza internamente.",
+    )
+    ph: float | None = Field(default=None, ge=1.0, le=12.0, allow_inf_nan=False)
+    force_regenerate: bool = Field(
+        default=False,
+        description=(
+            "Compatibilidad con clientes anteriores. El endpoint regenera siempre "
+            "hasta disponer de una clave de caché que incluya pH y algoritmo."
+        ),
+    )
+
+
+class ConformerResponse(BaseModel):
+    canonical_smiles:       str
+    smiles_hash:            str
+    conformer_path:         str
+    num_atoms_3d:           int
+    optimization_converged: bool
+    had_macrocycle:         bool
+    molecular_formula:      str
+    sdf_content:            str = ""
+    from_cache:             bool = False
+    estado_del_ligando:     dict | None = None
+
+
+class PropertiesResponse(BaseModel):
+    """
+    Respuesta del endpoint de propiedades.
+    Incluye las propiedades calculadas y un resumen ADME para la UI.
+    """
+    properties:   PhysicochemicalProperties
+    adme_summary: str
+    smiles_hash:  str
+    from_cache:   bool = False
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/validate",
+    response_model=ValidationResult,
+    summary="Valida un SMILES",
+    description=(
+        "Valida la estructura química de un SMILES usando RDKit. "
+        "Retorna el SMILES canónico, hash SHA-256, fórmula molecular "
+        "y listas de errores/warnings. Llamado en tiempo real desde Ketcher."
+    ),
+    status_code=status.HTTP_200_OK,
+)
+async def validate_endpoint(
+    request: ValidateRequest,
+) -> ValidationResult:
+    """
+    Endpoint de validación rápida.
+
+    No usa estado efímero porque la validación es determinista y ~10ms —
+    consultar el runtime local sería comparable a recalcular.
+
+    No requiere autenticación — la validación es una operación de lectura
+    sin efectos secundarios. Un usuario no autenticado puede verificar
+    si su SMILES es válido antes de crear una cuenta.
+
+    Retorna siempre HTTP 200 con is_valid=True o is_valid=False.
+    Los errores de validación científica no son HTTP 4xx — son información
+    estructurada que el frontend usa para mostrar feedback al usuario.
+    """
+    bind_context(endpoint="validate", smiles_preview=request.smiles[:20])
+
+    # RDKit fuera del hilo async — ver el bloque de `properties_endpoint`.
+    # Aquí el coste típico es de milisegundos, pero el editor Ketcher llama a
+    # este endpoint en cada pulsación y un SMILES patológico sanitiza lento.
+    result = await run_in_threadpool(validate_smiles, request.smiles)
+
+    log.info(
+        "validación completada",
+        is_valid=result.is_valid,
+        formula=result.molecular_formula,
+        errors=len(result.errors),
+        warnings=len(result.warnings),
+    )
+
+    return result
+
+
+@router.post(
+    "/properties",
+    response_model=PropertiesResponse,
+    summary="Calcula propiedades fisicoquímicas",
+    description=(
+        "Calcula MW, logP, TPSA, HBD/HBA, enlaces rotables, anillos "
+        "y evalúa las reglas de Lipinski y Veber. "
+        "Incluye un resumen narrativo del perfil ADME para la UI."
+    ),
+    status_code=status.HTTP_200_OK,
+)
+async def properties_endpoint(
+    request: PropertiesRequest,
+    cache: LocalRuntimeStore = Depends(get_cache),
+) -> PropertiesResponse:
+    """
+    Calcula propiedades fisicoquímicas con cache.
+
+    Las propiedades son deterministas: el mismo SMILES siempre produce
+    el mismo resultado. El cache (TTL 1h) evita recalcular si el usuario
+    envía la misma molécula varias veces durante una sesión.
+
+    El cache key usa el hash SHA-256 del SMILES canónico, no el SMILES
+    raw del usuario — distintas representaciones de la misma molécula
+    comparten el mismo cache entry.
+
+    Lanza HTTP 422 si el SMILES es inválido (via InvalidSMILES).
+    """
+    bind_context(endpoint="properties", smiles_preview=request.smiles[:20])
+
+    # ═════════════════════════════════════════════════════════════════
+    # RDKit y ADMET-AI no pueden correr en el hilo del bucle de eventos
+    # ═════════════════════════════════════════════════════════════════
+    #
+    # Auditoría de backend del 2026-09-04, §3.3. Este endpoint es `async def` y
+    # llamaba a `calculate_properties` directamente. Esa función no es sólo
+    # RDKit: dentro corre ADMET-AI —un ensamble de modelos— más el consenso de
+    # BBB y el MPO. Medido en esta máquina, con los modelos ya cargados:
+    #
+    #     aspirina        353-412 ms
+    #     pentapéptido       1 321 ms
+    #
+    # Durante ese tiempo un `async def` sin puntos de suspensión no cede el
+    # control: FastAPI no atiende NADA más, incluido el sondeo de progreso con
+    # el que el frontend dibuja el estado de una corrida. La interfaz se
+    # congelaba por segundo y pico cada vez que alguien pedía propiedades de una
+    # molécula grande, y el síntoma —«la aplicación se queda pensando»— no
+    # apuntaba a este endpoint por ninguna parte.
+    #
+    # `run_in_threadpool` lo manda al pool de hilos que FastAPI ya usa para los
+    # endpoints `def`. No cambia ningún número: cambia quién espera.
+    #
+    # Cuánto se recupera, medido ocho veces con una tarea que late cada 10 ms:
+    # en el hilo del bucle, 0 latidos; en el pool, 11-13 de los ~52 posibles.
+    # No es todo —torch retiene el GIL buena parte del cálculo de ADMET— pero
+    # es la diferencia entre una interfaz lenta y una que parece colgada. Ver
+    # `tests/test_rdkit_no_bloquea_el_bucle.py`, que lo mide.
+    #
+    # Paso 1: validar primero para obtener el hash (necesario para el cache key)
+    # validate_smiles_or_raise lanza InvalidSMILES → HTTP 422 si es inválido
+    validation = await run_in_threadpool(validate_smiles_or_raise, request.smiles)
+    smiles_hash = validation.smiles_hash
+
+    # Paso 2: verificar cache
+    cache_key = CacheKey.properties(smiles_hash)
+    cached = await cache.get(cache_key)
+    if cached is not None:
+        log.debug("propiedades desde cache", hash_prefix=smiles_hash[:8])
+        return PropertiesResponse(
+            properties=PhysicochemicalProperties(**cached["properties"]),
+            adme_summary=cached["adme_summary"],
+            smiles_hash=smiles_hash,
+            from_cache=True,
+        )
+
+    # Paso 3: calcular propiedades (fuera del bucle; ver arriba)
+    def _calcular() -> tuple:
+        propiedades = calculate_properties(request.smiles)
+        return propiedades, summarize_adme_profile(propiedades)
+
+    props, adme_summary = await run_in_threadpool(_calcular)
+
+    # Paso 4: guardar en cache
+    await cache.set(
+        cache_key,
+        {
+            "properties":   props.model_dump(),
+            "adme_summary": adme_summary,
+        },
+        ttl=3600,   # 1 hora
+    )
+
+    log.info(
+        "propiedades calculadas",
+        formula=validation.molecular_formula,
+        mw=props.molecular_weight,
+        lipinski=props.lipinski_pass,
+        hash_prefix=smiles_hash[:8],
+    )
+
+    return PropertiesResponse(
+        properties=props,
+        adme_summary=adme_summary,
+        smiles_hash=smiles_hash,
+        from_cache=False,
+    )
+
+
+@router.post(
+    "/conformer",
+    response_model=ConformerResponse,
+    summary="Genera estructura 3D",
+    description=(
+        "Genera un conformer 3D usando ETKDGv3 y optimiza con MMFF94. "
+        "El archivo .sdf se guarda en el almacenamiento local. "
+        "Retorna la ruta del archivo, no el archivo en sí. "
+        "El frontend usa esta ruta para el visor Mol*."
+    ),
+    status_code=status.HTTP_201_CREATED,
+)
+async def conformer_endpoint(
+    request: ConformerRequest,
+    cache: LocalRuntimeStore = Depends(get_cache),
+) -> ConformerResponse:
+    """
+    Genera estructura 3D al pH solicitado y devuelve su estado químico.
+
+    La caché antigua indexada por SMILES de entrada no distingue pH,
+    versión del algoritmo ni microestado. Se regenera hasta disponer de
+    una clave validada para ese conjunto completo de parámetros.
+
+    Lanza HTTP 422 si el SMILES es inválido.
+    Lanza HTTP 422 si la generación 3D falla (ConformerGenerationError).
+    Lanza HTTP 500 si hay un error inesperado en RDKit.
+    """
+    bind_context(endpoint="conformer", smiles_preview=request.smiles[:20])
+
+    # La especie depende del pH y del algoritmo; un SDF previo indexado sólo
+    # por el SMILES de entrada no demuestra que sea el estado solicitado.
+    # Generar nuevo conformer
+    result = await generate_conformer(request.smiles, request.ph)
+
+    log.info(
+        "conformer generado",
+        formula=result["molecular_formula"],
+        atoms=result["num_atoms_3d"],
+        converged=result["optimization_converged"],
+        macrocycle=result["had_macrocycle"],
+        path=result["conformer_path"],
+    )
+
+    return ConformerResponse(
+        canonical_smiles=result["canonical_smiles"],
+        smiles_hash=result["smiles_hash"],
+        conformer_path=result["conformer_path"],
+        num_atoms_3d=result["num_atoms_3d"],
+        optimization_converged=result["optimization_converged"],
+        had_macrocycle=result["had_macrocycle"],
+        molecular_formula=result["molecular_formula"],
+        sdf_content=result.get("sdf_content", ""),
+        from_cache=False,
+        estado_del_ligando=result.get("estado_del_ligando"),
+    )
+
+
+@router.get(
+    "/render/{molecule_id}",
+    response_class=Response,
+    summary="Renderiza molécula en 2D",
+    description="Genera un SVG de la molécula usando RDKit de alta calidad.",
+)
+async def render_2d_molecule(
+    molecule_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserORM | None = Depends(get_current_user_optional),
+):
+    """Genera una miniatura SVG sólo para el dueño de la molécula."""
+    bind_context(endpoint="render_2d", molecule_id=str(molecule_id))
+    molecule = await require_owned_molecule(
+        repository=Repository(db), db=db, molecule_id=molecule_id,
+        current_user=current_user, forbidden_detail="Molécula no accesible",
+        missing_detail="Molécula no encontrada",
+    )
+
+    # 2 y 3. Construir el SVG con RDKit, fuera del bucle de eventos.
+    #
+    # La Moldex pide miniaturas de una rejilla entera: `Compute2DCoords` sobre
+    # decenas de moléculas seguidas, en el hilo async, bloqueaba el sondeo de
+    # progreso mientras se dibujaba la galería. Ver `properties_endpoint`.
+    def _dibujar(smiles: str) -> str | None:
+        mol = Chem.MolFromSmiles(smiles)
+        if not mol:
+            return None
+        # El mismo dibujo del que parte la elevación 3D (`chem/elevacion.py`):
+        # si divergieran, la ficha saltaría al empezar a girar.
+        return dibujo_2d(mol).svg
+
+    svg = await run_in_threadpool(_dibujar, molecule.smiles)
+    if svg is None:
+        log.error("SMILES corrupto en base de datos", molecule_id=molecule_id)
+        raise HTTPException(status_code=422, detail="SMILES inválido")
+
+    return Response(
+        content=svg,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "private, no-store"}
+    )
+
+
+# ── Elevación 2D → 3D ─────────────────────────────────────────────────────────
+
+
+class ElevacionRequest(BaseModel):
+    smiles: str = Field(..., min_length=1, max_length=2000,
+                        description="SMILES del editor. Se genera un conformador, no una pose.")
+    vista: Literal["escrita", "acoplada"] = Field(
+        "escrita",
+        description=("`escrita`: conformadores del SMILES tal cual. `acoplada`: la especie y el conformador de "
+                     "partida que prepararía la corrida, con su pH y su modo de tautómero."))
+    ph: float | None = Field(None, description="pH de la corrida (sólo `acoplada`). Se acota como en la corrida.")
+    tautomero: str | None = Field(None, description="Modo de tautómero de la corrida (sólo `acoplada`).")
+    molfile: str | None = Field(
+        None, max_length=500_000,
+        description=("Dibujo de Ketcher (molfile). Si es la molécula del SMILES, el levantamiento parte de él; "
+                     "si no, se usa el de RDKit y se dice (`dibujo`)."))
+    rapida: bool = Field(
+        False,
+        description=("Sólo `escrita`: una semilla en vez de tres, para enseñar algo enseguida. La abstención "
+                     "queda provisional (`abstencion_provisional`) hasta pedir la completa."))
+
+
+@router.get(
+    "/elevacion/{molecule_id}",
+    summary="Pose top-1 de una corrida, alineada con su miniatura 2D",
+    description=(
+        "Primer registro del SDF de la corrida (Vina top-1), alineado por rotación propia con el dibujo 2D de "
+        "`/chem/render/{id}`. Sin SDF de la corrida responde 404/409: no se sustituye por un conformador."
+    ),
+)
+async def elevacion_de_la_corrida(
+    molecule_id: uuid.UUID,
+    task_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: UserORM | None = Depends(get_current_user_optional),
+) -> dict:
+    from api.routers.evaluation_access import result_for_task
+    from services.docking.result_sdf import ResultSdfUnavailable, read_result_sdf
+
+    bind_context(endpoint="elevacion", molecule_id=str(molecule_id))
+    repository = Repository(db)
+    molecule = await require_owned_molecule(
+        repository=repository, db=db, molecule_id=molecule_id,
+        current_user=current_user, forbidden_detail="Molécula no accesible",
+        missing_detail="Molécula no encontrada",
+    )
+    selected = await result_for_task(repository, molecule_id, task_id)
+    try:
+        artefacto = await read_result_sdf(selected)
+    except ResultSdfUnavailable as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+    try:
+        modelo = await run_in_threadpool(modelo_desde_pose, molecule.smiles, artefacto.content)
+    except ElevacionNoDisponible as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    modelo["pose"]["task_id"] = getattr(selected, "task_id", None)
+    # Lo que la corrida ya guardó manda: la afinidad que enseñan la ficha y el
+    # dossier, y el veredicto físico de su pose top-1.
+    corrida = evidencia_de_la_corrida(selected)
+    if corrida["afinidad_kcal_mol"] is not None:
+        modelo["pose"]["afinidad_kcal_mol"] = corrida["afinidad_kcal_mol"]
+    modelo["pose"]["validez_fisica"] = corrida["validez_fisica"]
+    return modelo
+
+
+@router.post(
+    "/elevacion",
+    summary="Conformador calculado de un SMILES, alineado con su dibujo 2D",
+    description=(
+        "Vista previa del editor, no una pose de docking. `escrita`: ETKDGv3 + MMFF94 con semillas fijas. "
+        "`acoplada`: la especie y el conformador de partida que prepararía la corrida."
+    ),
+)
+async def elevacion_del_editor(request: ElevacionRequest) -> dict:
+    try:
+        if request.vista == "acoplada":
+            return await run_in_threadpool(
+                modelo_de_la_especie_acoplada, request.smiles, ph=request.ph, tautomero=request.tautomero,
+                molfile=request.molfile)
+        semillas = SEMILLAS_CRITERIO[:1] if request.rapida else SEMILLAS_CRITERIO
+        return await run_in_threadpool(modelo_desde_conformador, request.smiles, semillas=semillas,
+                                       molfile=request.molfile)
+    except ElevacionNoDisponible as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+# ── Endpoint de salud del servicio ────────────────────────────────────────────
+
+@router.get(
+    "/health",
+    summary="Estado del servicio químico",
+    description="Verifica que RDKit está disponible y funcionando.",
+    status_code=status.HTTP_200_OK,
+    include_in_schema=False,   # no aparece en /docs — es para monitoreo interno
+)
+async def chem_health() -> dict:
+    """
+    Verifica RDKit con una molécula de prueba simple (aspirina).
+    Si RDKit no está disponible, este endpoint falla y el health check
+    general de la API marca el servicio como no saludable.
+    """
+    from rdkit import Chem
+    from rdkit import __version__ as rdkit_version
+
+    # Prueba funcional mínima
+    test_mol = Chem.MolFromSmiles("CC(=O)Oc1ccccc1C(=O)O")
+    rdkit_ok = test_mol is not None
+
+    return {
+        "service":      "chem",
+        "status":       "healthy" if rdkit_ok else "degraded",
+        "rdkit_version": rdkit_version,
+        "test_molecule": "aspirina (C9H8O4)",
+        "test_passed":   rdkit_ok,
+    }

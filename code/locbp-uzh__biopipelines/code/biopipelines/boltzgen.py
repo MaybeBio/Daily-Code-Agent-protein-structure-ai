@@ -1,0 +1,1880 @@
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+"""
+BoltzGen configuration for protein binder design.
+
+Generates protein binders (proteins, peptides, or nanobodies) targeting specified molecules
+using diffusion models, inverse folding, and iterative structure validation.
+"""
+
+import os
+import json
+import re
+import shlex
+from typing import Dict, List, Any, Optional, Union
+
+try:
+    from .base_config import BaseConfig, StandardizedOutput, TableInfo, _validate_freeform_string
+    from .file_paths import Path
+    from .datastream import DataStream, create_map_table
+    from .biopipelines_io import Resolve
+except ImportError:
+    import sys
+    sys.path.append(os.path.dirname(__file__))
+    from base_config import BaseConfig, StandardizedOutput, TableInfo, _validate_freeform_string
+    from file_paths import Path
+    from datastream import DataStream, create_map_table
+    from biopipelines_io import Resolve
+
+
+class BoltzGen(BaseConfig):
+    """
+    BoltzGen configuration for protein binder design.
+
+    Generates and validates protein binders for target molecules using:
+    - Diffusion-based backbone generation
+    - Inverse folding for sequence design
+    - Structure prediction for validation
+    - Multi-metric filtering and ranking
+
+    Commonly used for:
+    - De novo binder design against protein targets
+    - Peptide binder generation
+    - Nanobody design
+    - Protein-small molecule binder design
+    """
+
+    # Tool identification
+    TOOL_NAME = "BoltzGen"
+    TOOL_VERSION = "2.6"
+    ENV_NAME = "boltzgen"
+
+    @classmethod
+    def _install_script(cls, folders, env_manager="mamba", force_reinstall=False, **kwargs):
+        env = cls._install_env(env_manager)
+        biopipelines = folders.get("biopipelines", "")
+        env_check = cls._env_exists_check(env, env_manager)
+        # The local 0.3.1 patches lived only in site-packages, so a rebuild dropped them silently; apply (or confirm) them on every install.
+        patch_block = f"""BG_SITE="$({cls._env_run(env, env_manager)}python -c 'import boltzgen,os;print(os.path.dirname(os.path.dirname(boltzgen.__file__)))')"
+BG_PATCH="{biopipelines}/environments/patches/boltzgen-0.3.1-locbp.patch"
+if ! command -v patch >/dev/null 2>&1; then
+    echo "ERROR: 'patch' is not on PATH, so the BoltzGen local patches cannot be applied or confirmed."
+    echo "       Install it (e.g. 'mamba install -c conda-forge patch' or the OS package) and rerun the install."
+    exit 1
+elif patch -d "$BG_SITE" -p1 -R --dry-run -s -f < "$BG_PATCH" >/dev/null 2>&1; then
+    echo "BoltzGen local patches already applied"
+elif patch -d "$BG_SITE" -p1 --forward -s < "$BG_PATCH"; then
+    echo "Applied BoltzGen local patches to $BG_SITE"
+else
+    echo "ERROR: the BoltzGen local patches do not apply to $BG_SITE (expected boltzgen 0.3.1)"
+    exit 1
+fi
+"""
+        skip = "" if force_reinstall else f"""# Check if already installed
+if {env_check}; then
+    echo "BoltzGen already installed, skipping. Use force_reinstall=True to reinstall."
+{patch_block}    touch "$INSTALL_SUCCESS"
+    exit 0
+fi
+"""
+        remove_block = cls._env_remove_block(env, env_manager) if force_reinstall else ""
+        env_block = cls._env_install_block(env, env_manager, biopipelines)
+        return f"""echo "=== Installing BoltzGen ==="
+{skip}{remove_block}
+{env_block}
+{patch_block}
+
+# Verify installation
+if {cls._env_run(env, env_manager)}python -c "import boltzgen" >/dev/null 2>&1; then
+    touch "$INSTALL_SUCCESS"
+    echo "=== BoltzGen installation complete ==="
+else
+    echo "ERROR: BoltzGen verification failed (cannot import boltzgen)"
+    exit 1
+fi
+"""
+
+    # Lazy path descriptors for output files
+    # BoltzGen already produces a structured tree (intermediate_designs/,
+    # intermediate_designs_inverse_folded/, final_ranked_designs/, config/,
+    # design_spec.cif, steps.yaml) so we point its --output directly at the
+    # step's output_folder and surface those native folders as named streams
+    # — no `_execution/<step>/` wrapper. Slug uniqueness (BoltzGen's CLI
+    # derives per-source design IDs from `_slugify_run_tag(basename(--output))`,
+    # see boltzgen.cli.boltzgen) is preserved because the step folder
+    # basename is already globally unique within a pipeline (e.g.
+    # "002_BoltzGen_batch01"). Framework-owned artefacts still land in the
+    # canonical slots (`_configuration/`, `_execution/`, `tables/`, `_extras/`).
+    boltzgen_run_folder = Path(lambda self: self.output_folder)
+    design_spec_yaml_file = Path(lambda self: self.configuration_path("design_spec.yaml"))
+    config_folder = Path(lambda self: os.path.join(self.boltzgen_run_folder, "config"))
+    intermediate_designs_folder = Path(lambda self: self.stream_folder("intermediate_designs"))
+    intermediate_inverse_folded_folder = Path(lambda self: self.stream_folder("intermediate_designs_inverse_folded"))
+    final_ranked_folder = Path(lambda self: self.stream_folder("final_ranked_designs"))
+    all_designs_metrics_csv = Path(lambda self: os.path.join(self.final_ranked_folder, "all_designs_metrics.csv"))
+    final_designs_metrics_csv = Path(lambda self: os.path.join(self.final_ranked_folder, f"final_designs_metrics_{self.budget}.csv"))
+    aggregate_metrics_csv = Path(lambda self: os.path.join(self.intermediate_inverse_folded_folder, "aggregate_metrics_analyze.csv"))
+    per_target_metrics_csv = Path(lambda self: os.path.join(self.intermediate_inverse_folded_folder, "per_target_metrics_analyze.csv"))
+    results_overview_pdf = Path(lambda self: os.path.join(self.final_ranked_folder, "results_overview.pdf"))
+    # Map tables for streams whose folder is one of BoltzGen's native folders:
+    # they live directly inside the stream folder (= the BoltzGen folder),
+    # next to BoltzGen's own files.
+    final_ranked_map = Path(lambda self: self.stream_map_path("final_ranked_designs"))
+    refolded_structures_map = Path(lambda self: self.stream_map_path("intermediate_designs_inverse_folded"))
+    # Content-bearing sequences stream: sequences.csv IS the content table
+    # and the map_table simultaneously. Lives inside the stream folder.
+    sequences_csv = Path(lambda self: self.stream_path("sequences", "sequences.csv"))
+
+    # Helper script paths
+    boltzgen_helper_py = Path(lambda self: self.pipe_script_path("pipe_boltzgen.py"))
+    boltzgen_config_py = Path(lambda self: self.pipe_script_path("pipe_boltzgen_config.py"))
+    target_ds_json = Path(lambda self: self.configuration_path("target_structure.json"))
+    compounds_input_json = Path(lambda self: self.configuration_path(".input_compounds.json"))
+    compounds_input_csv = Path(lambda self: self.configuration_path(".input_compounds.csv"))
+
+    def __init__(self,
+                 # Design specification - Option 1: Manual YAML/dict
+                 design_spec: Union[str, Dict[str, Any]] = None,
+                 # Design specification - Option 2: Automatic building from BioPipelines inputs
+                 # For protein-small_molecule: use ligand parameter
+                 # For protein-anything: use target_structure parameter
+                 ligand: Union[DataStream, StandardizedOutput] = None,
+                 target_structure: Union[str, DataStream, StandardizedOutput] = None,
+                 binder_spec: Union[str, Dict[str, Any]] = None,
+                 binding_region: str = None,
+                 # Output configuration
+                 protocol: str = "protein-anything",
+                 num_designs: int = 10000,
+                 budget: int = 100,
+                 # Design generation parameters
+                 design_checkpoints: Optional[List[str]] = None,
+                 step_scale: Optional[float] = None,
+                 noise_scale: Optional[float] = None,
+                 diffusion_batch_size: Optional[int] = None,
+                 # Inverse folding parameters
+                 inverse_fold_num_sequences: int = 1,
+                 skip_inverse_folding: bool = False,
+                 # Filtering parameters
+                 alpha: float = None,
+                 filter_biased: bool = True,
+                 refolding_rmsd_threshold: Optional[float] = None,
+                 additional_filters: Optional[List[str]] = None,
+                 metrics_override: Optional[Dict[str, float]] = None,
+                 # Execution parameters
+                 devices: Optional[int] = None,
+                 reuse: Union[DataStream, StandardizedOutput, str, None] = None,
+                 steps: Optional[List[str]] = None,
+                 cache_dir: Optional[str] = None,
+                 smiles_overrides: Optional[Dict[str, str]] = None,
+                 **kwargs):
+        """
+        Initialize BoltzGen configuration.
+
+        You can provide EITHER design_spec (manual) OR automatic mode inputs.
+        For automatic mode, use ONE of:
+        - ligand + binder_spec: For protein-small_molecule protocol (binder against small molecule)
+        - target_structure + binder_spec: For protein-anything protocol (binder against protein target)
+
+        Args:
+            design_spec: YAML configuration string/dict or path to YAML file defining:
+                        - Target entities (proteins, ligands)
+                        - Binder specification (sequence ranges)
+                        - Binding site constraints
+                        - Secondary structure specifications
+            ligand: Ligand input from Ligand tool (DataStream/StandardizedOutput).
+                   For protein-small_molecule protocol. The tool reads the compounds.csv
+                   to determine format (smiles/ccd) automatically.
+            target_structure: BioPipelines structure input (DataStream or file path) for
+                            protein-anything protocol (binder against protein target)
+            binder_spec: Binder specification for automatic building:
+                        - String format: "50-100" for length range, or "50" for fixed length
+                        - Dict format: {"length": [50, 100]} or custom specification
+            binding_region: Target binding region (optional, PyMOL-style: "A:9-140")
+            protocol: Design protocol - one of:
+                     - "protein-anything": General protein binder design
+                     - "peptide-anything": Peptide binder design
+                     - "protein-small_molecule": Protein-small molecule binder design
+                     - "nanobody-anything": Nanobody design
+            num_designs: Total number of designs to generate (default: 10000)
+            budget: Final number of designs after diversity filtering (default: 100)
+            design_checkpoints: Model checkpoint paths for backbone generation
+            step_scale: Diffusion sampling step scale parameter
+            noise_scale: Diffusion sampling noise scale parameter
+            diffusion_batch_size: Samples per trunk run (auto if None)
+            inverse_fold_num_sequences: Sequences per backbone (default: 1)
+            skip_inverse_folding: Skip sequence redesign step (default: False)
+            alpha: Quality/diversity in sequence during filtering (0.0=quality, 1.0=diversity, default: 0.01 peptides and 0.001 others)
+            filter_biased: Remove amino acid composition outliers (default: True)
+            refolding_rmsd_threshold: RMSD threshold for filtering designs based on refolding (e.g., 2.5)
+            additional_filters: Hard threshold expressions (e.g., ["design_ALA>0.3"])
+            metrics_override: Per-metric ranking weights override
+            devices: Number of GPUs to use (default: auto-detect)
+            reuse: Previous BoltzGen run to resume or extend. Can be:
+                  - DataStream/StandardizedOutput from a previous BoltzGen call
+                  - String path to a previous BoltzGen output directory
+                  When provided, operates on the existing output folder instead of
+                  creating a new one. Use with `steps` to run specific steps only
+                  (e.g., steps=["analysis"] or steps=["filtering"]).
+            steps: Run only specific pipeline steps (default: all steps)
+            cache_dir: Model/cache location (default: /home/$USER/data/boltzgen, auto-downloaded on first run)
+            **kwargs: Additional parameters passed to BaseConfig
+
+        Output:
+            Streams: final_ranked_designs (.cif), sequences (.csv), intermediate_designs_inverse_folded (.cif)
+            Tables:
+                aggregate_metrics: id | file_name | designed_sequence | num_prot_tokens | native_rmsd | design_ptm | design_iptm | affinity_pred_value | ...
+                all_designs_metrics: id | final_rank | designed_sequence | affinity_probability_binary1 | design_to_target_iptm | filter_rmsd | ...
+                final_designs_metrics: id | final_rank | designed_sequence | ... (same as all_designs_metrics, filtered)
+        """
+        # Store design specification parameters
+        self.design_spec = design_spec
+        self.binder_spec = binder_spec
+        self.binding_region = binding_region
+
+        # Store output configuration
+        self.protocol = protocol
+        self.num_designs = num_designs
+        self.budget = budget
+
+        # Design generation parameters
+        self.design_checkpoints = design_checkpoints
+        self.step_scale = step_scale
+        self.noise_scale = noise_scale
+        self.diffusion_batch_size = diffusion_batch_size
+
+        # Inverse folding parameters
+        self.inverse_fold_num_sequences = inverse_fold_num_sequences
+        self.skip_inverse_folding = skip_inverse_folding
+
+        # Filtering parameters
+        self.alpha = alpha
+        self.filter_biased = filter_biased
+        self.refolding_rmsd_threshold = refolding_rmsd_threshold
+        self.additional_filters = additional_filters or []
+        self.metrics_override = metrics_override
+
+        # Execution parameters
+        self.devices = devices
+        self.steps = steps or []
+        self.cache_dir = cache_dir
+        self.smiles_overrides = smiles_overrides or {}
+
+        # Track inputs from previous tools
+        self.ligand_compounds_csv = None  # Path to compounds.csv from Ligand tool
+        self.compounds_stream = None  # Source compounds stream for runtime id filtering
+        self.target_structure_path = None  # Raw path string (when given directly)
+        self.target_stream = None  # DataStream for runtime resolution
+        self.target_input_id = None  # ID of target structure
+        self.reuse_path = None  # Will be set in configure_inputs if reuse is provided
+
+        # Resolve input types and extract paths
+        self._resolve_ligand_input(ligand)
+        self._resolve_target_structure_input(target_structure)
+        self._resolve_reuse_input(reuse)
+
+        # Determine specification mode
+        if reuse is not None:
+            # Reuse mode: operating on existing BoltzGen output
+            self.spec_mode = "reuse"
+            self.design_spec_is_dict = False
+            self.design_spec_is_yaml_str = False
+            self.design_spec_is_file = False
+        elif design_spec is not None:
+            # Manual mode: user provided design_spec
+            self.spec_mode = "manual"
+            self.design_spec_is_dict = isinstance(design_spec, dict)
+            self.design_spec_is_yaml_str = isinstance(design_spec, str) and (
+                'entities:' in design_spec or '- protein:' in design_spec
+            )
+            self.design_spec_is_file = isinstance(design_spec, str) and not self.design_spec_is_yaml_str
+        elif self.ligand_compounds_csv is not None and binder_spec is not None:
+            # Automatic mode: ligand + binder_spec (protein-small_molecule)
+            self.spec_mode = "ligand"
+            self.design_spec_is_dict = False
+            self.design_spec_is_yaml_str = False
+            self.design_spec_is_file = False
+        elif (self.target_stream is not None or self.target_structure_path is not None) and binder_spec is not None:
+            # Automatic mode: target_structure + binder_spec (protein-anything)
+            self.spec_mode = "target"
+            self.design_spec_is_dict = False
+            self.design_spec_is_yaml_str = False
+            self.design_spec_is_file = False
+        else:
+            self.spec_mode = None  # Will fail validation
+
+        # Initialize base class
+        super().__init__(**kwargs)
+
+    def _resolve_ligand_input(self, ligand: Union[DataStream, StandardizedOutput, None]):
+        """Resolve ligand input to compounds CSV path."""
+        # Kept whole: the upstream `missing` manifest hangs off .tables, not off a DataStream.
+        self.ligand_input = ligand
+        if ligand is None:
+            return
+
+        if isinstance(ligand, StandardizedOutput):
+            if ligand.streams.compounds and len(ligand.streams.compounds) > 0:
+                # compounds is a DataStream, get map_table
+                self.compounds_stream = ligand.streams.compounds
+                self.ligand_compounds_csv = ligand.streams.compounds.map_table
+            elif hasattr(ligand, 'tables') and hasattr(ligand.tables, 'compounds'):
+                self.ligand_compounds_csv = ligand.tables.compounds.info.path
+            else:
+                raise ValueError("Ligand StandardizedOutput has no compounds attribute")
+        elif isinstance(ligand, DataStream):
+            self.compounds_stream = ligand
+            self.ligand_compounds_csv = ligand.map_table
+        else:
+            raise ValueError(f"ligand must be DataStream or StandardizedOutput, got {type(ligand)}")
+
+    def _resolve_target_structure_input(self, target_structure: Union[str, DataStream, StandardizedOutput, None]):
+        """Resolve target structure input — store stream for runtime resolution."""
+        if target_structure is None:
+            return
+
+        if isinstance(target_structure, StandardizedOutput):
+            if target_structure.streams.structures and len(target_structure.streams.structures) > 0:
+                self.target_stream = target_structure.streams.structures
+                self.target_input_id = self.target_stream.ids[0]
+            else:
+                raise ValueError("target_structure StandardizedOutput has no structures")
+        elif isinstance(target_structure, DataStream):
+            if len(target_structure) > 0:
+                self.target_stream = target_structure
+                self.target_input_id = self.target_stream.ids[0]
+            else:
+                raise ValueError("target_structure DataStream is empty")
+        elif isinstance(target_structure, str):
+            # Raw path string — no DataStream, will be used directly
+            self.target_structure_path = target_structure
+        else:
+            raise ValueError(f"target_structure must be str, DataStream, or StandardizedOutput, got {type(target_structure)}")
+
+    def _resolve_reuse_input(self, reuse: Union[DataStream, StandardizedOutput, str, None]):
+        """Resolve reuse input to output folder path."""
+        if reuse is None:
+            return
+
+        if isinstance(reuse, StandardizedOutput):
+            if hasattr(reuse, 'output_folder') and reuse.output_folder:
+                self.reuse_path = reuse.output_folder
+            else:
+                raise ValueError("StandardizedOutput has no output_folder")
+        elif isinstance(reuse, str):
+            self.reuse_path = reuse
+        else:
+            raise ValueError(f"reuse must be StandardizedOutput or path string, got {type(reuse)}")
+
+    def validate_params(self):
+        """Validate BoltzGen parameters."""
+        for code, smiles in self.smiles_overrides.items():
+            # The code becomes an env-var name and is matched against the CIF res_name verbatim.
+            if not re.fullmatch(r"[A-Z0-9]{1,5}", str(code)):
+                raise ValueError(f"smiles_overrides key {code!r} must be a CCD-style code: "
+                                 f"1-5 uppercase letters or digits")
+            if not isinstance(smiles, str) or not smiles.strip() or any(c.isspace() for c in smiles):
+                raise ValueError(f"smiles_overrides[{code!r}] must be a single SMILES string")
+        # Validate specification mode
+        if self.spec_mode is None:
+            raise ValueError(
+                "Must provide EITHER design_spec (manual) OR "
+                "(ligand + binder_spec) for protein-small_molecule OR "
+                "(target_structure + binder_spec) for protein-anything OR "
+                "reuse (to continue from existing run)"
+            )
+
+        if self.spec_mode == "reuse":
+            # Validate reuse parameter
+            if self.reuse_path is None:
+                raise ValueError("reuse path could not be resolved")
+
+        if self.spec_mode == "manual" and not self.design_spec:
+            raise ValueError("design_spec cannot be empty in manual mode")
+
+        if self.spec_mode == "ligand":
+            if not self.ligand_compounds_csv:
+                raise ValueError("ligand is required for protein-small_molecule mode")
+            if not self.binder_spec:
+                raise ValueError("binder_spec is required for protein-small_molecule mode")
+
+        if self.spec_mode == "target":
+            if not self.target_stream and not self.target_structure_path:
+                raise ValueError("target_structure is required for protein-anything mode")
+            if not self.binder_spec:
+                raise ValueError("binder_spec is required for protein-anything mode")
+
+        # Validate protocol
+        valid_protocols = [
+            "protein-anything", "peptide-anything",
+            "protein-small_molecule", "nanobody-anything"
+        ]
+        if self.protocol not in valid_protocols:
+            raise ValueError(
+                f"protocol must be one of {valid_protocols}, got '{self.protocol}'"
+            )
+
+        # Validate numeric parameters
+        if self.num_designs <= 0:
+            raise ValueError("num_designs must be positive")
+
+        if self.budget <= 0:
+            raise ValueError("budget must be positive")
+
+        if self.budget > self.num_designs:
+            self.budget = self.num_designs
+            print("[Warning] budget was set equal to num_designs.")
+
+        if self.inverse_fold_num_sequences <= 0:
+            raise ValueError("inverse_fold_num_sequences must be positive")
+
+        if self.alpha and not (0.0 <= self.alpha <= 1.0):
+            raise ValueError("alpha must be between 0.0 and 1.0")
+
+        # Validate diffusion parameters if provided
+        if self.step_scale is not None and self.step_scale <= 0:
+            raise ValueError("step_scale must be positive")
+
+        if self.noise_scale is not None and self.noise_scale <= 0:
+            raise ValueError("noise_scale must be positive")
+
+        if self.diffusion_batch_size is not None and self.diffusion_batch_size <= 0:
+            raise ValueError("diffusion_batch_size must be positive")
+
+        if self.devices is not None and self.devices <= 0:
+            raise ValueError("devices must be positive")
+
+        _validate_freeform_string("binding_region", self.binding_region)
+        _validate_freeform_string("cache_dir", self.cache_dir)
+        if isinstance(self.design_spec, str):
+            _validate_freeform_string("design_spec", self.design_spec)
+        if isinstance(self.binder_spec, str):
+            _validate_freeform_string("binder_spec", self.binder_spec)
+        if self.additional_filters:
+            for i, f in enumerate(self.additional_filters):
+                _validate_freeform_string(f"additional_filters[{i}]", f)
+        if self.design_checkpoints:
+            for i, c in enumerate(self.design_checkpoints):
+                _validate_freeform_string(f"design_checkpoints[{i}]", c)
+        if self.steps:
+            for i, s in enumerate(self.steps):
+                _validate_freeform_string(f"steps[{i}]", s)
+
+        # Warn if analysis step will run with less than 64GB memory (OOM risk)
+        has_analysis = "analysis" in self.steps or not self.steps
+        if has_analysis:
+            mem_str = self.resources.get("memory", "")
+            if mem_str:
+                mem_gb = int(''.join(c for c in mem_str if c.isdigit()))
+                if "MB" in mem_str.upper():
+                    mem_gb = mem_gb // 1024
+                if mem_gb < 64:
+                    print(f'[Warning] BoltzGen "analysis" step may require >=64GB memory (currently {mem_str}). '
+                          f'Risk of OOM (SIGKILL). Consider increasing memory with pipeline.resources(memory="64GB").')
+
+    def configure_inputs(self, pipeline_folders: Dict[str, str]):
+        """Configure input design specification and dependencies."""
+        self.folders = pipeline_folders
+
+        # Handle reuse mode - override output_folder with reuse path.
+        # Reuse runs (e.g. analysis-only, filtering-only) write their
+        # results back into the upstream folder, so this step's own folder
+        # would be left empty. Drop a README pointer there so users can
+        # navigate to the actual outputs.
+        if self.spec_mode == "reuse" and self.reuse_path:
+            original_folder = self.output_folder
+            self._write_reuse_pointer_readme(original_folder, self.reuse_path)
+            self.output_folder = self.reuse_path
+
+        # Use BoltzGenCache folder if user didn't specify custom cache_dir
+        if self.cache_dir is None:
+            self.cache_dir = pipeline_folders.get("BoltzGenCache", None)
+
+        if self.spec_mode == "manual":
+            # Handle manual design specification input
+            if self.design_spec_is_file:
+                # File path - check if it exists
+                if os.path.isabs(self.design_spec):
+                    spec_path = self.design_spec
+                else:
+                    # Try relative to project folders
+                    spec_path = os.path.join(pipeline_folders.get("biopipelines", "."), self.design_spec)
+
+                if not os.path.exists(spec_path):
+                    raise ValueError(f"Design specification file not found: {self.design_spec}")
+
+                self.design_spec = spec_path
+
+    def _write_reuse_pointer_readme(self, step_folder: str, reuse_path: str) -> None:
+        """Drop a README in this step's (otherwise-empty) folder pointing
+        users at the upstream output folder where the reuse run actually
+        writes its results.
+        """
+        if not step_folder:
+            return
+        try:
+            os.makedirs(step_folder, exist_ok=True)
+            steps_line = ", ".join(self.steps) if self.steps else "(default — all steps)"
+            readme = (
+                f"# {os.path.basename(step_folder)}\n\n"
+                f"This step ran `BoltzGen(reuse=...)` and only added results "
+                f"(steps: {steps_line}) to the upstream BoltzGen output folder.\n\n"
+                f"**Outputs are in:**\n\n    {reuse_path}\n\n"
+                f"Browse that folder to find `final_ranked_designs/`, "
+                f"`intermediate_designs_inverse_folded/`, etc.\n"
+            )
+            with open(os.path.join(step_folder, "README.md"), "w") as f:
+                f.write(readme)
+        except OSError:
+            # Non-fatal: the step still works without the pointer.
+            pass
+
+    def get_config_display(self) -> List[str]:
+        """Get BoltzGen configuration display lines."""
+        config_lines = super().get_config_display()
+
+        # Design specification display
+        if self.spec_mode == "manual":
+            if self.design_spec_is_dict:
+                spec_display = f"Manual (Dictionary, {len(self.design_spec)} keys)"
+            elif self.design_spec_is_file:
+                spec_display = f"Manual (File: {os.path.basename(self.design_spec)})"
+            else:
+                spec_display = "Manual (YAML string)"
+        elif self.spec_mode == "ligand":
+            spec_display = "Automatic (from ligand + binder_spec)"
+            if self.ligand_compounds_csv:
+                spec_display += f"\n  Ligand CSV: {os.path.basename(self.ligand_compounds_csv)}"
+            if self.binder_spec:
+                spec_display += f"\n  Binder: {self.binder_spec}"
+            if self.binding_region:
+                spec_display += f"\n  Binding region: {self.binding_region}"
+        elif self.spec_mode == "target":
+            spec_display = "Automatic (from target_structure + binder_spec)"
+            if self.target_input_id:
+                spec_display += f"\n  Target: {self.target_input_id}"
+            elif self.target_structure_path:
+                spec_display += f"\n  Target: {os.path.basename(self.target_structure_path)}"
+            if self.binder_spec:
+                spec_display += f"\n  Binder: {self.binder_spec}"
+            if self.binding_region:
+                spec_display += f"\n  Binding region: {self.binding_region}"
+        elif self.spec_mode == "reuse":
+            spec_display = "Reuse (from previous BoltzGen run)"
+            if self.reuse_path:
+                spec_display += f"\n  Source: {os.path.basename(self.reuse_path)}"
+            if self.steps:
+                spec_display += f"\n  Steps: {', '.join(self.steps)}"
+        else:
+            spec_display = "Unknown mode"
+
+        config_lines.extend([
+            f"DESIGN SPEC: {spec_display}",
+            f"PROTOCOL: {self.protocol}",
+            f"NUM DESIGNS: {self.num_designs}",
+            f"BUDGET: {self.budget}",
+            f"INVERSE FOLD SEQUENCES: {self.inverse_fold_num_sequences}",
+            f"ALPHA (quality/diversity): {self.alpha}",
+            f"FILTER BIASED: {self.filter_biased}"
+        ])
+
+        if self.additional_filters:
+            config_lines.append(f"ADDITIONAL FILTERS: {', '.join(self.additional_filters)}")
+
+        if self.skip_inverse_folding:
+            config_lines.append("SKIP INVERSE FOLDING: True")
+
+        if self.steps:
+            config_lines.append(f"STEPS: {', '.join(self.steps)}")
+
+        if self.devices:
+            config_lines.append(f"DEVICES: {self.devices}")
+
+        return config_lines
+
+    def _build_automatic_yaml_spec(self) -> Dict[str, Any]:
+        """
+        Build BoltzGen YAML specification from BioPipelines inputs.
+
+        Returns:
+            Dictionary representing the design specification
+        """
+        # Parse binder_spec
+        if isinstance(self.binder_spec, dict):
+            if "length" not in self.binder_spec:
+                raise ValueError("binder_spec dict must contain 'length' key")
+            binder_length = self.binder_spec["length"]
+        elif isinstance(self.binder_spec, str):
+            # Parse string format: "50-100" or "50"
+            if "-" in self.binder_spec:
+                parts = self.binder_spec.split("-")
+                binder_length = [int(parts[0]), int(parts[1])]
+            else:
+                length_val = int(self.binder_spec)
+                binder_length = [length_val, length_val]
+        else:
+            raise ValueError(f"Invalid binder_spec format: {self.binder_spec}")
+
+        # Build entities section
+        entities = []
+
+        # Add target structure — path resolved at runtime
+        target_path = self.target_structure_path or "__RESOLVE_TARGET_STRUCTURE__"
+        entities.append({
+            "file": {
+                "path": target_path,
+                "include": [{"chain": {"id": "A"}}]  # Default to chain A
+            }
+        })
+
+        # Add binder
+        entities.append({
+            "protein": {
+                "id": "binder",
+                "sequence": f"{binder_length[0]}..{binder_length[1]}"
+            }
+        })
+
+        # Build the full specification
+        spec = {"entities": entities}
+
+        # Add bindings section if binding region is specified
+        if self.binding_region:
+            # Parse binding region format: "A:9-140" -> target_chains: [A], target_region: "9-140"
+            if ":" in self.binding_region:
+                chain, region = self.binding_region.split(":", 1)
+                spec["bindings"] = [{
+                    "binder_chain": "binder",
+                    "target_chains": [chain],
+                    "target_region": region
+                }]
+
+        return spec
+
+    def generate_script(self, script_path: str) -> str:
+        """
+        Generate BoltzGen execution script.
+
+        Args:
+            script_path: Path where script should be written
+
+        Returns:
+            Script content as string
+        """
+        # configuration/, execution/ auto-created by the pipeline. The
+        # BoltzGen-internal config/ subfolder is created on demand by the
+        # CLI; we don't pre-create it.
+
+        # Serialize target DataStream to JSON for runtime file resolution
+        if self.target_stream:
+            self.target_stream.save_json(self.target_ds_json)
+
+        # Filtered compounds CSV materialized at runtime (honors an upstream filter)
+        compounds_block = ""
+        if self.compounds_stream is not None:
+            self.compounds_stream.save_json(self.compounds_input_json)
+            self.ligand_compounds_csv = self.compounds_input_csv
+            compounds_block = self.generate_filtered_map_table_block(
+                self.compounds_input_json, self.compounds_input_csv,
+                input_sources=[self.ligand_input],
+            )
+
+        # Parse binder spec
+        binder_min, binder_max = self._parse_binder_spec()
+
+        # Generate config generation section (all modes generate YAML at runtime)
+        config_generation_section = self._generate_config_section(binder_min, binder_max)
+
+        # Build BoltzGen command
+        boltzgen_cmd = self._build_boltzgen_command()
+
+        # Determine if postprocessing is needed (only for filtering step)
+        # If no steps specified, all steps run including filtering
+        has_filtering = "filtering" in self.steps if self.steps else True
+
+        # Build postprocessing section
+        if has_filtering:
+            # Route BoltzGen-facing artefacts into the canonical slots:
+            #   structures.csv → tables/structures.csv
+            #   sequences.csv  → sequences/sequences.csv (content-bearing stream)
+            #   final_structures.txt → _extras/
+            structures_table = self.table_path("structures")
+            sequences_csv = self.sequences_csv
+            structures_list = os.path.join(self.extras_folder, "final_structures.txt")
+            postprocessing_section = f"""
+# Run postprocessing to extract sequences and validate outputs
+echo "Running BoltzGen postprocessing..."
+python "{self.boltzgen_helper_py}" \\
+  --output_folder "{self.boltzgen_run_folder}" \\
+  --budget {self.budget} \\
+  --extract_sequences \\
+  --validate \\
+  --sequences-csv "{sequences_csv}" \\
+  --structures-csv "{structures_table}" \\
+  --structures-list "{structures_list}"
+
+if [ $? -eq 0 ]; then
+    echo "Postprocessing completed successfully"
+else
+    echo "Warning: Postprocessing had errors (continuing anyway)"
+fi
+"""
+        else:
+            postprocessing_section = ""
+
+        # Generate script content
+        script_content = "#!/bin/bash\n"
+        script_content += "# BoltzGen execution script\n"
+        script_content += self.generate_completion_check_header()
+        script_content += compounds_block
+        script_content += self.activate_environment()
+        for _code, _smi in self.smiles_overrides.items():
+            script_content += f'export BOLTZGEN_SMILES_{_code}={shlex.quote(_smi)}\n'
+        script_content += f"""
+echo "Running BoltzGen binder design"
+echo "Protocol: {self.protocol}"
+echo "Output folder: {self.output_folder}"
+
+{config_generation_section}
+
+echo "Design specification: {self.design_spec_yaml_file}"
+
+# Run BoltzGen
+{boltzgen_cmd}
+
+if [ $? -eq 0 ]; then
+    echo "BoltzGen completed successfully"
+else
+    echo "Error: BoltzGen failed"
+    exit 1
+fi
+{postprocessing_section}
+"""
+        script_content += self.generate_completion_check_footer()
+
+        return script_content
+
+    def _parse_binder_spec(self):
+        """Parse binder_spec into min and max length values."""
+        if isinstance(self.binder_spec, dict):
+            # Dict format: {"length": [50, 100]}
+            if "length" not in self.binder_spec:
+                raise ValueError("binder_spec dict must contain 'length' key")
+            length = self.binder_spec["length"]
+            if isinstance(length, list) and len(length) == 2:
+                return length[0], length[1]
+            elif isinstance(length, int):
+                return length, length
+            else:
+                raise ValueError(f"Invalid length format in binder_spec: {length}")
+        elif isinstance(self.binder_spec, str):
+            # String format: "50-100" or "50"
+            if "-" in self.binder_spec:
+                parts = self.binder_spec.split("-")
+                return int(parts[0]), int(parts[1])
+            else:
+                length = int(self.binder_spec)
+                return length, length
+        else:
+            raise ValueError(f"Invalid binder_spec type: {type(self.binder_spec)}")
+
+    def _generate_config_section(self, binder_min: int, binder_max: int) -> str:
+        """Generate the config file creation section for the bash script."""
+        if self.spec_mode == "reuse":
+            # Reuse mode: design_spec.yaml already exists in the reuse folder
+            return f'''# Using existing design specification from previous run
+echo "Reusing design specification from: {self.reuse_path}"
+echo "Design spec: {self.design_spec_yaml_file}"
+'''
+
+        if self.spec_mode == "ligand":
+            # Ligand mode: generate YAML at runtime from compounds.csv
+            target_args = ""
+            if self.binding_region:
+                target_args += f' --binding-region "{self.binding_region}"'
+
+            return f'''# Generate design specification from ligand
+echo "Generating design specification from ligand compounds..."
+python "{self.boltzgen_config_py}" \\
+  --ligand-csv "{self.ligand_compounds_csv}" \\
+  --output-yaml "{self.design_spec_yaml_file}" \\
+  --binder-length-min {binder_min} \\
+  --binder-length-max {binder_max}{target_args}
+
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to generate design specification"
+    exit 1
+fi
+'''
+
+        elif self.spec_mode == "target":
+            # Target mode: generate YAML at runtime with target structure
+            # Resolve target structure path at runtime if from a DataStream
+            resolve_snippet = ""
+            if self.target_stream:
+                resolve_snippet = f"""TARGET_ID={Resolve.stream_ids(self.target_ds_json, index=0, valid_set=True)}
+TARGET_STRUCTURE={Resolve.stream_item(self.target_ds_json, '$TARGET_ID')}
+"""
+                target_args = ' --target-structure "$TARGET_STRUCTURE"'
+            else:
+                target_args = f' --target-structure "{self.target_structure_path}"'
+
+            if self.binding_region:
+                target_args += f' --binding-region "{self.binding_region}"'
+
+            return f'''{resolve_snippet}# Generate design specification from target structure
+echo "Generating design specification from target structure..."
+python "{self.boltzgen_config_py}" \\
+  --ligand-csv "NONE" \\
+  --output-yaml "{self.design_spec_yaml_file}" \\
+  --binder-length-min {binder_min} \\
+  --binder-length-max {binder_max}{target_args}
+
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to generate design specification"
+    exit 1
+fi
+'''
+
+        elif self.spec_mode == "manual":
+            # Manual mode: write YAML at configuration time (user-provided spec)
+            if self.design_spec_is_dict:
+                # Convert dictionary to YAML and write to file at configuration time
+                import yaml
+                with open(self.design_spec_yaml_file, 'w') as f:
+                    yaml.dump(self.design_spec, f, default_flow_style=False)
+                return f'# Using pre-generated design specification: {self.design_spec_yaml_file}\n'
+            elif self.design_spec_is_yaml_str:
+                # Write YAML string to file at configuration time
+                with open(self.design_spec_yaml_file, 'w') as f:
+                    f.write(self.design_spec)
+                return f'# Using pre-generated design specification: {self.design_spec_yaml_file}\n'
+            elif self.design_spec_is_file:
+                # Copy existing file to output folder at configuration time
+                import shutil
+                shutil.copy(self.design_spec, self.design_spec_yaml_file)
+                return f'# Using copied design specification: {self.design_spec_yaml_file}\n'
+
+        return "# Unknown spec mode\n"
+
+    def _build_boltzgen_command(self) -> str:
+        """Build the boltzgen run command with all arguments."""
+        # Base command (container_prefix is a no-op when no container is set)
+        cmd_parts = [
+            f"{self.container_prefix()}boltzgen run",
+            f'"{self.design_spec_yaml_file}"',
+            # BoltzGen writes its tree directly into the step folder; the
+            # step's basename is unique across parallel runs.
+            f'--output "{self.boltzgen_run_folder}"',
+            f'--protocol {self.protocol}',
+            f'--num_designs {self.num_designs}',
+            f'--budget {self.budget}'
+        ]
+
+        # Design generation parameters
+        if self.design_checkpoints:
+            checkpoints_str = ' '.join(f'"{cp}"' for cp in self.design_checkpoints)
+            cmd_parts.append(f'--design_checkpoints {checkpoints_str}')
+
+        if self.step_scale is not None:
+            cmd_parts.append(f'--step_scale {self.step_scale}')
+
+        if self.noise_scale is not None:
+            cmd_parts.append(f'--noise_scale {self.noise_scale}')
+
+        if self.diffusion_batch_size is not None:
+            cmd_parts.append(f'--diffusion_batch_size {self.diffusion_batch_size}')
+
+        # Inverse folding parameters
+        cmd_parts.append(f'--inverse_fold_num_sequences {self.inverse_fold_num_sequences}')
+
+        if self.skip_inverse_folding:
+            cmd_parts.append('--skip_inverse_folding')
+
+        # Filtering parameters
+        if self.alpha:
+            cmd_parts.append(f'--alpha {self.alpha}')
+
+        if not self.filter_biased:
+            cmd_parts.append('--filter_biased false')
+
+        if self.refolding_rmsd_threshold is not None:
+            cmd_parts.append(f'--refolding_rmsd_threshold {self.refolding_rmsd_threshold}')
+
+        if self.additional_filters:
+            # Format: --additional_filters 'feature>threshold' 'feature<threshold'
+            filters_str = ' '.join(f"'{f}'" for f in self.additional_filters)
+            cmd_parts.append(f"--additional_filters {filters_str}")
+
+        if self.metrics_override:
+            # Format: --metrics_override metric_name=weight metric_name=weight
+            # A larger weight down-weights that metric's rank
+            metrics_str = ' '.join(f"{k}={v}" for k, v in self.metrics_override.items())
+            cmd_parts.append(f"--metrics_override {metrics_str}")
+
+        # Execution parameters
+        if self.devices is not None:
+            cmd_parts.append(f'--devices {self.devices}')
+
+        if self.reuse_path:
+            cmd_parts.append('--reuse')
+
+        if self.steps:
+            steps_str = ' '.join(self.steps)
+            cmd_parts.append(f'--steps {steps_str}')
+
+        if self.cache_dir:
+            cmd_parts.append(f'--cache "{self.cache_dir}"')
+
+        # Join with line continuations for readability
+        return ' \\\n  '.join(cmd_parts)
+
+    def get_output_files(self) -> Dict[str, Any]:
+        """
+        Get expected output files after BoltzGen execution.
+
+        Predictions are step-dependent:
+        - "analysis" in steps: aggregate_metrics_analyze.csv, per_target_metrics_analyze.csv
+        - "filtering" in steps: structures in final_<budget>_designs/ (rankNNNN_*.cif),
+                                all_designs_metrics.csv, final_designs_metrics_<budget>.csv,
+                                results_overview.pdf
+        - "folding" in steps (but not filtering): structures in refold_cif/ (design_spec_NNN.cif)
+        - None of above: empty prediction
+
+        Returns:
+            Dictionary mapping output types to DataStream and TableInfo objects.
+        """
+        # Determine which steps are being run
+        # If no steps specified, BoltzGen runs all steps by default
+        steps = self.steps if self.steps else [
+            "design", "inverse_folding", "folding", "design_folding", "affinity", "analysis", "filtering"
+        ]
+        has_analysis = "analysis" in steps
+        has_filtering = "filtering" in steps
+        has_folding = "folding" in steps or "design_folding" in steps
+
+        # Initialize empty structures
+        tables = {}
+
+        # If no relevant steps, return empty prediction
+        if not has_analysis and not has_filtering and not has_folding:
+            return {
+                "tables": tables,
+                "output_folder": self.output_folder
+            }
+
+        # Analysis step outputs
+        if has_analysis:
+            tables["aggregate_metrics"] = TableInfo(
+                name="aggregate_metrics",
+                path=self.aggregate_metrics_csv,
+                columns=[
+                    "id", "file_name", "designed_sequence", "designed_chain_sequence",
+                    "num_prot_tokens", "num_lig_atoms", "num_resolved_tokens", "num_tokens",
+                    "num_design", "UNK_fraction", "GLY_fraction", "ALA_fraction", "CYS_fraction",
+                    "SER_fraction", "PRO_fraction", "THR_fraction", "VAL_fraction", "ILE_fraction",
+                    "ASN_fraction", "ASP_fraction", "LEU_fraction", "MET_fraction", "GLN_fraction",
+                    "GLU_fraction", "LYS_fraction", "HIS_fraction", "PHE_fraction", "ARG_fraction",
+                    "TYR_fraction", "TRP_fraction", "loop", "helix", "sheet", "liability_score",
+                    "liability_num_violations", "liability_high_severity_violations",
+                    "liability_medium_severity_violations", "liability_low_severity_violations",
+                    "native_rmsd", "native_rmsd_bb", "native_rmsd_refolded", "native_rmsd_bb_refolded",
+                    "bb_rmsd", "bb_rmsd_design", "bb_rmsd_target", "design_ptm", "design_iptm",
+                    "design_to_target_iptm", "min_design_to_target_pae", "min_interaction_pae",
+                    "affinity_pred_value", "affinity_probability_binary1"
+                ],
+                description="Aggregate metrics for all designs from analysis step"
+            )
+            tables["per_target_metrics"] = TableInfo(
+                name="per_target_metrics",
+                path=self.per_target_metrics_csv,
+                columns=[
+                    "target_id", "num_prot_tokens", "num_lig_atoms", "num_resolved_tokens",
+                    "num_tokens", "num_design", "UNK_fraction", "GLY_fraction", "ALA_fraction",
+                    "CYS_fraction", "SER_fraction", "PRO_fraction", "THR_fraction", "VAL_fraction",
+                    "ILE_fraction", "ASN_fraction", "ASP_fraction", "LEU_fraction", "MET_fraction",
+                    "GLN_fraction", "GLU_fraction", "LYS_fraction", "HIS_fraction", "PHE_fraction",
+                    "ARG_fraction", "TYR_fraction", "TRP_fraction", "loop", "helix", "sheet",
+                    "liability_score", "liability_num_violations", "bb_rmsd", "bb_rmsd_design",
+                    "design_ptm", "design_iptm", "design_to_target_iptm", "min_design_to_target_pae",
+                    "affinity_pred_value", "affinity_probability_binary1"
+                ],
+                description="Per-target metrics from analysis step"
+            )
+
+        # Filtering step outputs
+        if has_filtering:
+            # Final designs folder
+            final_designs_folder = os.path.join(self.final_ranked_folder, f"final_{self.budget}_designs")
+
+            # BoltzGen filter zero-pads rank to len(str(budget)) digits (see
+            # boltzgen/task/filter/filter.py: `num_digits = len(str(len(self.df)))`),
+            # so a budget of 10 yields rank01..rank10, 100 yields rank001..rank100, etc.
+            # Match that padding here so the expected-output validator finds the files.
+            rank_digits = max(1, len(str(self.budget)))
+            structure_ids = [f"rank{i:0{rank_digits}d}" for i in range(1, self.budget + 1)]
+            structure_files = [os.path.join(final_designs_folder, f"rank{i:0{rank_digits}d}_*.cif") for i in range(1, self.budget + 1)]
+
+            # Map table lives inside the stream folder (= final_ranked_designs/),
+            # which is also BoltzGen's native output folder for filtered ranks.
+            create_map_table(self.final_ranked_map, structure_ids, files=structure_files)
+
+            structures = DataStream(
+                name="final_ranked_designs",
+                ids=structure_ids,
+                files=structure_files,
+                map_table=self.final_ranked_map,
+                format="cif"
+            )
+
+            # All designs metrics
+            tables["all_designs_metrics"] = TableInfo(
+                name="all_designs_metrics",
+                path=self.all_designs_metrics_csv,
+                columns=[
+                    "id", "final_rank", "designed_sequence", "designed_chain_sequence",
+                    "num_design", "affinity_probability_binary1", "design_to_target_iptm",
+                    "min_design_to_target_pae", "design_ptm", "filter_rmsd",
+                    "designfolding-filter_rmsd", "plip_hbonds_refolded", "delta_sasa_refolded",
+                    "design_largest_hydrophobic_patch_refolded", "design_chain_hydrophobicity",
+                    "design_hydrophobicity", "loop", "helix", "sheet", "file_name"
+                ],
+                description="Metrics for all designs considered by filtering"
+            )
+
+            # Final designs metrics
+            tables["final_designs_metrics"] = TableInfo(
+                name="final_designs_metrics",
+                path=self.final_designs_metrics_csv,
+                columns=[
+                    "id", "final_rank", "designed_sequence", "designed_chain_sequence",
+                    "num_design", "affinity_probability_binary1", "design_to_target_iptm",
+                    "min_design_to_target_pae", "design_ptm", "filter_rmsd",
+                    "designfolding-filter_rmsd", "plip_hbonds_refolded", "delta_sasa_refolded",
+                    "design_largest_hydrophobic_patch_refolded", "design_chain_hydrophobicity",
+                    "design_hydrophobicity", "loop", "helix", "sheet", "file_name"
+                ],
+                description=f"Metrics for top {self.budget} designs after filtering"
+            )
+
+        # Folding step outputs (only if filtering not present)
+        elif has_folding:
+            # Structures in refold_cif folder under the inverse-folded stream.
+            refold_cif_folder = os.path.join(self.intermediate_inverse_folded_folder, "refold_cif")
+
+            # Generate structure IDs and paths
+            structure_ids = [f"design_spec_{i}" for i in range(self.num_designs)]
+            structure_files = [os.path.join(refold_cif_folder, f"design_spec_{i}.cif") for i in range(self.num_designs)]
+
+            create_map_table(self.refolded_structures_map, structure_ids, files=structure_files)
+
+            structures = DataStream(
+                name="intermediate_designs_inverse_folded",
+                ids=structure_ids,
+                files=structure_files,
+                map_table=self.refolded_structures_map,
+                format="cif"
+            )
+        else:
+            structures = None
+
+        # Sequences stream: extracted from designed structures by postprocessing.
+        # sequences.csv (id, sequence) is written by pipe_boltzgen.py and serves
+        # directly as the map_table. Only available when filtering runs.
+        if has_filtering:
+            seq_rank_digits = max(1, len(str(self.budget)))
+            sequence_ids = [f"rank{i:0{seq_rank_digits}d}" for i in range(1, self.budget + 1)]
+            sequences = DataStream(
+                name="sequences",
+                ids=sequence_ids,
+                files=[],
+                map_table=self.sequences_csv,
+                format="csv",
+            )
+        else:
+            sequences = None
+
+        return {
+            "structures": structures,
+            "sequences": sequences,
+            "tables": tables,
+            "output_folder": self.output_folder
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize configuration with all BoltzGen parameters."""
+        base_dict = super().to_dict()
+
+        # Prepare design spec for serialization
+        if self.spec_mode == "automatic":
+            design_spec_value = f"<automatic from {self.target_input_id or self.target_structure_path}>"
+        elif self.design_spec_is_dict:
+            design_spec_value = "<dict>"
+        else:
+            design_spec_value = self.design_spec
+
+        base_dict.update({
+            "tool_params": {
+                "spec_mode": self.spec_mode,
+                "design_spec": design_spec_value,
+                "target_input_id": self.target_input_id,
+                "ligand_compounds_csv": self.ligand_compounds_csv,
+                "binder_spec": self.binder_spec,
+                "binding_region": self.binding_region,
+                "protocol": self.protocol,
+                "num_designs": self.num_designs,
+                "budget": self.budget,
+                "design_checkpoints": self.design_checkpoints,
+                "step_scale": self.step_scale,
+                "noise_scale": self.noise_scale,
+                "diffusion_batch_size": self.diffusion_batch_size,
+                "inverse_fold_num_sequences": self.inverse_fold_num_sequences,
+                "skip_inverse_folding": self.skip_inverse_folding,
+                "alpha": self.alpha,
+                "filter_biased": self.filter_biased,
+                "additional_filters": self.additional_filters,
+                "metrics_override": self.metrics_override,
+                "devices": self.devices,
+                "reuse_path": self.reuse_path,
+                "steps": self.steps,
+                "cache_dir": self.cache_dir
+            }
+        })
+        return base_dict
+
+
+class BoltzGenMerge(BaseConfig):
+    """
+    Merge multiple BoltzGen output directories into one.
+
+    Use this to combine results from parallel BoltzGen runs before
+    re-running filtering on the combined set.
+
+    Example:
+        run1 = BoltzGen(ligand=..., binder_spec="140-180", ...)
+        run2 = BoltzGen(ligand=..., binder_spec="140-180", ...)
+        merged = BoltzGenMerge(sources=[run1, run2])
+        filtered = BoltzGen(reuse=merged, steps=["filtering"], budget=100, ...)
+
+    With ID renaming to avoid collisions:
+        merged = BoltzGenMerge(sources=[run1, run2, ...],
+                              id_template="batch{i:03d}_")
+        # This renames design_spec_001 -> batch000_design_spec_001, etc.
+    """
+
+    TOOL_NAME = "BoltzGenMerge"
+    TOOL_VERSION = "2.5"
+
+    @classmethod
+    def _install_script(cls, folders, env_manager="mamba", force_reinstall=False, **kwargs):
+        return """echo "=== BoltzGenMerge ==="
+echo "Requires boltzgen environment (installed with BoltzGen.install())"
+echo "No additional installation needed."
+touch "$INSTALL_SUCCESS"
+echo "=== BoltzGenMerge ready ==="
+"""
+
+    # Lazy path descriptors
+    merge_helper_py = Path(lambda self: self.pipe_script_path("pipe_boltzgen_merge.py"))
+    # Merge writes its tree directly into the step folder, mirroring the
+    # flattened BoltzGen layout (no `_execution/<step>/` wrapper).
+    boltzgen_run_folder = Path(lambda self: self.output_folder)
+
+    def __init__(self,
+                 sources: List[Union[DataStream, StandardizedOutput, str]] = None,
+                 id_template: str = None,
+                 **kwargs):
+        """
+        Initialize BoltzGenMerge configuration.
+
+        Args:
+            sources: List of BoltzGen outputs to merge. Can be DataStream,
+                    StandardizedOutput, or direct paths to output directories.
+            id_template: Template for renaming design IDs to avoid collisions.
+                        If provided, uses custom merge logic instead of
+                        `boltzgen merge` command.
+                        Supports:
+                        - {i} for source index (0-based)
+                        - {name} for source folder name
+                        Examples:
+                        - "batch{i:03d}_" -> batch000_design_spec_001
+                        - "{name}_" -> BoltzGen_Run1_design_spec_001
+                        Default: None (uses standard boltzgen merge)
+            **kwargs: Additional parameters passed to BaseConfig
+
+        Output:
+            Streams: (none)
+            Tables: (none) — merges BoltzGen output directories
+        """
+        self.sources = sources or []
+        self.source_paths = []
+        self.id_template = id_template
+
+        # Initialize base class
+        super().__init__(**kwargs)
+
+    def validate_params(self):
+        """Validate BoltzGenMerge parameters."""
+        if not self.sources or len(self.sources) < 2:
+            raise ValueError("BoltzGenMerge requires at least 2 source directories to merge")
+        _validate_freeform_string("id_template", self.id_template)
+
+    def configure_inputs(self, pipeline_folders: Dict[str, str]):
+        """Configure input sources."""
+        self.folders = pipeline_folders
+
+        # Reset source_paths to avoid accumulation if configure_inputs is called multiple times
+        self.source_paths = []
+
+        # Extract paths from sources
+        for source in self.sources:
+            if isinstance(source, StandardizedOutput):
+                if hasattr(source, 'output_folder') and source.output_folder:
+                    self.source_paths.append(source.output_folder)
+                else:
+                    raise ValueError("StandardizedOutput has no output_folder")
+            elif isinstance(source, str):
+                self.source_paths.append(source)
+            else:
+                raise ValueError(f"Invalid source type: {type(source)}")
+
+    def generate_script(self, script_path: str) -> str:
+        """Generate BoltzGenMerge execution script."""
+        # Each source is a BoltzGen step folder containing
+        # intermediate_designs[_inverse_folded]/ directly under it
+        # (flattened layout). The helper script handles both the new and
+        # legacy on-disk shapes.
+        sources_str = ' '.join(f'"{p}"' for p in self.source_paths)
+
+        # Use first source for design_spec.yaml copy
+        first_source = self.source_paths[0]
+        design_spec_dest = self.configuration_path("design_spec.yaml")
+        merge_output = self.boltzgen_run_folder
+
+        script_content = "#!/bin/bash\n"
+        script_content += "# BoltzGenMerge execution script\n"
+        script_content += self.generate_completion_check_header()
+        script_content += self.activate_environment()
+
+        if self.id_template:
+            # Use custom merge with ID renaming
+            script_content += f"""
+echo "Merging BoltzGen outputs with ID renaming"
+echo "Sources: {len(self.source_paths)} directories"
+echo "Output: {merge_output}"
+echo "ID template: {self.id_template}"
+
+# Run custom merge with ID renaming
+python "{self.merge_helper_py}" \\
+    --sources {sources_str} \\
+    --output "{merge_output}" \\
+    --id_template "{self.id_template}"
+
+if [ $? -eq 0 ]; then
+    echo "BoltzGenMerge with ID renaming completed successfully"
+else
+    echo "Error: BoltzGenMerge failed"
+    exit 1
+fi
+
+# Copy design_spec.yaml from first source for reuse compatibility.
+cp "{first_source}/_configuration/design_spec.yaml" "{design_spec_dest}"
+echo "Copied design_spec.yaml from {first_source}/_configuration/design_spec.yaml"
+
+"""
+        else:
+            # Use standard boltzgen merge command. The CLI looks for
+            # `intermediate_designs[_inverse_folded]/` directly under each
+            # source and derives a per-source tag from the source's
+            # basename (_slugify_run_tag in boltzgen.cli). Sources are step
+            # folders under the flattened layout — pass them straight through.
+            script_content += f"""
+echo "Merging BoltzGen outputs"
+echo "Sources: {', '.join(os.path.basename(p) for p in self.source_paths)}"
+echo "Output: {merge_output}"
+
+# Run BoltzGen merge
+{self.container_prefix()}boltzgen merge {sources_str} --output "{merge_output}"
+
+if [ $? -eq 0 ]; then
+    echo "BoltzGenMerge completed successfully"
+else
+    echo "Error: BoltzGenMerge failed"
+    exit 1
+fi
+
+# Copy design_spec.yaml from first source for reuse compatibility.
+cp "{first_source}/_configuration/design_spec.yaml" "{design_spec_dest}"
+echo "Copied design_spec.yaml from {first_source}/_configuration/design_spec.yaml"
+
+"""
+        script_content += self.generate_completion_check_footer()
+        return script_content
+
+    def get_output_files(self) -> Dict[str, Any]:
+        """Get expected output files after merge."""
+        return {
+            "tables": {},
+            "output_folder": self.output_folder
+        }
+
+    def get_config_display(self) -> List[str]:
+        """Get configuration display lines."""
+        config_lines = super().get_config_display()
+        config_lines.append(f"SOURCES: {len(self.sources)} directories")
+        for i, path in enumerate(self.source_paths):
+            config_lines.append(f"  [{i+1}] {os.path.basename(path)}")
+        if self.id_template:
+            config_lines.append(f"ID TEMPLATE: {self.id_template}")
+            config_lines.append("  (Using custom merge with ID renaming)")
+        else:
+            config_lines.append("ID TEMPLATE: None (using standard boltzgen merge)")
+        return config_lines
+
+
+class BoltzGenImport(BaseConfig):
+    """
+    Import external structures into BoltzGen filesystem format.
+
+    This tool converts structures (e.g., from RFdiffusion) into the BoltzGen
+    directory structure, enabling use of downstream BoltzGen steps like
+    folding, analysis, and filtering.
+
+    Two modes are supported:
+    1. Design only: Import backbone structures (simulates "design" step output)
+       BoltzGenImport(designs=rfd_output, ligand=lig, binder_spec="140-180")
+
+    2. Design + Inverse Folding: Import structures with sequences
+       (simulates "inverse_folding" step output)
+       BoltzGenImport(designs=rfd_output, sequences=lmpnn_output, ligand=lig, binder_spec="140-180")
+
+    After import, use BoltzGen(reuse=imported, steps=["folding", ...]) to
+    continue the pipeline.
+
+    Notes:
+    - Chain reassignment: Input structures (e.g., from RFdiffusion) may have
+      protein+ligand in chain A. This tool separates them into chain A (protein)
+      and chain B (ligand) as BoltzGen expects.
+    - When sequences are provided, sidechain atom coordinates are set to (0,0,0)
+      as BoltzGen expects - the folding step will predict them.
+    - NPZ files are not generated (BoltzGen should handle their absence).
+    """
+
+    TOOL_NAME = "BoltzGenImport"
+    TOOL_VERSION = "2.5"
+
+    @classmethod
+    def _install_script(cls, folders, env_manager="mamba", force_reinstall=False, **kwargs):
+        return """echo "=== BoltzGenImport ==="
+echo "Requires boltzgen environment (installed with BoltzGen.install())"
+echo "No additional installation needed."
+echo "=== BoltzGenImport ready ==="
+"""
+
+    # Lazy path descriptors
+    import_helper_py = Path(lambda self: self.pipe_script_path("pipe_boltzgen_import.py"))
+    sequences_input_json = Path(lambda self: self.configuration_path(".input_sequences.json"))
+    sequences_input_csv = Path(lambda self: self.configuration_path(".input_sequences.csv"))
+    compounds_input_json = Path(lambda self: self.configuration_path(".input_compounds.json"))
+    compounds_input_csv = Path(lambda self: self.configuration_path(".input_compounds.csv"))
+    # Imported tree is written directly into the step folder, mirroring the
+    # flattened BoltzGen layout so a downstream BoltzGen(reuse=imported)
+    # finds intermediate_designs/, intermediate_designs_inverse_folded/ etc.
+    # at the canonical paths.
+    boltzgen_run_folder = Path(lambda self: self.output_folder)
+
+    def __init__(self,
+                 designs: Union[DataStream, StandardizedOutput] = None,
+                 sequences: Union[DataStream, StandardizedOutput] = None,
+                 # Design spec parameters (same as BoltzGen)
+                 ligand: Union[DataStream, StandardizedOutput] = None,
+                 binder_spec: Union[str, Dict[str, Any]] = None,
+                 protocol: str = "protein-small_molecule",
+                 ligand_chain: str = "B",
+                 protein_chain: str = "A",
+                 ligand_name: str = "LIG1",
+                 num_designs: int = None,
+                 **kwargs):
+        """
+        Initialize BoltzGenImport configuration.
+
+        Args:
+            designs: Structure input from a design tool (RFdiffusion, etc.).
+                    Must have 'structures' output with PDB/CIF files.
+            sequences: Optional sequence input from inverse folding tool
+                      (ProteinMPNN, LigandMPNN, etc.). Must have a table
+                      with 'id' and 'sequence' columns that map to designs.
+                      If provided, simulates inverse_folding step output.
+            ligand: Ligand input from Ligand tool (for design_spec generation).
+                   Used to get SMILES/CCD for the design specification.
+            binder_spec: Binder length specification (e.g., "140-180" or {"length": [140, 180]}).
+                        Used for design_spec generation.
+            protocol: BoltzGen protocol (default: "protein-small_molecule").
+                     Used when running minimal design step to generate molecule pickle.
+            ligand_chain: Chain ID for ligand in output (default: "B")
+            protein_chain: Chain ID for protein in output (default: "A")
+            ligand_name: Residue name for ligand in output (default: "LIG1").
+                        BoltzGen expects ligands to match pattern ^LIG\\d+ (e.g., LIG1, LIG2).
+            num_designs: Number of designs being imported (auto-detected if None).
+                        Used for consistent naming with BoltzGen conventions.
+            **kwargs: Additional parameters passed to BaseConfig
+
+        Output:
+            Streams: (none)
+            Tables: (none) — imports external designs into BoltzGen format
+        """
+        self.binder_spec = binder_spec
+        self.protocol = protocol
+        self.ligand_chain = ligand_chain
+        self.protein_chain = protein_chain
+        self.ligand_name = ligand_name
+        self.num_designs = num_designs
+
+        # Paths to be resolved
+        self.design_structures = []  # List of PDB/CIF paths
+        self.design_ids = []  # List of structure IDs
+        self.sequences_csv = None    # Path to sequences CSV
+        self.sequences_stream = None  # Source sequences stream for runtime id filtering
+        self.ligand_compounds_csv = None  # Path to ligand compounds CSV
+        self.compounds_stream = None  # Source compounds stream for runtime id filtering
+
+        # Resolve inputs
+        self._resolve_designs_input(designs)
+        self._resolve_sequences_input(sequences)
+        self._resolve_ligand_input(ligand)
+
+        # Determine mode
+        self.mode = "inverse_folding" if sequences is not None else "design"
+
+        super().__init__(**kwargs)
+
+    def _resolve_designs_input(self, designs: Union[DataStream, StandardizedOutput, None]):
+        """Resolve designs input to structure file paths."""
+        if designs is None:
+            return
+
+        if isinstance(designs, StandardizedOutput):
+            if designs.streams.structures and len(designs.streams.structures) > 0:
+                for struct_id, struct_file in zip(designs.streams.structures.ids,
+                                                    designs.streams.structures.files):
+                    self.design_ids.append(struct_id)
+                    self.design_structures.append(struct_file)
+            else:
+                raise ValueError("designs StandardizedOutput has no structures")
+        elif isinstance(designs, DataStream):
+            self.design_ids = list(designs.ids)
+            self.design_structures = list(designs.files)
+        else:
+            raise ValueError(f"designs must be DataStream or StandardizedOutput, got {type(designs)}")
+
+    def _resolve_sequences_input(self, sequences: Union[DataStream, StandardizedOutput, None]):
+        """Resolve sequences input to CSV path."""
+        # Kept whole: the upstream `missing` manifest hangs off .tables, not off a DataStream.
+        self.sequences_input = sequences
+        if sequences is None:
+            return
+
+        if isinstance(sequences, StandardizedOutput):
+            # Look for sequences table or CSV
+            if hasattr(sequences, 'tables'):
+                if hasattr(sequences.tables, 'sequences'):
+                    self.sequences_csv = sequences.tables.sequences.info.path
+                elif hasattr(sequences.tables, '_tables'):
+                    for name, info in sequences.tables._tables.items():
+                        if 'sequence' in name.lower() or name == 'main':
+                            self.sequences_csv = info.info.path
+                            break
+            if not self.sequences_csv and sequences.sequences and len(sequences.sequences) > 0:
+                self.sequences_stream = sequences.sequences
+                self.sequences_csv = sequences.sequences.map_table
+        elif isinstance(sequences, DataStream):
+            self.sequences_stream = sequences
+            self.sequences_csv = sequences.map_table
+        else:
+            raise ValueError(f"sequences must be DataStream or StandardizedOutput, got {type(sequences)}")
+
+        if not self.sequences_csv:
+            raise ValueError(
+                "Could not find sequences CSV from sequences input. "
+                "Ensure it has a table with 'id' and 'sequence' columns."
+            )
+
+    def _resolve_ligand_input(self, ligand: Union[DataStream, StandardizedOutput, None]):
+        """Resolve ligand input to compounds CSV path."""
+        # Kept whole: the upstream `missing` manifest hangs off .tables, not off a DataStream.
+        self.ligand_input = ligand
+        if ligand is None:
+            return
+
+        if isinstance(ligand, StandardizedOutput):
+            if ligand.streams.compounds and len(ligand.streams.compounds) > 0:
+                self.compounds_stream = ligand.streams.compounds
+                self.ligand_compounds_csv = ligand.streams.compounds.map_table
+            elif hasattr(ligand, 'tables') and hasattr(ligand.tables, 'compounds'):
+                self.ligand_compounds_csv = ligand.tables.compounds.info.path
+        elif isinstance(ligand, DataStream):
+            self.compounds_stream = ligand
+            self.ligand_compounds_csv = ligand.map_table
+        else:
+            raise ValueError(f"ligand must be DataStream or StandardizedOutput, got {type(ligand)}")
+
+    def validate_params(self):
+        """Validate BoltzGenImport parameters."""
+        if not self.design_structures:
+            raise ValueError("designs parameter is required and must have structures")
+
+        if self.binder_spec is None:
+            raise ValueError("binder_spec is required for design_spec generation")
+
+        _validate_freeform_string("ligand_name", self.ligand_name)
+        _validate_freeform_string("ligand_chain", self.ligand_chain)
+        _validate_freeform_string("protein_chain", self.protein_chain)
+        if isinstance(self.binder_spec, str):
+            _validate_freeform_string("binder_spec", self.binder_spec)
+
+    def configure_inputs(self, pipeline_folders: Dict[str, str]):
+        """Configure input sources."""
+        self.folders = pipeline_folders
+
+    def _parse_binder_spec(self):
+        """Parse binder_spec into min and max length values."""
+        if isinstance(self.binder_spec, dict):
+            if "length" not in self.binder_spec:
+                raise ValueError("binder_spec dict must contain 'length' key")
+            length = self.binder_spec["length"]
+            if isinstance(length, list) and len(length) == 2:
+                return length[0], length[1]
+            elif isinstance(length, int):
+                return length, length
+            else:
+                raise ValueError(f"Invalid length format in binder_spec: {length}")
+        elif isinstance(self.binder_spec, str):
+            if "-" in self.binder_spec:
+                parts = self.binder_spec.split("-")
+                return int(parts[0]), int(parts[1])
+            else:
+                length = int(self.binder_spec)
+                return length, length
+        else:
+            raise ValueError(f"Invalid binder_spec type: {type(self.binder_spec)}")
+
+    def generate_script(self, script_path: str) -> str:
+        """Generate BoltzGenImport execution script."""
+        # BoltzGen's internal tree (intermediate_designs/, config/, etc.)
+        # is written directly under the step folder so a downstream
+        # BoltzGen(reuse=imported) finds the canonical layout.
+        import_root = self.boltzgen_run_folder
+        intermediate_designs = os.path.join(import_root, "intermediate_designs")
+        intermediate_inverse_folded = os.path.join(import_root, "intermediate_designs_inverse_folded")
+        config_dir = os.path.join(import_root, "config")
+
+        os.makedirs(intermediate_designs, exist_ok=True)
+        os.makedirs(config_dir, exist_ok=True)
+        if self.mode == "inverse_folding":
+            os.makedirs(intermediate_inverse_folded, exist_ok=True)
+
+        # Parse binder spec
+        binder_min, binder_max = self._parse_binder_spec()
+
+        # Filtered input CSVs materialized at runtime (honor an upstream id filter).
+        filter_block = ""
+        if self.sequences_stream is not None:
+            self.sequences_stream.save_json(self.sequences_input_json)
+            self.sequences_csv = self.sequences_input_csv
+            filter_block += self.generate_filtered_map_table_block(
+                self.sequences_input_json, self.sequences_input_csv,
+                required_columns=["id", "sequence"],
+                input_sources=[self.sequences_input],
+            )
+        if self.compounds_stream is not None:
+            self.compounds_stream.save_json(self.compounds_input_json)
+            self.ligand_compounds_csv = self.compounds_input_csv
+            filter_block += self.generate_filtered_map_table_block(
+                self.compounds_input_json, self.compounds_input_csv,
+                input_sources=[self.ligand_input],
+            )
+
+        # Build structures list file — config-time artefact.
+        structures_list_file = self.configuration_path(".input_structures.txt")
+        with open(structures_list_file, 'w') as f:
+            for struct in self.design_structures:
+                f.write(f"{struct}\n")
+
+        # Write steps.yaml into configuration/ (it's a config-time artefact).
+        steps_yaml_file = self.configuration_path("steps.yaml")
+        if self.mode == "design":
+            steps_content = """steps:
+- name: design
+  config_file: config/design.yaml
+"""
+        else:  # inverse_folding
+            steps_content = """steps:
+- name: design
+  config_file: config/design.yaml
+- name: inverse_folding
+  config_file: config/inverse_folding.yaml
+"""
+        with open(steps_yaml_file, 'w') as f:
+            f.write(steps_content)
+
+        # Build command arguments — import helper writes its BoltzGen-style
+        # tree into execution/ just like the design tool.
+        cmd_args = [
+            f'--structures "{structures_list_file}"',
+            f'--output "{import_root}"',
+            f'--mode {self.mode}',
+            f'--protein-chain {self.protein_chain}',
+            f'--ligand-chain {self.ligand_chain}',
+            f'--binder-min {binder_min}',
+            f'--binder-max {binder_max}',
+            f'--ligand-name {self.ligand_name}',
+        ]
+
+        if self.sequences_csv:
+            cmd_args.append(f'--sequences "{self.sequences_csv}"')
+
+        if self.ligand_compounds_csv:
+            cmd_args.append(f'--ligand-csv "{self.ligand_compounds_csv}"')
+
+        cmd_str = ' \\\n    '.join(cmd_args)
+
+        # Determine target directory for molecules
+        if self.mode == "inverse_folding":
+            molecules_target_dir = os.path.join(intermediate_inverse_folded, "molecules_out_dir")
+        else:
+            molecules_target_dir = os.path.join(intermediate_designs, "molecules_out_dir")
+
+        # Build molecule generation command if ligand is provided.
+        # Temp dir lives under execution/ (scratch for boltzgen design step);
+        # design_spec.yaml is a config-time artefact.
+        molecule_gen_section = ""
+        if self.ligand_compounds_csv:
+            temp_design_dir = self.execution_path(".temp_molecule_gen")
+            design_spec_yaml = self.configuration_path("design_spec.yaml")
+            molecule_gen_section = f'''
+# Step 1: Generate design_spec.yaml for molecule generation
+echo "Generating design_spec.yaml for molecule pickle generation..."
+python "{self.import_helper_py}" \\
+    --generate-design-spec \\
+    --ligand-csv "{self.ligand_compounds_csv}" \\
+    --output "{design_spec_yaml}" \\
+    --protein-chain {self.protein_chain} \\
+    --ligand-chain {self.ligand_chain} \\
+    --binder-min {binder_min} \\
+    --binder-max {binder_max}
+
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to generate design_spec.yaml"
+    exit 1
+fi
+
+# Step 2: Generate molecule pickle by running minimal BoltzGen design
+echo "Generating molecule pickle via BoltzGen design step..."
+TEMP_MOL_DIR="{temp_design_dir}"
+mkdir -p "$TEMP_MOL_DIR"
+
+# Run BoltzGen with 1 design to generate the molecule pickle
+{self.container_prefix()}boltzgen run "{design_spec_yaml}" \\
+    --output "$TEMP_MOL_DIR" \\
+    --protocol {self.protocol} \\
+    --num_designs 1 \\
+    --steps design
+
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to generate molecule pickle"
+    exit 1
+fi
+
+# Copy molecule pickle to target directory
+MOLECULES_SOURCE="$TEMP_MOL_DIR/intermediate_designs/molecules_out_dir"
+MOLECULES_TARGET="{molecules_target_dir}"
+mkdir -p "$MOLECULES_TARGET"
+
+if [ -d "$MOLECULES_SOURCE" ]; then
+    echo "Copying molecule pickles from $MOLECULES_SOURCE to $MOLECULES_TARGET"
+    cp -r "$MOLECULES_SOURCE"/* "$MOLECULES_TARGET"/
+else
+    echo "Warning: No molecules_out_dir found in BoltzGen output"
+fi
+
+# Keep temp directory for debugging (contains molecule pickle generation output)
+echo "Molecule pickle generation complete (temp files preserved in $TEMP_MOL_DIR)"
+'''
+
+        script_content = "#!/bin/bash\n"
+        script_content += "# BoltzGenImport execution script\n"
+        script_content += self.generate_completion_check_header()
+        script_content += filter_block
+        script_content += self.activate_environment()
+        script_content += f"""
+echo "Importing structures into BoltzGen format"
+echo "Mode: {self.mode}"
+echo "Input structures: {len(self.design_structures)} files"
+echo "Output (execution/): {import_root}"
+echo "Binder spec: {binder_min}-{binder_max}"
+{"echo 'Sequences CSV: " + self.sequences_csv + "'" if self.sequences_csv else ""}
+{"echo 'Ligand CSV: " + self.ligand_compounds_csv + "'" if self.ligand_compounds_csv else ""}
+{molecule_gen_section}
+# Step 3: Run import helper to convert structures
+echo "Converting structures to BoltzGen format..."
+python "{self.import_helper_py}" \\
+    {cmd_str}
+
+if [ $? -eq 0 ]; then
+    echo "BoltzGenImport completed successfully"
+else
+    echo "Error: BoltzGenImport failed"
+    exit 1
+fi
+
+"""
+        script_content += self.generate_completion_check_footer()
+        return script_content
+
+    def get_output_files(self) -> Dict[str, Any]:
+        """
+        Get expected output files.
+
+        BoltzGenImport does not predict outputs - it creates the filesystem
+        structure for subsequent BoltzGen steps.
+        """
+        return {
+            "tables": {},
+            "output_folder": self.output_folder
+        }
+
+    def get_config_display(self) -> List[str]:
+        """Get configuration display lines."""
+        config_lines = super().get_config_display()
+        config_lines.append(f"MODE: {self.mode}")
+        config_lines.append(f"PROTOCOL: {self.protocol}")
+        config_lines.append(f"INPUT STRUCTURES: {len(self.design_structures)} files")
+        config_lines.append(f"BINDER SPEC: {self.binder_spec}")
+        config_lines.append(f"CHAINS: protein={self.protein_chain}, ligand={self.ligand_chain}")
+        config_lines.append(f"LIGAND NAME: {self.ligand_name}")
+        if self.sequences_csv:
+            config_lines.append(f"SEQUENCES CSV: {os.path.basename(self.sequences_csv)}")
+        if self.ligand_compounds_csv:
+            config_lines.append(f"LIGAND CSV: {os.path.basename(self.ligand_compounds_csv)}")
+        return config_lines
+
+
+# =============================================================================
+# BOLTZGEN INTERNAL FORMAT DOCUMENTATION
+# =============================================================================
+# This section documents the internal file formats used by BoltzGen, extracted
+# from the boltzgen package source code (v0.1.4). This information is needed
+# when importing external structures (e.g., from RFdiffusion) into BoltzGen
+# filesystem format.
+#
+# Source: boltzgen/task/predict/data_from_generated.py
+#         boltzgen/data/const.py
+#
+# -----------------------------------------------------------------------------
+# NPZ METADATA FILES
+# -----------------------------------------------------------------------------
+# BoltzGen expects each CIF structure file to have a corresponding NPZ metadata
+# file with the same base name (e.g., design_spec_0.cif -> design_spec_0.npz).
+#
+# The NPZ file contains per-token arrays where N_tokens = N_protein_residues + N_ligand_atoms
+#
+# REQUIRED FIELDS:
+# ----------------
+# design_mask : np.ndarray, dtype=float32, shape=(N_tokens,)
+#     Indicates which tokens are designable (part of the binder).
+#     Values: 1.0 = designable (binder protein residues)
+#             0.0 = fixed (target/ligand atoms)
+#
+# OPTIONAL FIELDS (may cause issues if missing):
+# ----------------------------------------------
+# inverse_fold_design_mask : np.ndarray or object
+#     Same as design_mask, or can be overridden for inverse folding.
+#     Used when use_new_design_mask=True in BoltzGen.
+#     Can be object type for complex specifications.
+#
+# ss_type : np.ndarray, dtype=int64, shape=(N_tokens,)
+#     Secondary structure type per token.
+#     Values (from boltzgen/data/const.py):
+#         0 = UNSPECIFIED
+#         1 = LOOP
+#         2 = HELIX
+#         3 = SHEET
+#
+# binding_type : np.ndarray, dtype=int64 or float32, shape=(N_tokens,)
+#     Binding type per token.
+#     Values (from boltzgen/data/const.py):
+#         0 = UNSPECIFIED
+#         1 = BINDING
+#         2 = NOT_BINDING
+#
+# token_resolved_mask : np.ndarray, dtype=float32, shape=(N_tokens,)
+#     Indicates which tokens have resolved coordinates.
+#     Values: 1.0 = resolved (has coordinates)
+#             0.0 = unresolved
+#
+# NOTE: mol_type is NOT loaded from NPZ - it's computed by the tokenizer from
+# the structure. Chain types are:
+#     0 = PROTEIN
+#     1 = DNA
+#     2 = RNA
+#     3 = NONPOLYMER (ligands)
+#
+# -----------------------------------------------------------------------------
+# EXAMPLE NPZ GENERATION (for BoltzGenImport)
+# -----------------------------------------------------------------------------
+# For a structure with N protein residues and M ligand atoms:
+#
+#     import numpy as np
+#
+#     n_tokens = n_protein_residues + n_ligand_atoms
+#
+#     # Design mask: 1.0 for protein (designed), 0.0 for ligand (fixed)
+#     design_mask = np.concatenate([
+#         np.ones(n_protein_residues, dtype=np.float32),
+#         np.zeros(n_ligand_atoms, dtype=np.float32)
+#     ])
+#
+#     # Secondary structure: all unspecified
+#     ss_type = np.zeros(n_tokens, dtype=np.int64)
+#
+#     # Binding type: all unspecified
+#     binding_type = np.zeros(n_tokens, dtype=np.int64)
+#
+#     # Token resolved mask: all resolved
+#     token_resolved_mask = np.ones(n_tokens, dtype=np.float32)
+#
+#     np.savez(
+#         output_npz_path,
+#         design_mask=design_mask,
+#         inverse_fold_design_mask=design_mask,  # Same as design_mask
+#         ss_type=ss_type,
+#         binding_type=binding_type,
+#         token_resolved_mask=token_resolved_mask
+#     )
+#
+# -----------------------------------------------------------------------------
+# FILESYSTEM STRUCTURE
+# -----------------------------------------------------------------------------
+# BoltzGen expects the following directory structure:
+#
+# <output_folder>/
+# ├── design_spec.yaml              # Design specification (entities, bindings)
+# ├── steps.yaml                    # Completed pipeline steps
+# ├── config/                       # Step configuration files
+# │   ├── design.yaml
+# │   └── inverse_folding.yaml
+# ├── intermediate_designs/         # Output from "design" step
+# │   ├── design_spec_0.cif
+# │   ├── design_spec_0.npz         # <-- Required metadata
+# │   ├── design_spec_1.cif
+# │   ├── design_spec_1.npz
+# │   └── ...
+# └── intermediate_designs_inverse_folded/  # Output from "inverse_folding" step
+#     ├── design_spec_0.cif
+#     ├── design_spec_0.npz         # <-- Required metadata
+#     ├── design_spec_1.cif
+#     ├── design_spec_1.npz
+#     └── ...
+#
+# =============================================================================

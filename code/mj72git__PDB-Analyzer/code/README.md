@@ -1,0 +1,109 @@
+
+# PDB Analyzer Web App 
+
+This is a Streamlit-based web application for analyzing **PDB files**, exploring **interface metrics**, and visualizing **3D protein structures**.
+
+This tool helps you interpret the results generated after running Protein Design Software like AlphaFold, BindCraft, including the Accepted PDB files.
+
+
+
+
+---
+
+## Getting Started
+### Accessing the PDB Analyzer Web App
+This application is hosted on Streamlit Cloud, providing easy access without any local installation required. The link :
+https://pdbanalyzermjshadfar.streamlit.app/
+
+ 
+(Includes a RESET button in the sidebar to clear all information.)
+
+## 🚀 Features
+
+### ✅ 1. Summary Tab
+- Displays all analyzed results in a single interactive table  
+  
+- Provides buttons to download:
+  - summary CSV  
+
+---
+
+### ✅ 2. Visualization Tab
+- Interactive **3D structure viewer** using *py3Dmol*
+- Customizable chain coloring  
+- Counts and plots the number of **3 Å and 4 Å contacts** between binder and target  
+- Counts and plots the number of hydrophobic contacts and salt bridge and H bonds between binder and target for each design.
+---
+
+### ✅ 3. Details Tab
+For each design, you can inspect:
+- Target and binder sequences  
+- Residue–residue contact pairs (3 Å and 4 Å)   
+
+
+---
+
+### ✅ 4. Binder Analysis:
+For each designed binder, you can inspect:
+- Binder length & Sequence.
+- Hydrophobicity Analysis.
+
+
+---
+
+
+### ✅ 5. Binder Analysis Overall:
+Displays Hydrophobicity, Acidic & Basic Percentages of all designed binders .  
+
+---
+
+### ✅ 6. Overall Tab
+Displays Frequency of target residues at interface (3 Å, 4 Å, hydrophobic contacts & salt bridge)
+
+---
+
+### ✅ 7. Filters (Customisation)
+You can choose your best designs based on your customised filters.
+
+---
+
+## 📁 Input Requirements
+
+Upload the following:
+
+1. **Accepted PDB designs**  
+   Output from BindCraft or AlphaFold.
+
+
+
+The app will automatically match each PDB to its corresponding row in the CSV.
+
+---
+
+## 🛠️ How to use it?
+
+You have two choices:  
+- install all the dependencies.
+- just use the Wep App via the link.  (https://pdbanalyzermjshadfar.streamlit.app/)
+
+
+If you want to install it locally:
+
+
+git clone https://github.com/mj72git/PDB-Analyzer.git
+cd PDB-Analyzer-main
+
+conda create -n pdb_analyser_env python=3.9 -y
+
+conda activate pdb_analyser_env
+
+pip install -r requirements.txt
+
+After installation, you can run it by:
+
+streamlit run app.py
+
+
+
+
+

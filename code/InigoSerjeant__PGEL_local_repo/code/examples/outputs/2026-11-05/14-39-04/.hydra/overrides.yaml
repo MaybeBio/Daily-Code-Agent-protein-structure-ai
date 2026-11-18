@@ -1,0 +1,5 @@
+- inference.input_pdb=input_pdbs/5UDC_H_only_motif40.pdb
+- inference.output_prefix=outputs/H83_122_motif40_train
+- contigmap.contigs=[82-82/H83-122/95-95]
+- inference.num_designs=1
+- inference.inversion_train=True

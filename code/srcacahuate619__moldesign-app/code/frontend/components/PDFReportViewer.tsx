@@ -1,0 +1,192 @@
+"use client";
+
+import { presentError } from "../lib/frontendError";
+
+
+import { useLanguage } from "@/context/LanguageContext";
+import React, { useEffect, useState, useRef } from "react";
+import { fetchCertificateBlobUrl, downloadCertificate } from "../lib/api";
+import { Download, Maximize, FileText, Loader2, ShieldCheck, AlertCircle } from "lucide-react";
+import { CertificationModal, type CertificationSuccess } from "./CertificationModal";
+
+interface PDFReportViewerProps {
+  moleculeId: string;
+  /**
+   * Corrida cuyo dossier se muestra. Una molécula se evalúa varias veces; sin ella
+   * el backend usaría la última, que puede no ser la que el investigador abrió.
+   */
+  taskId?: string | null;
+  isCertified: boolean;
+  /** Actualiza el resultado local con una firma que el modal ya publicó. */
+  onCertify?: (result: CertificationSuccess) => void | Promise<void>;
+  isCertifying?: boolean;
+}
+
+export function PDFReportViewer({ moleculeId, taskId, isCertified, onCertify, isCertifying = false }: PDFReportViewerProps) {
+  const { t, locale } = useLanguage();
+  const [blobUrl, setBlobUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [showModal, setShowModal] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  // DOC 71, DEFECTO E1. La versión anterior tenía dos fugas encadenadas:
+  //
+  //   1. la petición descartada NO se cancelaba. React monta, desmonta y vuelve
+  //      a montar el efecto en desarrollo, así que salían DOS generaciones del
+  //      mismo certificado. Cada una es un render completo de ReportLab, y
+  //      hasta este arreglo bloqueaban el bucle de eventos del backend: dos
+  //      bloqueos encadenados, y el WebView cortando la petición en vuelo con
+  //      `Failed to fetch`.
+  //
+  //   2. la URL del blob de la petición descartada nunca se revocaba: la
+  //      limpieza leía `url` por cierre, y en la primera pasada `url` todavía
+  //      era `""` porque el `await` no había resuelto. El objeto quedaba vivo
+  //      hasta recargar la ventana.
+  //
+  // Se aborta con `AbortController` y se revoca contra una referencia que
+  // sobrevive al cierre.
+  const urlActual = useRef<string | null>(null);
+
+  useEffect(() => {
+    const control = new AbortController();
+    let activo = true;
+
+    (async () => {
+      setIsLoading(true);
+      setError(null);
+      try {
+        const url = await fetchCertificateBlobUrl(moleculeId, control.signal, taskId);
+        if (!activo) {
+          // Llegó después de que nadie la esperara: se libera aquí, que es el
+          // único sitio donde todavía se conoce.
+          URL.revokeObjectURL(url);
+          return;
+        }
+        if (urlActual.current) URL.revokeObjectURL(urlActual.current);
+        urlActual.current = url;
+        setBlobUrl(url);
+        setIsLoading(false);
+      } catch (err: any) {
+        // Abortar es lo que pedimos, no un fallo que mostrar.
+        if (err?.name === "AbortError" || !activo) return;
+        setError(presentError(err, t) || t("auto_15eff5b3b975"));
+        setIsLoading(false);
+      }
+    })();
+
+    return () => {
+      activo = false;
+      control.abort();
+    };
+  }, [moleculeId, taskId, isCertified, locale, t]);
+
+  // La última URL viva se libera al desmontar de verdad, no en cada re-efecto.
+  useEffect(() => () => {
+    if (urlActual.current) URL.revokeObjectURL(urlActual.current);
+  }, []);
+
+  if (isLoading) {
+    return (
+      <div className="w-full h-full min-h-[400px] flex flex-col items-center justify-center bg-surface-900 border border-surface-800 rounded-lg">
+        <Loader2 className="w-8 h-8 text-brand-500 animate-spin mb-4" />
+        <div className="text-surface-400 font-mono text-xs uppercase tracking-wider">{t("auto_48b7ee848f6b")}</div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="w-full h-full min-h-[400px] flex flex-col items-center justify-center bg-red-500/5 border border-red-500/20 rounded-lg p-6 text-center">
+        <AlertCircle className="w-10 h-10 text-red-400 mb-4" />
+        <div className="text-red-400 font-bold mb-2">{t("pn_dossier_no_cargo")}</div>
+        <div className="text-surface-400 text-sm max-w-md">{error}</div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div ref={containerRef} className="flex flex-col w-full h-full min-h-[500px] bg-surface-950 border border-surface-800 rounded-lg overflow-hidden relative">
+        {/* Dossier toolbar */}
+        <div className="flex items-center justify-between px-4 py-3 bg-surface-900 border-b border-surface-800 z-10 shadow-sm relative">
+          <div className="flex items-center gap-3">
+            <FileText className="w-4 h-4 text-brand-400" />
+            <span className="font-mono text-xs text-surface-300 tracking-wider">{t("pn_pdf_dossier_name", { id: moleculeId.split('-')[0].toUpperCase() })}</span>
+          </div>
+          
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => {
+                if (containerRef.current) {
+                  if (document.fullscreenElement) {
+                    document.exitFullscreen();
+                  } else {
+                    containerRef.current.requestFullscreen();
+                  }
+                }
+              }}
+              className="grid h-11 w-11 place-items-center rounded text-surface-400 transition-colors hover:bg-surface-800 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-400"
+              title={t("pn_pdf_fullscreen")}
+            >
+              <Maximize className="w-4 h-4" />
+            </button>
+            
+            <div className="w-px h-4 bg-surface-700 mx-1" />
+            
+            <button
+              onClick={() => downloadCertificate(moleculeId, "general", taskId)}
+              className="flex h-11 items-center gap-2 whitespace-nowrap rounded bg-surface-800 px-3 font-mono text-xs font-bold text-surface-300 transition-colors hover:bg-brand-500 hover:text-surface-950 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-400"
+            >
+              <Download className="w-3 h-3" />
+              <span className="hidden sm:inline">{t("pn_pdf_download")}</span>
+            </button>
+          </div>
+        </div>
+
+        {/* PDF Viewer Canvas Area */}
+        <div className="flex-1 overflow-hidden relative bg-[#0f1015]">
+          {!isCertified && (
+            <div className="absolute top-0 inset-x-0 z-20 bg-amber-500/10 border-b border-amber-500/20 px-4 py-2 flex items-center justify-between backdrop-blur-md">
+              <div className="flex items-center gap-2 text-amber-500 text-sm font-medium">
+                <AlertCircle className="w-4 h-4" />
+                <span>{t("pn_dossier_sin_registro")}</span>
+              </div>
+              {onCertify && (
+                <button
+                  onClick={() => setShowModal(true)}
+                  disabled={isCertifying}
+                  className="flex min-h-11 items-center gap-2 whitespace-nowrap rounded bg-amber-500 px-3 font-mono text-xs font-bold uppercase text-surface-950 transition-colors hover:bg-amber-400 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-200 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <ShieldCheck className="w-3 h-3" />
+                  {t("pn_pdf_register_integrity")}
+                </button>
+              )}
+            </div>
+          )}
+          
+          <div className="absolute inset-0 z-10 pt-[40px]">
+            {blobUrl && (
+              <iframe 
+                src={`${blobUrl}#toolbar=0&view=FitH`} 
+                className="w-full h-full border-none bg-transparent"
+                title={t("pn_dossier_vista_previa")}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+      
+      {showModal && (
+        <CertificationModal 
+          moleculeId={moleculeId} 
+          taskId={taskId}
+          onClose={() => setShowModal(false)}
+          onSuccess={(result) => {
+            void onCertify?.(result);
+          }}
+        />
+      )}
+    </>
+  );
+}

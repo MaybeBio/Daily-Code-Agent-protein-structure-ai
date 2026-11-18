@@ -1,0 +1,73 @@
+"""Rigid-body kinetic energy for TIP3P-style triatomic waters (O + 2 H per molecule)."""
+
+from __future__ import annotations
+
+import jax
+import jax.numpy as jnp
+from jaxtyping import Array
+
+
+def rigid_tip3p_box_ke_kcal(
+  position: Array,
+  momentum: Array,
+  mass: Array,
+  n_waters: int,
+) -> Array:
+  """Total rigid-body kinetic energy (kcal/mol); see :func:`rigid_tip3p_ke_components`.
+
+  This includes the kinetic energy of the *system* centre of mass. When that mode is
+  not removed by the integrator (``remove_linear_com_momentum=False``) it is a live,
+  thermalized 3-DOF mode, so dividing this total by ``6 N - 3`` overstates the
+  temperature by ``3 T / (6 N - 3)`` (+100 K at N=2). Use
+  :func:`prolix.physics.temperature_scan.rigid_tip3p_temperatures` for temperatures.
+  """
+  ke_trans, ke_rot = rigid_tip3p_ke_components(position, momentum, mass, n_waters)
+  return ke_trans + ke_rot
+
+
+def rigid_tip3p_ke_components(
+  position: Array,
+  momentum: Array,
+  mass: Array,
+  n_waters: int,
+) -> tuple[Array, Array]:
+  """Rigid-body kinetic energy (kcal/mol) split into ``(sum of per-molecule COM KE, rotational KE)``.
+
+  Uses laboratory-frame positions ``r_i`` and conjugate momenta ``p_i`` with masses ``m_i``
+  grouped as ``(O, H, H)`` per water. This matches the physical kinetic energy counted by
+  OpenMM's ``State.getKineticEnergy()`` for ``rigidWater=True`` more closely than
+  ``sum_i |p_i|^2 / (2 m_i)``, which still includes internal components that constraints remove.
+
+  NOTES:
+  - ``one_water`` uses ``jnp.linalg.solve(inertia, ang[:, None]).squeeze(-1)`` rather than
+    the natural ``jnp.linalg.solve(inertia, ang)``.  JAX >= 0.5.0 requires the rhs of
+    ``linalg.solve`` to have an explicit trailing dimension when the function is traced
+    under ``jax.vmap``; passing a 1-D vector causes a tracer shape mismatch that surfaces
+    as a cryptic vmap slicing error.  The ``[:, None] / .squeeze`` pattern is the canonical
+    workaround (same fix applied to ``_remove_angular_momentum_from_impulse`` in settle.py).
+  """
+  m_flat = jnp.asarray(mass).reshape(-1)
+  pos = jnp.asarray(position).reshape((n_waters, 3, 3))
+  mom = jnp.asarray(momentum).reshape((n_waters, 3, 3))
+  mw = m_flat.reshape((n_waters, 3))
+
+  def one_water(r: Array, p: Array, m: Array) -> Array:
+    m_sum = jnp.sum(m)
+    eps = jnp.array(1e-12, dtype=m_sum.dtype)
+    com = jnp.sum(m[:, None] * r, axis=0) / jnp.maximum(m_sum, eps)
+    p_tot = jnp.sum(p, axis=0)
+    ke_t = 0.5 * jnp.dot(p_tot, p_tot) / jnp.maximum(m_sum, eps)
+    rc = r - com
+    ang = jnp.cross(rc[0], p[0]) + jnp.cross(rc[1], p[1]) + jnp.cross(rc[2], p[2])
+    eye = jnp.eye(3, dtype=r.dtype)
+    inertia = (
+      m[0] * (jnp.sum(rc[0] * rc[0]) * eye - jnp.outer(rc[0], rc[0]))
+      + m[1] * (jnp.sum(rc[1] * rc[1]) * eye - jnp.outer(rc[1], rc[1]))
+      + m[2] * (jnp.sum(rc[2] * rc[2]) * eye - jnp.outer(rc[2], rc[2]))
+    )
+    omega = jnp.linalg.solve(inertia, ang[:, None]).squeeze(-1)  # see NOTES in docstring
+    ke_r = 0.5 * jnp.dot(ang, omega)
+    return ke_t, ke_r
+
+  ke_t, ke_r = jax.vmap(one_water)(pos, mom, mw)
+  return ke_t.sum(), ke_r.sum()

@@ -1,0 +1,271 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prolix"
+version = "1.0.0"
+description = "Protein Physics and Molecular Dynamics in JAX"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "Marielle Russo", email = "67157875+maraxen@users.noreply.github.com" },
+]
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "jax",
+    "jax-md",
+    "equinox",
+    "proxide>=0.1.0a8",
+    "biotite",
+    "mdtraj",
+    "numpy",
+    "scipy",
+    "chex",
+    "jaxtyping",
+    "py2Dmol>=1.5.1",
+    "matplotlib>=3.10.7",
+    "imageio>=2.37.2",
+    "jaxopt",
+    "h5py>=3.16.0",
+    "rdkit>=2024.3.0",
+    "xtrax>=0.4.1b2,<0.5",
+    "parmed>=4.3.1",
+    "openmmtools",
+    "mpiplus",
+    "netcdf4",
+    "numba",
+    "openmm",
+    "pandas",
+    "pdbfixer",
+    "pymbar",
+    "pyyaml",
+]
+
+[project.urls]
+Homepage = "https://github.com/maraxen/prolix"
+Repository = "https://github.com/maraxen/prolix"
+Issues = "https://github.com/maraxen/prolix/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.optional-dependencies]
+cuda = ["jax[cuda12]"]
+tpu = ["jax[tpu]"]
+cpu = ["jax"]
+dev = [
+    "ruff",
+    "pytest",
+    "pytest-cov",
+    "pytest-xdist",
+    "ty",
+    # openff-toolkit: install separately via conda if needed for HP4 work
+    # see scripts/data/build_params_init.py §10.2 for details
+]
+
+# Linux x86_64: OpenMM 8.4+ is manylinux_2_34-only (no sdist) — pin 8.3.x for older glibc HPC nodes.
+# Other platforms: latest 8.4+ wheels. See also ``[tool.uv].required-environments``.
+openmm = [
+    "openmm>=8.3.1,<8.4.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "openmm>=8.4.0 ; sys_platform != 'linux' or platform_machine != 'x86_64'",
+]
+
+docs = [
+    "sphinx",
+    "sphinx-book-theme",
+    "myst-nb",
+    "sphinx-design",
+    "sphinx-copybutton",
+    "sphinx-autodoc-typehints",
+    "sphinxext-rediraffe",
+]
+
+viz = [
+    "py2Dmol>=1.5.0",
+    "flask>=3.0.0",
+]
+
+wasm = [
+    "iree-base-compiler>=3.11",
+]
+
+[tool.pytest.ini_options]
+timeout = 900
+timeout_method = "thread"
+# Rootdir-relative so tests/ can import `scripts.experiments.*` helpers directly
+# (test_apply_pme_config, test_stage2_coverage_tags, test_emit_probe_record).
+# The former `scripts.profiling.*` seam this once justified was upstreamed to
+# xtrax.profiling (xtrax >= 0.4.0a7, 2026-09-01) and the local copy retired; see
+# .praxia/docs/reference/260901_named-scope-attribution-limits.md for the
+# prolix-specific attribution evidence preserved out of it.
+pythonpath = ["."]
+# Default fast CI: pytest -m "not slow" (matches .github/workflows/ci.yml test step)
+# OpenMM parity (optional dep): pytest -m "openmm"
+markers = [
+    "fast: marks tests as fast (< 30s, CI gating)",
+    "smoke: marks tests as smoke tests (fast and critical)",
+    "slow: marks tests as slow (>30s, may be skipped in CI)",
+    "benchmark: marks tests as benchmark (deselect with -m 'not benchmark')",
+    "openmm: marks tests that require OpenMM (optional dependency)",
+    "kups: optional third-party kups package for thermostat cross-validation (pytest -m \"not kups\" to skip)",
+    "wasm: marks tests requiring iree-compile (optional wasm extra, Claim 2 W3)",
+    "integration: marks heavy parity or integration tests against other engines",
+    "dynamics: marks tests involving long MD trajectories or statistical checks",
+    "order: controls test execution order",
+]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "--json-report --json-report-file=tmp/pytest.json"
+
+[tool.ruff]
+line-length = 100
+fix = true
+indent-width = 2
+force-exclude = true
+exclude = [
+    ".venv",
+    "venv",
+    "build",
+    "dist",
+    "__pycache__",
+    "*.ipynb",
+    "tests",
+    "scripts",
+    "inspect_eqx.py",
+    "main.py",
+    "test_bonded.py",
+    "proxide",
+    "benchmarks",
+    "docs",
+]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "ANN", "D", "SIM", "PERF", "A", "TRY", "EM",
+    "FBT", "S104", "BLE", "SLF001", "PGH003",
+    "N803", "N806", "ARG001", "ERA001", "PLC0415",
+    "G004", "PTH",
+    "C901", "PLR0915", "PLR0912", "PLR2004",
+    "FIX002", "TD002", "TD003",
+    "E501", "E741", "E701",
+    "PD", "COM812", "ISC001", "ARG003",
+    "F722", # jaxtyping strings
+    "RUF002", # greek sigma in docstrings
+    "RET504", # unnecessary assignment before return
+    "F841", # unused variables
+    "RUF059", # unused unpacked variables
+    "F821", # undefined name (often jaxtyping dims)
+    "RUF022", # sorting __all__
+    "TC002", # move jaxtyping into type-checking block
+    "W293", # blank line whitespace
+    "C414", # unnecessary list() in sorted()
+]
+pylint.max-args = 15
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    "S101",    # assert allowed in tests
+    "T201",    # print allowed in tests
+    "ANN201",  # return type not required
+    "INP001",  # implicit namespace package
+    "PLC0415", # import outside top-level
+    "SLF001",  # private member access
+    "PLR2004", # magic value comparison
+    "ANN001",  # missing type annotation
+    "D100", "D101", "D102", "D103",  # missing docstrings
+]
+"scripts/**/*.py" = [
+    "T201",    # print allowed in scripts
+    "INP001",  # implicit namespace package
+]
+
+[tool.ty.src]
+exclude = ["**/viewer.py"]
+
+[tool.ty.environment]
+root = ["src/prolix"]
+
+[tool.ty.rules]
+invalid-type-form = "ignore"
+# ty 0.0.29: false positives — stdlib typing members not resolved in this env config
+unresolved-import = "ignore"
+# Protocol methods with `...` bodies are valid; ty does not yet detect @runtime_checkable
+empty-body = "ignore"
+
+[tool.uv]
+# OpenMM 8.4+ ships manylinux_2_34 wheels only (no sdist). Older Linux (e.g. glibc/manylinux_2_28
+# HPC nodes) must resolve to 8.3.x, which still publishes manylinux_2_28 x86_64 wheels. Requiring
+# this environment forces the universal lock to retain a compatible fork for Linux x86_64 while
+# allowing newer OpenMM on other platforms.
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv.sources]
+openmmtools = { git = "https://github.com/choderalab/openmmtools" }
+
+[dependency-groups]
+# Keep in sync with [project.optional-dependencies] dev (no OpenMM here — see `openmm` extra).
+dev = [
+    "ruff",
+    "pytest",
+    "pytest-cov",
+    "pytest-xdist",
+    "ty",
+    "pytest-timeout",
+    "pdbfixer>=1.12.0",
+    "termcolor>=3.3.0",
+    "pytest-json-report>=1.5.0",
+]
+
+# §7.1 external-baseline comparator envs — install per-tool, not all together.
+# Each group is isolated; DMFF and espaloma have incompatible dep trees.
+# Usage: uv sync --group benchmark-dmff   (or torchmd / espaloma)
+#
+# DMFF: not on PyPI — pinned to repo HEAD at time of external-baseline campaign.
+# Commit 809f656 = deepmodeling/DMFF main branch, 2026-05-22.
+# Also requires openmm (via `openmm` extra: uv sync --group benchmark-dmff --extra openmm)
+# and freud-analysis (conda-forge preferred: `mamba install -c conda-forge freud`).
+benchmark-dmff = [
+    "dmff @ git+https://github.com/deepmodeling/DMFF.git@809f656153018498e3260e07162197139ba103d6",
+    "networkx>=3.0",
+    "pymbar>=4.0.0",
+    "optax>=0.1.4",
+    "jaxopt>=0.8.0",
+    # freud-analysis: conda-forge only (no PyPI wheel for linux x86_64)
+    # openmm: use `--extra openmm` alongside this group
+]
+
+# TorchMD: on PyPI as `torchmd`. Requires moleculekit (also on PyPI).
+# Commit 0948418 = torchmd/torchmd main branch, 2026-05-22 (reference only; PyPI version used).
+# torch itself must be installed in the venv with CUDA support separately:
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cu126
+benchmark-torchmd = [
+    "torchmd>=1.1.2",
+    "moleculekit",
+]
+
+# espaloma: not on PyPI — pinned to repo HEAD at time of external-baseline campaign.
+# Commit 413eb55 = choderalab/espaloma main branch, 2026-05-22.
+# DGL is NOT on PyPI (CUDA-specific wheels); install separately:
+#   mamba install -c dglteam/label/cu124 dgl
+# openff-toolkit required for heterograph construction:
+#   mamba install -c conda-forge openff-toolkit
+# torch: same as benchmark-torchmd (cu126 index).
+benchmark-espaloma = [
+    "espaloma @ git+https://github.com/choderalab/espaloma.git@413eb55074037540e1414eb365da7304bd5d72be",
+    # dgl: conda only (see comment above)
+    # openff-toolkit: conda only (see comment above)
+]
+
+
+[tool.jaxlint]
+# JL010: float64 is required throughout for MD energy conservation
+# JD001/JD002: test functions don't need Parameters/Returns docstrings
+[tool.jaxlint.per_file_ignores]
+"tests/**" = ["JD001", "JD002"]
+"src/**" = ["JL010"]

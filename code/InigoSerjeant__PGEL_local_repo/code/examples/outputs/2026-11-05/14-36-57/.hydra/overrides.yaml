@@ -1,0 +1,5 @@
+- inference.input_pdb=input_pdbs/5UDC_H_only.pdb
+- inference.output_prefix=outputs/H103_114_rowmasked/sample
+- contigmap.contigs=[61-61/H62-114/103-103]
+- inference.num_designs=1
+- inference.inversion_train=False

@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package with test extras
+        # `[mcp]` too: without it tests/test_mcp_server.py skips and bp-mcp ships untested.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test,mcp]"
+
+      - name: Run pytest
+        # -m overrides the local addopts deselect, so the network tests run here.
+        run: pytest tests/ -v -m "not tool_parameters"
+
+      - name: Run the per-tool parameter suites
+        # They need neither GPU nor network and are opt-in locally, so CI runs them.
+        run: pytest tests/tool_parameters -v -m tool_parameters

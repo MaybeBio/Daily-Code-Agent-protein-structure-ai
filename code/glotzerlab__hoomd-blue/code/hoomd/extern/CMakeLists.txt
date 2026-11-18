@@ -1,0 +1,16 @@
+file(GLOB_RECURSE _extern_headers
+     RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}
+     *.h *.cuh *.hpp *.cmake)
+
+foreach(file ${_extern_headers})
+    # install into installation target
+    get_filename_component(dir ${file} DIRECTORY)
+    install(FILES ${file} DESTINATION ${PYTHON_SITE_INSTALL_DIR}/include/hoomd/extern/${dir})
+endforeach()
+
+# setup neighbor target, as it will be installed by HOOMD
+add_library(neighbor INTERFACE)
+add_library(HOOMD::neighbor ALIAS neighbor)
+target_include_directories(neighbor INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/neighbor/include>
+                                              $<INSTALL_INTERFACE:${PYTHON_SITE_INSTALL_DIR}/include/hoomd/extern/neighbor/include>)
+install(TARGETS neighbor EXPORT HOOMDTargets)

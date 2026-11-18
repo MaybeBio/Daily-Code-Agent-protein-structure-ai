@@ -1,0 +1,463 @@
+# Validation results
+
+Agreement of pimd-rs with every reference used in milestones M1–M7a, and the performance table.
+M1–M4 numbers from branch `milestone-4`, M5 numbers from branch `milestone-5`, M6b numbers from branch `milestone-6`, M7a numbers from branch `milestone-7` (pimd-rs 0.1.0, rustc 1.96.0). Every number below has one of these sources:
+
+- **[run]**: printed by the long validation suite, run for this file with
+  `RAYON_NUM_THREADS=4 cargo test --workspace --release --all-features -- --nocapture`
+  (the release test step of `CHECK_LONG=1 ./scripts/check.sh`; 224 tests passed, 0 failed,
+  12 min 48 s wall);
+- **[plots]**: `validation/run_neon.py` + `validation/make_plots.py`, written to
+  [`plots/neon_summary.json`](https://github.com/njweiss/pimd-rs/blob/HEAD/validation/plots/neon_summary.json);
+- **[json]**: a committed reference-data file under `crates/*/tests/data/`;
+- **[comment]**: the doc comment of the named test (tolerances and their derivation).
+
+Tolerance policy (`docs/WORKFLOW.md`): 5σ of the block-averaged estimate (blocks checked against
+4× longer blocks, σ the larger) plus a stated discretisation-bias allowance; σ_c is the combined
+σ of engine and reference.
+
+## Reference versions
+
+| Code | Version | Used for |
+|---|---|---|
+| LAMMPS | 22 Jul 2025 Update 6, conda `2025.07.22 cpu_py312_hdb376b3_mpi_openmpi_6` | M3 single point, trajectory, thermodynamics; LJ client of i-PI (M4); benchmark |
+| i-PI | 3.3.1 (conda `pyh5ded981_0`) | M4 liquid-neon PIMD; M5 water/GFN2-xTB PIMD; M7a RPMD/TRPMD (double well, liquid neon) |
+| tblite | 0.7.0 (conda `py312h0536e37_2`) | M5 GFN2-xTB force client (`ipi_client.py xtb`), for both codes |
+| Python / numpy / scipy | 3.12.16 / 2.5.4 / 1.18.1 | reference generators (double well: numpy + scipy) |
+| matplotlib | 3.11.2 | plots only |
+| PyTorch / mace-torch / e3nn | 2.13.0 (CUDA 13.0) / 0.3.17 / 0.4.4 | M6b Python MACE reference (`mace_ref.json`, `mace_client.py`); libtorch for the `tch` 0.26.0 crate |
+| MACE-OFF23 | small (`MACE-OFF23_small.model`, not committed) | M6b long validation |
+
+Versions from the `versions` blocks of the committed JSON files [json] and `pixi.lock`.
+
+## M1 Foundations
+
+No external reference code. Units equal their CODATA 2018 values exactly; the normal-mode matrix,
+frequencies and spring matrix are compared with an independent construction from the SPEC
+formulas; neighbor lists equal a brute-force search exactly (`crates/pimd-core/tests/`, default
+suite).
+
+## M2 Ring-polymer sampling
+
+| Comparison | Reference | pimd-rs [run] | Agreement | Tolerance [comment] |
+|---|---|---|---|---|
+| Harmonic, P = 1, ⟨E⟩ (E_prim = E_vir) | E-9 exact: 3 | 3.00373 ± 0.00388 | +0.96σ | 5σ + 0.005 = 0.0244 |
+| Harmonic, P = 4, ⟨E_prim⟩ | E-9 exact: 5.6 | 5.59191 ± 0.00433 | −1.87σ | 0.0266 |
+| Harmonic, P = 4, ⟨E_vir⟩ | 5.6 | 5.59966 ± 0.00501 | −0.07σ | 0.0300 |
+| Harmonic, P = 16, ⟨E_prim⟩ | E-9 exact: 6.178180 | 6.16693 ± 0.00725 | −1.55σ | 0.0413 |
+| Harmonic, P = 16, ⟨E_vir⟩ | 6.178180 | 6.18345 ± 0.00461 | +1.14σ | 0.0280 |
+| Harmonic, P = 16, var(E_vir)/var(E_prim) | — | 0.6731 / 4.7281 = 0.142 | — | < 0.3 |
+| Double well, P = 32, ⟨E_vir⟩ | finite-P exact −3.012905 [json] | −3.016219 ± 0.00413 | −3.31e-3 (0.80σ) | 5σ + 3e-3 |
+| Double well, P = 32, vs exact quantum −3.007976 [json] | | | −8.24e-3 | 5σ + 3e-3 + 4.93e-3 |
+| Double well, P = 64, ⟨E_vir⟩ | finite-P exact −3.009212 [json] | −3.012258 ± 0.00405 | −3.05e-3 (0.75σ) | 5σ + 3e-3 |
+| Double well, P = 64, vs exact quantum | −3.007976 | | −4.28e-3 | 5σ + 3e-3 + 1.24e-3 |
+| Free ring polymer, PILE-L, ⟨p̃_k²/m⟩, 8 modes | P/β = 2 | 1.99821 … 2.00633 | within 1.89σ (all modes) | 5σ |
+
+Atomic units (Eh). Harmonic: N = 4, ω = 1, β = 4, dt = 0.05, 50 000 a.u. sampled
+(`crates/pimd-estimators/tests/harmonic_sampling.rs`). Double well: one atom in 3D, a = 1/8, b = 1,
+β = 2, exact values from sinc-DVR diagonalisation and the finite-P transfer matrix
+(`double_well.json`, numpy 2.5.4, scipy 1.18.1; `double_well_sampling.rs`). The finite-P exact
+values converge as 1/P² (ratio of discretisation errors P = 32 / P = 64: 3.986 [json]).
+
+## M3 Classical core (LAMMPS)
+
+| Comparison | pimd-rs vs LAMMPS [run] | Tolerance [comment] |
+|---|---|---|
+| Single point, 256-atom LJ liquid, shifted: total energy | −1181.0262416971264 vs −1181.0262416971216 (4.0e-15 rel) | 1e-10 rel |
+| same, forces (768 components) | max 3.1e-14 rel | 1e-10 rel |
+| Single point, unshifted: energy / forces | 1.8e-15 rel / 3.1e-14 rel | 1e-10 rel |
+| NVE trajectory, 20 steps, dt = 0.005 τ (`fix nve`) | max \|Δx\| 8.9e-16, max \|Δv\| 2.8e-14 | 1e-8 abs |
+| NVE energy conservation, fluctuation ratio dt = 0.01 / 0.005 | 0.2541 / 0.06256 = 4.06 (dt² gives 4) | [3, 5] |
+| Thermo smoke (first 400 steps): ⟨V⟩ / ⟨p⟩ | 7.6e-15 / 7.3e-14 rel | 1e-9 rel |
+| Thermo long (200 000 steps NVE): ⟨V⟩ | −1193.3956 ± 0.108 vs −1193.2938 ± 0.109 [json] (−0.66σ_c) | 5σ_c ≈ 0.77 |
+| Thermo long: ⟨p⟩ | 1.832914 ± 0.00247 vs 1.832718 ± 0.00228 [json] (+0.06σ_c) | 5σ_c ≈ 0.017 |
+
+LJ reduced units (ε = σ = m = 1), ρ* = 0.8, T* ≈ 1, r_c = 2.5σ. Tests:
+`crates/pimd-potentials/tests/lj_lammps.rs`, `crates/pimd-integrators/tests/vv_lennard_jones.rs`,
+`crates/pimd-estimators/tests/lj_thermo.rs`; LAMMPS data in `lj_snapshot.json` and
+`lj_thermo.json`. The dt/2 check of the thermo bias (Δ⟨V⟩ = −0.12, Δ⟨p⟩ = −0.0002, unresolved) is
+from the reference implementation [comment].
+
+## M4 Liquid neon, PIMD
+
+State point (from `crates/pimd-cli/tests/data/ipi_neon.json`, configs in
+[`configs/`](https://github.com/njweiss/pimd-rs/blob/HEAD/validation/configs)): N = 108 Ne in a 14.1 Å cube (ρ* = 0.80), LJ ε = 35.6 K, σ = 2.749 Å,
+r_c = 2.2σ shifted, T = 30 K, dt = 2 fs, BAOAB + PILE-L (τ_0 = 100 fs, γ_k = 2ω_k), 5 000
+equilibration and 200 000 production steps (400 ps), recorded every 10 steps. Engine data: the
+release `pimd-rs` binary, 80 restarted legs of 2 500 steps per P (`run_neon.py`); blocks of 250
+samples (5 ps) checked against 1 000. i-PI 3.3.1 with LAMMPS `fix ipi` as LJ client, same
+splitting and thermostat, seed 31415 [json]. Energies per atom in K. All numbers [plots]; the
+same numbers were printed by `crates/pimd-cli/tests/long_neon.rs` in the [run], which passed.
+
+### pimd-rs vs i-PI, P = 16
+
+| Quantity | pimd-rs | i-PI + LAMMPS [json] | Difference |
+|---|---|---|---|
+| ⟨E_vir⟩ | −96.721 ± 0.208 | −97.189 ± 0.183 | +0.47 K (1.69σ_c) |
+| ⟨E_prim⟩ | −96.699 ± 0.251 | −97.291 ± 0.256 | +0.59 K (1.65σ_c) |
+| g(r), 70 bins to 7 Å | | | worst bin 2.03σ_c (r = 2.55 Å); no bin above 3σ_c |
+
+Tolerance 5σ_c, bias allowance 0 (same integrator and dt on both sides; the dt vs dt/2 change
+measured with the reference implementation is 0.08 ± 0.53 K in ⟨E_vir⟩ [comment]).
+Plots: [energies](https://github.com/njweiss/pimd-rs/blob/HEAD/validation/plots/neon_p16_energy_vs_ipi.png), [g(r) and residuals](https://github.com/njweiss/pimd-rs/blob/HEAD/validation/plots/neon_p16_rdf_vs_ipi.png).
+
+### Quantum (P = 16) vs classical (P = 1)
+
+| Quantity | P = 1 | P = 16 | Shift |
+|---|---|---|---|
+| ⟨E_vir⟩ | −112.683 ± 0.178 | −96.721 ± 0.208 | +15.96 K (58.2σ_c) |
+| ⟨E_prim⟩ | −112.683 ± 0.178 | −96.699 ± 0.251 | +15.98 K (51.9σ_c) |
+| g(r) at the classical first peak, r = 2.95 Å | 2.7322 ± 0.0070 | 2.4631 ± 0.0041 | −0.269 (33.1σ_c) |
+
+Both have the expected sign: quantum delocalisation raises the energy and lowers the first peak.
+Plot: [g(r)](https://github.com/njweiss/pimd-rs/blob/HEAD/validation/plots/neon_quantum_vs_classical_rdf.png).
+
+### Convergence in P
+
+| P | ⟨E_vir⟩ | σ(K_prim) | σ(K_vir) |
+|---|---|---|---|
+| 4 | −99.001 ± 0.215 | 0.096 | 0.026 |
+| 8 | −97.693 ± 0.185 | 0.113 | 0.036 |
+| 16 | −96.721 ± 0.208 | 0.129 | 0.032 |
+| 32 | −96.744 ± 0.208 | 0.169 | 0.036 |
+
+Weighted fit ⟨E_vir⟩ = E∞ + a/P²: E∞ = −96.80 ± 0.13 K, a = −36.6 ± 4.3 K; residuals +0.42,
+−1.72, +1.08, +0.45 σ. E(32) − E(4) = +2.26 K (7.5σ_c). The virial kinetic estimator's block
+error is 3–5× smaller than the primitive's at every P (K = E − V̄, which removes the shared slow
+potential-energy fluctuations). Plot: [⟨E_vir⟩ vs 1/P²](https://github.com/njweiss/pimd-rs/blob/HEAD/validation/plots/neon_convergence_in_p.png).
+
+These M4 numbers equal, to the printed digits, those recorded in the header of `long_neon.rs`
+for the reference implementation.
+
+## M5 Socket backend, GFN2-xTB
+
+Numbers printed by `RAYON_NUM_THREADS=4 cargo test --release -p pimd-socket --features
+long-validation --test bridge -- --nocapture` and `cargo test --release -p pimd-cli --features
+long-validation,socket-validation --test long_water_xtb -- --nocapture` on branch `milestone-5`
+(commit 823ef01), after `CHECK_LONG=1 CHECK_IPI=1 ./scripts/check.sh` had passed on the same
+commit (95 min wall, both i-PI references regenerated bit-identically) [run]. Tolerances and their
+derivation: the doc comments of `crates/pimd-socket/tests/bridge.rs` and
+`crates/pimd-cli/tests/long_water_xtb.rs` [comment].
+
+### Bridge: Python `lj` client through the socket vs in-process `LennardJones`
+
+Per evaluation, worst relative error over a 200-step PIMD trajectory driven by the in-process
+forces (tolerance 1e-12):
+
+| System | Clients | Energy | Forces | Virial |
+|---|---|---|---|---|
+| Liquid neon (M4 system, N = 108), P = 1 | 1 | 9.9e-16 | 9.4e-16 | 3.1e-15 |
+| Liquid neon, P = 4 | 2 | 1.1e-15 | 1.2e-15 | — (P > 1, K-6) |
+| 13-atom neon cluster, gas phase, P = 4 | 3 | 5.9e-16 | 4.7e-16 | — |
+
+50-step PIMD run through the socket vs in-process, same state and seed (tolerance max |Δq| ≤
+1e-10 bohr, |ΔV|/|V| ≤ 1e-12): neon P = 4, max |Δq| = 1.4e-14 bohr, |ΔV|/|V| = 0; cluster
+P = 4, 4.4e-16 bohr, 4.1e-16. The two codes differ by summation order only; over 3 000 steps
+the deviation grew roughly linearly to 2.9e-13 bohr (neon), far inside the chaos horizon
+[comment].
+
+### Water on GFN2-xTB: pimd-rs vs i-PI, P = 16
+
+One gas-phase water molecule, 300 K, P = 16, dt = 0.5 fs, BAOAB + PILE-L (τ_0 = 20 fs,
+γ_k = 2ω_k), 4 000 equilibration and 400 000 production steps (200 ps) per code, four
+single-threaded stateless `xtb` clients on both sides, blocks of 4 000 steps (2 ps) checked
+against 4× longer [json]. Per molecule; geometry bead-averaged.
+
+| Quantity | pimd-rs | i-PI [json] | Difference |
+|---|---|---|---|
+| ⟨E_vir⟩ (Eh) | −5.049908 ± 0.000023 | −5.049943 ± 0.000022 | +1.10σ_c |
+| ⟨E_prim⟩ (Eh) | −5.049985 ± 0.000047 | −5.050054 ± 0.000048 | +1.03σ_c |
+| ⟨V̄⟩ (Eh) | −5.061468 ± 0.000017 | −5.061498 ± 0.000015 | +1.32σ_c |
+| ⟨r_OH⟩ (bohr) | 1.849247 ± 0.000422 | 1.849065 ± 0.000432 | +0.30σ_c |
+| ⟨θ_HOH⟩ (°) | 107.0878 ± 0.0149 | 107.0927 ± 0.0154 | −0.23σ_c |
+| r_OH histogram, 25 bins 1.4–2.4 bohr | | | worst bin 2.19σ_c |
+
+Tolerance 5σ_c, bias allowance 0 (same splitting and dt on both sides). The dt vs dt/2 check
+with the reference implementation found no resolved bias (E_vir +6.2e-5 ± 3.3e-5 Eh, 1.9σ)
+[comment]. Run times: pimd-rs 914 s for this run; the i-PI reference 2 195 s in the gate. These
+numbers equal, to the printed digits, those recorded in the header of `long_water_xtb.rs` for
+the reference implementation.
+
+## M6 Torch backend, MACE (M6b)
+
+Numbers printed by `PIMD_MACE_MODEL=ff_models/mace_off23/MACE-OFF23_small.model
+RAYON_NUM_THREADS=4 pixi run -e ml env LIBTORCH_USE_PYTORCH=1 cargo test -p pimd-torch --release
+--features torch,long-validation -- --nocapture` on branch `milestone-6` (commit eb2f32d), after
+`CHECK_LONG=1 CHECK_IPI=1 CHECK_TORCH=1 ./scripts/check.sh` had passed on the same commit (99 min
+wall; all 7 reference generators, including both MACE ones, reproduced the committed files)
+[run]. Tolerances and their derivation: the doc comments of `crates/pimd-torch/tests/*.rs`
+[comment]. The MACE-OFF23 weights are not in the repository (`ff_models/` is ignored); the test
+reads them from `PIMD_MACE_MODEL` and exports them to a temporary file.
+
+### MACE-OFF23 small: in-process `MacePotential` vs Python MACE through the socket
+
+Gas-phase water at the M5 start geometry, P = 8, 300 K, dt = 0.5 fs, BAOAB + PILE-L. In
+process: `MacePotential`, CPU, float64, 1 libtorch thread. Through the socket: four
+`mace_client.py` clients (`MACECalculator` on the same model file, float64, CPU).
+
+| Check | Measured | Tolerance |
+|---|---|---|
+| Per evaluation, 100 steps: worst \|ΔE\|/\|E\| per bead | 1.86e-16 | 1e-12 |
+| Per evaluation, 100 steps: worst max\|ΔF\|/max\|F\| per bead | 6.42e-15 | 1e-10 |
+| 50-step trajectory, same state and seed: max \|Δq\| | 1.78e-15 bohr | 1e-10 bohr |
+| 50-step trajectory: \|ΔV\|/\|V\| | 0 | 1e-12 |
+
+### Tiny model vs Python MACE [json]
+
+The committed tiny MACE model (2 896 parameters, r_max 5 Å) against `mace_ref.json`
+(`MACECalculator`, mace's own neighbour list, float64 CPU). Water, ethanol and a periodic
+4-water box (positions not wrapped into the cell, 224 of 416 edges cross the boundary); 8
+displaced beads each, evaluated as one batch. Worst over the beads.
+
+| System | f64 CPU \|ΔE\|/\|E\| | f64 CPU max\|ΔF\|/max\|F\| | f64 CUDA max\|ΔF\|/max\|F\| | f32 CPU \|ΔE\| (eV) | f32 CPU max\|ΔF\|/max\|F\| |
+|---|---|---|---|---|---|
+| Water | 0 | 1.19e-15 | 1.73e-15 | 2.96e-4 | 1.34e-6 |
+| Ethanol | 0 | 3.93e-16 | 1.41e-15 | 8.09e-4 | 8.28e-7 |
+| 4-water box | 0 | 8.64e-16 | 6.47e-15 | 5.74e-4 | 4.52e-6 |
+
+Tolerances: float64 (CPU and CUDA) \|ΔE\| ≤ 1e-12·\|E\| and max\|ΔF\| ≤ 1e-10·max\|F\|; float32
+against the float64 reference \|ΔE\| ≤ 5e-3 eV and max\|ΔF\| ≤ 1e-4·max\|F\|. f64 CUDA
+\|ΔE\|/\|E\| = 0 for all three; f32 CUDA \|ΔE\| 2.96e-4, 8.09e-4, 5.74e-4 eV and max\|ΔF\|/max\|F\|
+1.75e-6, 6.64e-7, 4.43e-6. The CUDA numbers need a GPU and are skipped without one (here: RTX
+4060, CUDA 13.0).
+
+Batching all beads in one call vs one call per bead (tolerance 1e-12): \|ΔE\|/\|E\| = 0, worst
+max\|ΔF\|/max\|F\| 1.19e-15. Periodic box with atoms wrapped into [0, L) or shifted by lattice
+vectors (−2 … 2 box lengths per axis) vs the unwrapped positions (tolerance 1e-12):
+\|ΔE\|/\|E\| = 0, max\|ΔF\|/max\|F\| 2.98e-14 (wrapped) and 4.99e-14 (shifted).
+
+## M7a Dynamics: RPMD and TRPMD
+
+Numbers printed by `RAYON_NUM_THREADS=4 cargo test --release --features long-validation -p
+pimd-estimators --test long_dynamics_harmonic --test long_dynamics_doublewell -- --nocapture`
+and `cargo test --release --features long-validation -p pimd-cli --test long_neon_dynamics --
+--nocapture` on branch `milestone-7` (commit 8798036), after `CHECK_LONG=1 CHECK_IPI=1
+./scripts/check.sh` had passed on the same commit (934 tests, 0 failed; all 9 reference
+generators, including the two new i-PI ones, reproduced the committed files) [run]. Protocol
+(SPEC Y-1 … Y-5): PILE-L decorrelation, momentum redraw from N(0, mP/β), then an NVE (RPMD) or
+TRPMD (λ = 1/2: γ_0 = 0, γ_k = ω_k) segment; every sampled step of a segment is a time origin; σ
+from the segment-to-segment scatter, checked against blocks of 4 segments. Tolerances and their
+derivation: the doc comments of `crates/pimd-estimators/tests/long_dynamics_*.rs` and
+`crates/pimd-cli/tests/long_neon_dynamics.rs` [comment]. These numbers equal, to the printed
+digits, those recorded in the test headers for the reference implementation.
+
+### Harmonic oscillator vs the exact finite-dt result
+
+One atom, βω = 8, P = 8, ω dt = 0.1, 8 000 segments of 200 steps per method. For a harmonic
+potential the centroid decouples and follows the velocity-Verlet map M exactly, so
+C_xx(τ) = 3/(βmω²)·[Mⁿ]_qq and C_vv(τ) = 3/(βm)·[Mⁿ]_pp, with no time-step bias (tolerance 5σ at
+every lag, no allowance).
+
+| Method | C_xx worst lag | C_vv worst lag | C_xx(0) (exact 0.375) | C_vv(0) (exact 0.375) |
+|---|---|---|---|---|
+| RPMD | 0.68σ | 0.66σ | 0.3757 ± 0.0025 | 0.3746 ± 0.0025 |
+| TRPMD | 1.33σ | 0.99σ | 0.3781 ± 0.0025 | 0.3773 ± 0.0025 |
+
+RPMD energy error per segment, mean |H_P(end) − H_P(start)|/N: 7.1188e-3 at dt, 1.7399e-3 at
+dt/2, ratio 4.091 (required 3.5–4.5; O(dt²)).
+
+### Double well vs i-PI, and vs the exact quantum result
+
+One atom, m = 1, V = Σ_d (x_d⁴/8 − x_d²) (barrier 2 Eh = 3 k_BT at β = 1.5), P = 16, dt = 0.05;
+cycles of 200 PILE-L steps, redraw, 400-step segment sampled every 4 steps. pimd-rs: 6 400
+segments per method (library-driven, QUESTIONS Q30); i-PI 3.3.1 through the `doublewell`
+socket client: 1 600 segments per method from 8 chains [json]. Tolerance 5σ_c at every lag,
+bias allowance 0 (same splitting and dt).
+
+| Method | C_xx worst lag | C_vv worst lag | C_xx(0) pimd-rs | C_xx(0) i-PI | C_vv(0) pimd-rs | C_vv(0) i-PI |
+|---|---|---|---|---|---|---|
+| RPMD | 1.31σ_c | 2.22σ_c | 9.5759 ± 0.0108 | 9.5658 ± 0.0212 | 1.9967 ± 0.0154 | 2.0121 ± 0.0304 |
+| TRPMD | 1.84σ_c | 2.65σ_c | 9.5636 ± 0.0100 | 9.5786 ± 0.0200 | 2.0275 ± 0.0150 | 1.9965 ± 0.0286 |
+
+Against the exact quantum Kubo-transformed C_xx(t) from a DVR of the same Hamiltonian
+(`ipi_doublewell.json`, checked on two grids to 1e-8). Reported only, not a gate: RPMD is exact
+at t = 0 as P → ∞ and approximate for t > 0.
+
+| t (ħ/Eh) | exact Kubo | RPMD | TRPMD |
+|---|---|---|---|
+| 0 | 9.5752 | 9.5759 ± 0.0108 | 9.5636 ± 0.0100 |
+| 5 | 8.0757 | 7.9625 ± 0.0295 | 7.8983 ± 0.0281 |
+| 10 | 8.3421 | 8.3678 ± 0.0262 | 7.9673 ± 0.0296 |
+| 15 | 6.0630 | 8.3271 ± 0.0268 | 8.0794 ± 0.0291 |
+| 20 | 5.7212 | 8.3418 ± 0.0358 | 7.8484 ± 0.0397 |
+
+Both methods track the exact curve to t ≈ 10 and then miss its decay: past t ≈ 10 the exact
+C_xx keeps falling, while the RPMD curve stays near 8.3 and the TRPMD curve near 7.9–8.1. This
+is the known failure of the classical-centroid approximation for barrier tunnelling. TRPMD's
+damping of the internal modes lowers the plateau a little but does not restore the decay.
+
+### Liquid neon vs i-PI + LAMMPS, P = 16
+
+The M4 liquid (N = 108, 30 K, dt = 2 fs, LJ as in M4); cycles of 250 PILE-L steps, redraw,
+500-step segment sampled every 2 steps (τ up to 1 ps), 480 segments per method on each side
+(pimd-rs: one `pimd-rs` run continued through 120 checkpoint restarts; i-PI: 6 chains) [json].
+D from the Green–Kubo integral of C_vv at τ_max = 1 ps. Tolerance 5σ_c at every lag for C_vv
+and at τ_max for D, bias allowance 0; C_vv(0) within 5σ of 3/(βm).
+
+| Method | C_vv worst lag | D pimd-rs (Å²/ps) | D i-PI (Å²/ps) | ΔD | C_vv(0) vs 3/(βm) |
+|---|---|---|---|---|---|
+| TRPMD | 2.41σ_c (lag 250) | 0.1652 ± 0.0020 | 0.1670 ± 0.0019 | −0.66σ_c | −0.05σ |
+| RPMD | 0.95σ_c (lag 250) | 0.1627 ± 0.0021 | 0.1629 ± 0.0020 | −0.05σ_c | −1.89σ |
+
+In atomic units D = 1.4273e-5, 1.4428e-5 (TRPMD) and 1.4057e-5, 1.4070e-5 (RPMD) bohr²/(ħ/Eh),
+converted with `units` constants. RPMD C_vv(0) lies 1.89σ below 3/(βm) here and 1.5σ below in
+i-PI. Because C_seg(0) averages over every sample of the segment, it carries the NVE time-step
+bias of the centroid kinetic energy, and that bias is the same in both codes.
+
+Run times: pimd-rs 545 s for both methods (4 threads); i-PI references in the gate: neon 1 481 s,
+double well 2 012 s.
+
+## M7b Dynamics: PA-CMD
+
+Numbers printed by `cargo test --release --features long-validation -p pimd-estimators --test
+long_pacmd_harmonic --test long_pacmd_doublewell -- --nocapture` and `cargo test --release
+--features long-validation -p pimd-cli --test long_neon_pacmd -- --nocapture` on branch
+`milestone-7b` (commit f61735e), after `CHECK_LONG=1 CHECK_IPI=1 ./scripts/check.sh` had passed
+on the same commit (1 028 tests, 0 failed; all 11 reference generators, including the two new
+i-PI pa-cmd ones, reproduced the committed files) [run]. Protocol (SPEC Y-6, Y-7): the M7a cycle
+with dynamical masses m·s_k, s_k = (ω_k/Ω)², for the whole run; PILE-L decorrelation (internal
+γ = 2Ω), the amended redraw (mode k scaled by √s_k), then a segment with centroid NVE and
+internal-mode friction γ = 2λΩ. Tolerances and their derivation: the doc comments of
+`crates/pimd-estimators/tests/long_pacmd_*.rs` and `crates/pimd-cli/tests/long_neon_pacmd.rs`
+[comment].
+
+### Harmonic oscillator vs the exact finite-dt result
+
+As M7a (βω = 8, P = 8, ω dt = 0.1), with Ω = 4 and λ = 1. The centroid still decouples, so the
+same exact C_xx and C_vv apply (5σ at every lag, no allowance).
+
+| Quantity | worst lag | lag 0 (exact 0.375) |
+|---|---|---|
+| C_xx | 1.01σ | 0.3726 ± 0.0024 |
+| C_vv | 1.40σ | 0.3716 ± 0.0024 |
+
+Segment energy error mean |ΔH̃_P| grows with Ω, as the internal modes become stiffer (each step
+required > 5σ):
+
+| Ω (Ω·dt) | mean \|ΔH̃_P\| (Eh) | increase |
+|---|---|---|
+| 2 (0.2) | 1.4181e-2 ± 2.5e-4 | |
+| 4 (0.4) | 9.9975e-2 ± 1.9e-3 | 44.7σ_c |
+| 8 (0.8) | 5.8838e-1 ± 1.1e-2 | 43.6σ_c |
+
+### Double well vs i-PI, at two Ω
+
+The M7a double well and protocol, λ = 1, at Ω_h = P^{P/(P−1)}/β = 12.8323 Eh/ħ and 2Ω_h; i-PI
+3.3.1 `pa-cmd`, 1 600 segments per Ω [json]. Tolerance 5σ_c at every lag, bias allowance 0.
+
+| Ω | C_xx worst lag | C_vv worst lag | C_xx(0) pimd-rs | C_xx(0) i-PI | C_vv(0) pimd-rs | C_vv(0) i-PI |
+|---|---|---|---|---|---|---|
+| Ω_h | 1.51σ_c | 2.25σ_c | 9.5893 ± 0.0100 | 9.5651 ± 0.0197 | 2.0067 ± 0.0154 | 2.0578 ± 0.0310 |
+| 2Ω_h | 2.25σ_c | 2.28σ_c | 9.5644 ± 0.0104 | 9.5243 ± 0.0200 | 2.0019 ± 0.0149 | 2.0810 ± 0.0314 |
+
+Against the exact Kubo C_xx(t) (reported only, as in M7a):
+
+| t (ħ/Eh) | exact Kubo | PA-CMD Ω_h | PA-CMD 2Ω_h | Ω_h − 2Ω_h |
+|---|---|---|---|---|
+| 0 | 9.5752 | 9.5893 ± 0.0100 | 9.5644 ± 0.0104 | 1.7σ_c |
+| 5 | 8.0757 | 7.9500 ± 0.0293 | 7.9358 ± 0.0297 | 0.3σ_c |
+| 10 | 8.3421 | 8.1373 ± 0.0290 | 8.1872 ± 0.0276 | −1.2σ_c |
+| 15 | 6.0630 | 8.2615 ± 0.0281 | 8.2817 ± 0.0276 | −0.5σ_c |
+| 20 | 5.7212 | 8.0986 ± 0.0394 | 8.1173 ± 0.0374 | −0.3σ_c |
+
+The two Ω agree within 2σ_c at every printed time, so Ω_h is adiabatic enough here. Like RPMD and
+TRPMD, PA-CMD misses the tunnelling decay past t ≈ 10: its plateau near 8.1–8.3 lies between the
+RPMD (≈ 8.3) and TRPMD (≈ 7.9–8.1) curves of M7a.
+
+### Liquid neon vs i-PI + LAMMPS, P = 16
+
+The M7a neon protocol with Ω = Ω_h = 401.349 cm⁻¹ and λ = 1; 480 segments on each side [json].
+
+| C_vv worst lag | D pimd-rs (Å²/ps) | D i-PI (Å²/ps) | ΔD | C_vv(0) vs 3/(βm) |
+|---|---|---|---|---|
+| 2.08σ_c (lag 32) | 0.1657 ± 0.0019 | 0.1679 ± 0.0021 | −0.79σ_c | −1.57σ |
+
+In atomic units D = 1.43105e-5 vs 1.44991e-5 bohr²/(ħ/Eh). The static check: ⟨E_vir⟩ over the
+PA-CMD run is −96.81 ± 0.13 K/atom against the M4 i-PI PIMD value −97.19 ± 0.18 K/atom (1.68σ_c),
+so the dynamical masses leave the sampled distribution unchanged. PA-CMD D lies within 1σ of the
+M7a TRPMD (0.1652) and RPMD (0.1627 ± 0.0021, 1.1σ) values: for this weakly quantum liquid the
+three methods agree.
+
+Run times: i-PI references in the gate: neon pa-cmd 743 s, double well pa-cmd 2 044 s.
+
+## M8a Periodic MACE with bead chunks
+
+Numbers printed by `cargo test -p pimd-torch --release --features torch,long-validation --test
+long_mace_off23_pbc -- --nocapture` and `cargo test -p pimd-cli --release --features
+torch,long-validation --test long_water_mace_ipi -- --nocapture` (pixi `ml` env,
+`PIMD_MACE_MODEL` = MACE-OFF23 small, RTX 4060) on branch `milestone-8` (commit 60abfa4), after
+`CHECK_LONG=1 CHECK_TORCH=1 CHECK_IPI=1 ./scripts/check.sh` had passed on the same commit
+(1 414 tests, 0 failed; all 14 reference generators, including the new box, NMA and i-PI MACE
+water ones, reproduced the committed files) [run]. Chunked evaluation (SPEC P-6): the P beads are
+evaluated as consecutive graphs of c beads. Tolerances and their derivation: the doc comments of
+`crates/pimd-torch/tests/long_mace_off23_pbc.rs` and `crates/pimd-cli/tests/long_water_mace_ipi.rs`
+[comment]; the float32 energy tolerance is Q34.
+
+### NMA + 216 waters vs Python MACE (periodic)
+
+660 atoms, L = 18.760 Å, P = 4 displaced beads, against mace's ASE calculator in float64 with
+periodic boundaries [json]. Worst bead:
+
+| Row | max \|ΔE\| (eV) | relative | max \|ΔF\| / max \|F\| | tolerance (E; F) |
+|---|---|---|---|---|
+| float64 CPU, c = 2 | 5.82e-11 | 1.28e-16 | 5.80e-16 | 1e-12·\|E\|; 1e-10 |
+| float32 CUDA, c = 2 | 1.06e-1 | 2.32e-7 | 1.75e-5 | 0.25 eV; 1e-4 |
+| float32 CUDA, c = 3 (3 + 1) | 1.06e-1 | 2.32e-7 | 1.73e-5 | 0.25 eV; 1e-4 |
+
+The float32 energy error is 3.4 float32 ulp at |E| ≈ 4.56e5 eV (the total includes the atomic
+reference energies).
+
+### 64 waters vs i-PI with a Python MACE client, P = 1 and 8
+
+MACE-OFF23 small in float32 on CUDA on both sides; pimd-rs in-process with c = 3 (P = 8: chunks
+3 + 3 + 2), positions from `positions_xyz`; i-PI 3.3.1 driving one periodic Python MACE client.
+300 K, dt 0.5 fs, PILE-L τ₀ = 100 fs, 2.5 ps equilibration, production 20 ps (P = 1) and 15 ps
+(P = 8) [json]. Per molecule; tolerance 5σ_c, bias allowance 0.
+
+| P | ⟨E_vir⟩ pimd-rs (Eh) | ⟨E_vir⟩ i-PI (Eh) | Δ | ⟨V̄⟩ Δ | g_OO worst bin (of 60) |
+|---|---|---|---|---|---|
+| 1 | −76.490804 ± 0.000072 | −76.490630 ± 0.000033 | −2.19σ_c | −2.19σ_c | 2.75σ_c |
+| 8 | −76.476828 ± 0.000063 | −76.476847 ± 0.000073 | 0.19σ_c | 0.19σ_c | 1.85σ_c |
+
+The quantum shift ⟨E_vir⟩_8 − ⟨E_vir⟩_1 = 0.0140 Eh per molecule (≈ 150σ). σ is the largest
+block error over 0.5, 1 and 2 ps blocks; at P = 1 it still grows with block length (4.1, 5.3,
+7.2e-5 Eh), so the P = 1 error bar may be slightly underestimated. The i-PI g_OO first peak is
+2.63 (P = 1) and 2.50 (P = 8).
+
+Run times: pimd-rs 2 881 s (P = 1) and 6 372 s (P = 8), run concurrently; the i-PI reference in
+the gate 2 724 s (P = 1) and 13 930 s (P = 8).
+
+## Performance
+
+`validation/benchmark.sh` (3 min 23 s wall), N = 108 neon at the state point above, best of 3
+timings. atom-steps/s = N · P · steps / s. pimd-rs: full BAOAB + PILE-L step, no RDF;
+LAMMPS: `fix nve` + `fix langevin`, OPENMP package (`-sf omp`, one MPI rank, OpenMP threads).
+
+- CPU: AMD Ryzen 5 5600X3D 6-Core Processor, 12 logical CPUs (6 cores, 2 threads/core), WSL2
+  (Linux 5.15.167.4-microsoft-standard-WSL2)
+- Load average at start 4.49, at end 8.54: four unrelated single-thread processes were running
+  during the benchmark, so the 8-thread column (and LAMMPS's multi-thread columns) are
+  depressed by contention; absolute numbers are indicative only.
+- pimd-rs 0.1.0, rustc 1.96.0; LAMMPS 22 Jul 2025 Update 6 (conda 2025.07.22
+  cpu_py312_hdb376b3_mpi_openmpi_6)
+
+| threads | pimd-rs P = 16 | speedup | pimd-rs P = 1 | speedup | LAMMPS (openmp) | speedup | pimd-rs P = 1 / LAMMPS |
+|---|---|---|---|---|---|---|---|
+| 1 | 7.09e+05 | 1.00 | 5.28e+05 | 1.00 | 5.04e+06 | 1.00 | 0.10 |
+| 2 | 1.26e+06 | 1.78 | 7.13e+05 | 1.35 | 4.44e+06 | 0.88 | 0.16 |
+| 4 | 1.74e+06 | 2.45 | 6.76e+05 | 1.28 | 3.86e+06 | 0.77 | 0.18 |
+| 8 | 1.29e+06 | 1.82 | 4.48e+05 | 0.85 | 1.51e+06 | 0.30 | 0.30 |
+
+4 vs 1 thread at N = 108, P = 16: **2.45×** (MILESTONE_4 target ≥ 2×, reported, not gated: met).
+At P = 1 (108 atoms) the single-thread LJ step of pimd-rs is about 10× slower than LAMMPS's,
+and neither code gains from threads at this size; PIMD at P = 16 parallelises over (bead, atom)
+pairs and scales to 4 threads.
+
+## Reproducing
+
+```bash
+python3 validation/run_neon.py                        # ~11 min on the machine above (5 chains, 2 threads each)
+pixi run -e ref python validation/make_plots.py       # seconds; writes validation/plots/
+./validation/benchmark.sh                             # ~3.5 min; prints the table above
+RAYON_NUM_THREADS=4 cargo test --workspace --release --all-features -- --nocapture
+```

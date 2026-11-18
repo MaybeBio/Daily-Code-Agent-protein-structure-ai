@@ -1,0 +1,350 @@
+"""Tests for make_bundle_from_system factory (T6: Phase 1 bridge).
+
+Verifies that PhysicsSystem -> MolecularBundle conversion:
+- Returns the correct type
+- Pads arrays to the smallest containing bucket
+- Preserves the atom mask for real atoms
+- Threads boundary_condition through to shape_spec
+- Flattens multi-term dihedral/improper params
+- Converts dense exclusion layouts to pair lists
+"""
+
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from prolix.physics.system import _dense_excl_to_pair_list, make_bundle_from_system
+from prolix.types.bundles import ATOM_BUCKETS, MolecularBundle
+
+
+def _make_minimal_physics_system():
+    """Build a minimal PhysicsSystem with 10 real atoms and empty topology."""
+    from prolix.typing import PhysicsSystem
+
+    n = 10
+    pos = jnp.zeros((n, 3))
+    ones_f = jnp.zeros(n)
+    ones_b = jnp.ones(n, dtype=bool)
+    zeros_b = jnp.zeros(n, dtype=bool)
+    elem = jnp.ones(n, dtype=jnp.int32)
+
+    # Empty topology arrays (size == 0 in first dim)
+    empty_bonds = jnp.zeros((0, 2), dtype=jnp.int32)
+    empty_bond_params = jnp.zeros((0, 2))
+    empty_bond_mask = jnp.zeros(0, dtype=bool)
+
+    empty_angles = jnp.zeros((0, 3), dtype=jnp.int32)
+    empty_angle_params = jnp.zeros((0, 2))
+    empty_angle_mask = jnp.zeros(0, dtype=bool)
+
+    empty_dihedrals = jnp.zeros((0, 4), dtype=jnp.int32)
+    # PhysicsSystem stores dihedral_params as 3D: (N, N_terms, 3)
+    empty_dihedral_params = jnp.zeros((0, 1, 3))
+    empty_dihedral_mask = jnp.zeros(0, dtype=bool)
+
+    empty_impropers = jnp.zeros((0, 4), dtype=jnp.int32)
+    empty_improper_params = jnp.zeros((0, 1, 3))
+    empty_improper_mask = jnp.zeros(0, dtype=bool)
+
+    return PhysicsSystem(
+        positions=pos,
+        charges=ones_f,
+        sigmas=ones_f,
+        epsilons=ones_f,
+        radii=ones_f,
+        scaled_radii=ones_f,
+        masses=ones_f,
+        element_ids=elem,
+        atom_mask=ones_b,
+        is_hydrogen=zeros_b,
+        is_backbone=zeros_b,
+        is_heavy=zeros_b,
+        protein_atom_mask=zeros_b,
+        water_atom_mask=zeros_b,
+        bonds=empty_bonds,
+        bond_params=empty_bond_params,
+        bond_mask=empty_bond_mask,
+        angles=empty_angles,
+        angle_params=empty_angle_params,
+        angle_mask=empty_angle_mask,
+        dihedrals=empty_dihedrals,
+        dihedral_params=empty_dihedral_params,
+        dihedral_mask=empty_dihedral_mask,
+        impropers=empty_impropers,
+        improper_params=empty_improper_params,
+        improper_mask=empty_improper_mask,
+    )
+
+
+def test_factory_returns_molecular_bundle():
+    sys = _make_minimal_physics_system()
+    bundle = make_bundle_from_system(sys, boundary_condition="free")
+    assert isinstance(bundle, MolecularBundle)
+
+
+def test_factory_pads_to_bucket():
+    sys = _make_minimal_physics_system()
+    bundle = make_bundle_from_system(sys, boundary_condition="free")
+    # 10 atoms should land in the first bucket (64)
+    assert bundle.positions.shape[0] == ATOM_BUCKETS[0]
+
+
+def test_factory_size_buckets_off_pads_to_exact_n():
+    sys = _make_minimal_physics_system()
+    bundle = make_bundle_from_system(sys, boundary_condition="free", use_size_buckets=False)
+    assert bundle.positions.shape[0] == 10
+    assert bundle.shape_spec.use_size_buckets is False
+    assert bundle.shape_spec.exact_n_atoms == 10
+    assert int(bundle.atom_mask.sum()) == 10
+
+
+def test_factory_preserves_atom_mask():
+    sys = _make_minimal_physics_system()
+    bundle = make_bundle_from_system(sys, boundary_condition="free")
+    assert int(bundle.atom_mask.sum()) == 10  # 10 real atoms, rest padded False
+
+
+def test_factory_sets_boundary_condition():
+    sys = _make_minimal_physics_system()
+    bundle = make_bundle_from_system(sys, boundary_condition="periodic")
+    assert bundle.shape_spec.boundary_condition == "periodic"
+    bundle_free = make_bundle_from_system(sys, boundary_condition="free")
+    assert bundle_free.shape_spec.boundary_condition == "free"
+
+
+def test_factory_flattens_multi_term_dihedrals():
+    """(N, T, 3) dihedral_params expand to N*T rows in the bundle."""
+    from prolix.typing import PhysicsSystem
+
+    n = 4
+    pos = jnp.zeros((n, 3))
+    ones_f = jnp.zeros(n)
+    ones_b = jnp.ones(n, dtype=bool)
+    zeros_b = jnp.zeros(n, dtype=bool)
+    elem = jnp.ones(n, dtype=jnp.int32)
+    empty = jnp.zeros((0, 2), dtype=jnp.int32)
+    empty_p = jnp.zeros((0, 2))
+    empty_m = jnp.zeros(0, dtype=bool)
+    empty_ang = jnp.zeros((0, 3), dtype=jnp.int32)
+
+    dihs = jnp.array([[0, 1, 2, 3], [0, 1, 2, 4]], dtype=jnp.int32)
+    # 2 dihedrals × 2 terms each
+    dih_p = jnp.array(
+        [
+            [[1.0, 0.0, 2.0], [2.0, jnp.pi, 3.0]],
+            [[1.0, 0.0, 1.5], [1.0, 0.0, 1.5]],
+        ],
+        dtype=jnp.float64,
+    )
+
+    sys = PhysicsSystem(
+        positions=pos,
+        charges=ones_f,
+        sigmas=ones_f,
+        epsilons=ones_f,
+        radii=ones_f,
+        scaled_radii=ones_f,
+        masses=ones_f,
+        element_ids=elem,
+        atom_mask=ones_b,
+        is_hydrogen=zeros_b,
+        is_backbone=zeros_b,
+        is_heavy=zeros_b,
+        protein_atom_mask=zeros_b,
+        water_atom_mask=zeros_b,
+        bonds=empty,
+        bond_params=empty_p,
+        bond_mask=empty_m,
+        angles=empty_ang,
+        angle_params=empty_p,
+        angle_mask=empty_m,
+        dihedrals=dihs,
+        dihedral_params=dih_p,
+        dihedral_mask=jnp.ones(2, dtype=bool),
+        impropers=jnp.zeros((0, 4), dtype=jnp.int32),
+        improper_params=jnp.zeros((0, 1, 3)),
+        improper_mask=jnp.zeros(0, dtype=bool),
+    )
+    bundle = make_bundle_from_system(sys, boundary_condition="free")
+    assert int(bundle.n_dihedrals) == 4
+    assert bundle.dihedral_params.shape[1] == 3
+    assert int(bundle.dihedral_mask.sum()) == 4
+
+
+def test_factory_bond_idx_is_int32_regardless_of_input_dtype():
+    """``bond_idx`` must be int32 even when the source topology arrives non-int32.
+
+    Regression for a real bug found via ``tests/physics/test_flash_dense_parity.py``
+    (debt 761): ``system.py``'s ``_pad_2d(arr, bucket, cols, dtype=jnp.int32)``
+    only applied ``dtype`` on the empty/None fallback branch -- the real-data
+    branch (``jnp.pad``, which preserves the input's own dtype) silently
+    ignored the caller's explicit ``dtype=jnp.int32`` request. Harmless for
+    plain array indexing (which tolerates/truncates), but fatal for any
+    dtype-based static/dynamic or differentiable/non-differentiable
+    partitioning downstream (``eqx.filter_grad``, used by
+    ``flash_explicit.py::flash_explicit_forces``, treats a float-typed index
+    array as differentiable, producing a tracer where concrete-array-only
+    code -- ``topology.find_bonded_exclusions`` -- expects a real value).
+
+    This was previously invisible because every existing fixture in this
+    file uses *empty* bonds (the only branch that did apply ``dtype``
+    correctly) -- this test is the first to exercise real, non-empty,
+    non-int32-dtyped topology through ``make_bundle_from_system``.
+    """
+    from prolix.typing import PhysicsSystem
+
+    n = 4
+    pos = jnp.zeros((n, 3))
+    ones_f = jnp.zeros(n)
+    ones_b = jnp.ones(n, dtype=bool)
+    zeros_b = jnp.zeros(n, dtype=bool)
+    elem = jnp.ones(n, dtype=jnp.int32)
+
+    # Deliberately float-dtyped bond indices -- upstream data (e.g. a merged
+    # topology under jax_enable_x64) can arrive this way; the factory must
+    # still normalize to int32, not just trust the input.
+    bonds = jnp.array([[0, 1], [1, 2], [2, 3]], dtype=jnp.float32)
+    bond_params = jnp.zeros((3, 2))
+    bond_mask = jnp.ones(3, dtype=bool)
+
+    empty_ang = jnp.zeros((0, 3), dtype=jnp.int32)
+    empty_p = jnp.zeros((0, 2))
+    empty_m = jnp.zeros(0, dtype=bool)
+
+    sys = PhysicsSystem(
+        positions=pos,
+        charges=ones_f,
+        sigmas=ones_f,
+        epsilons=ones_f,
+        radii=ones_f,
+        scaled_radii=ones_f,
+        masses=ones_f,
+        element_ids=elem,
+        atom_mask=ones_b,
+        is_hydrogen=zeros_b,
+        is_backbone=zeros_b,
+        is_heavy=zeros_b,
+        protein_atom_mask=zeros_b,
+        water_atom_mask=zeros_b,
+        bonds=bonds,
+        bond_params=bond_params,
+        bond_mask=bond_mask,
+        angles=empty_ang,
+        angle_params=empty_p,
+        angle_mask=empty_m,
+        dihedrals=jnp.zeros((0, 4), dtype=jnp.int32),
+        dihedral_params=jnp.zeros((0, 1, 3)),
+        dihedral_mask=jnp.zeros(0, dtype=bool),
+        impropers=jnp.zeros((0, 4), dtype=jnp.int32),
+        improper_params=jnp.zeros((0, 1, 3)),
+        improper_mask=jnp.zeros(0, dtype=bool),
+    )
+    bundle = make_bundle_from_system(sys, boundary_condition="free")
+    assert bundle.bond_idx.dtype == jnp.int32, (
+        f"bond_idx must be int32 regardless of input dtype, got {bundle.bond_idx.dtype}"
+    )
+    assert jnp.array_equal(bundle.bond_idx[:3], jnp.array([[0, 1], [1, 2], [2, 3]]))
+
+
+def test_dense_excl_to_pair_list_deduplicates():
+    """Dense (N, M) excl layout converts to unique (E, 2) pairs."""
+    excl = np.array([[1, -1], [0, -1]], dtype=np.int32)
+    vdw = np.array([[0.0, 1.0], [0.5, 1.0]], dtype=np.float32)
+    elec = np.ones_like(vdw)
+    pairs, sv, se, n = _dense_excl_to_pair_list(excl, vdw, elec)
+    assert n == 1
+    assert pairs is not None
+    assert pairs.shape == (1, 2)
+    assert list(pairs[0]) == [0, 1]
+    assert float(sv[0]) == 0.0
+    assert float(se[0]) == 1.0
+
+
+def test_target_bucket_counts_pads_bond_bucket_higher():
+    """debt 756: an explicit target should force a bigger bucket than the
+    real (here: zero) bond count would naturally select."""
+    sys = _make_minimal_physics_system()
+    bundle = make_bundle_from_system(
+        sys, boundary_condition="free", target_bucket_counts={"bond": 256}
+    )
+    assert bundle.bond_idx.shape[0] == 256
+    from prolix.types.bundles import BOND_BUCKETS
+    assert bundle.shape_spec.bond_bucket_idx == BOND_BUCKETS.index(256)
+
+
+def test_target_bucket_counts_two_systems_can_be_forced_to_match():
+    """The actual debt-756 use case: two systems with different real bond
+    counts land in the SAME bucket (and therefore the same shape_spec) when
+    both are given the same explicit target."""
+    sys_a = _make_minimal_physics_system()  # 0 real bonds
+    sys_b = _make_minimal_physics_system()  # also 0 real bonds in this fixture;
+    # the assertion below is what matters -- both forced to the same target
+    # produce identical bond_bucket_idx regardless of their real counts.
+    bundle_a = make_bundle_from_system(
+        sys_a, boundary_condition="free", target_bucket_counts={"bond": 1024}
+    )
+    bundle_b = make_bundle_from_system(
+        sys_b, boundary_condition="free", target_bucket_counts={"bond": 1024}
+    )
+    assert bundle_a.shape_spec.bond_bucket_idx == bundle_b.shape_spec.bond_bucket_idx
+
+
+def test_target_bucket_counts_rejects_target_below_real_count():
+    """Overflow safety: an explicit target smaller than the real count must
+    raise, not silently truncate real topology data (mirrors the safety
+    check already proven in the deprecated padding.pad_array/pad_protein)."""
+    sys = _make_minimal_physics_system()
+    # This fixture has 10 real atoms; a target below that must raise.
+    with pytest.raises(ValueError, match="atom"):
+        make_bundle_from_system(
+            sys, boundary_condition="free", target_bucket_counts={"atom": 5}
+        )
+
+
+def test_target_bucket_counts_none_is_backward_compatible():
+    """Omitting target_bucket_counts (or passing None) must reproduce
+    exactly the pre-existing behavior -- this is the regression guard."""
+    sys = _make_minimal_physics_system()
+    bundle_default = make_bundle_from_system(sys, boundary_condition="free")
+    bundle_explicit_none = make_bundle_from_system(
+        sys, boundary_condition="free", target_bucket_counts=None
+    )
+    assert bundle_default.shape_spec == bundle_explicit_none.shape_spec
+    assert bundle_default.bond_idx.shape == bundle_explicit_none.bond_idx.shape
+
+
+def test_target_bucket_counts_rejects_unknown_key():
+    """debt 756 hardening (final review finding): a typo'd axis name must
+    raise, not silently no-op back to natural bucket selection."""
+    sys = _make_minimal_physics_system()
+    with pytest.raises(ValueError, match="unknown key"):
+        make_bundle_from_system(
+            sys, boundary_condition="free", target_bucket_counts={"bonds": 1024}
+        )
+
+
+def test_target_bucket_counts_rejects_overflow_with_clear_message():
+    """debt 756 hardening (final review finding): a target exceeding the
+    largest configured bucket must raise a message naming the axis, not
+    silently clamp then crash later in an unrelated assert."""
+    sys = _make_minimal_physics_system()
+    with pytest.raises(ValueError, match="atom"):
+        make_bundle_from_system(
+            sys, boundary_condition="free", target_bucket_counts={"atom": 100_000}
+        )
+
+
+def test_target_bucket_counts_atom_axis_composes_with_new_2048_bucket():
+    """debt 756 + debt 773 composition: target_bucket_counts on the atom
+    axis correctly resolves against the new 2048 rung Task 0 added, not
+    just the pre-existing bucket boundaries."""
+    from prolix.types.bundles import ATOM_BUCKETS
+
+    sys = _make_minimal_physics_system()  # 10 real atoms
+    bundle = make_bundle_from_system(
+        sys, boundary_condition="free", target_bucket_counts={"atom": 2048}
+    )
+    assert bundle.positions.shape[0] == 2048
+    assert bundle.shape_spec.atom_bucket_idx == ATOM_BUCKETS.index(2048)
+    assert int(bundle.n_atoms) == 10
+    assert int(bundle.atom_mask.sum()) == 10

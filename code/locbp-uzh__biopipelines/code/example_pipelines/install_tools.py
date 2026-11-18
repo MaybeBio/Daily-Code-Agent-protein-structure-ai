@@ -1,0 +1,55 @@
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+# tested: 
+
+
+"""
+Installation pipeline for BioPipelines tools.
+
+Each tool.install() call adds an installation step to the pipeline.
+When submitted, each step runs the tool's installation script (git clone,
+environment creation, model downloads, etc.) as a SLURM job.
+
+Uncomment/comment tools as needed for your setup.
+"""
+
+from biopipelines.pipeline import *
+from biopipelines import (
+    RFdiffusion,
+    RFdiffusionAllAtom,
+    RFdiffusion3,
+    ProteinMPNN,
+    LigandMPNN,
+    AlphaFold,
+    Boltz2,
+    BoltzGen,
+    BioEmu2,
+    MutationProfiler,
+    PyMOL,
+    Gnina,
+    PoseBusters,
+)
+
+with Pipeline(project="Setup", job="InstallTools"):
+    Resources(time="8:00:00", memory="32GB")
+    # Structure generation
+    RFdiffusion.install()         # Creates SE3nv, clones repo, downloads weights
+    RFdiffusionAllAtom.install()  # Clones repo (uses SE3nv from RFdiffusion)
+    RFdiffusion3.install()        # Creates foundry env, downloads checkpoints
+    BoltzGen.install()            # Creates boltzgen env
+    # Sequence design
+    ProteinMPNN.install()         # Clones repo (uses SE3nv from RFdiffusion)
+    LigandMPNN.install()          # Creates ligandmpnn_env, clones repo
+    # Structure prediction & equilibrium ensembles
+    AlphaFold.install()           # LocalColabFold installation
+    Boltz2.install()              # Creates Boltz2Env
+    BioEmu2.install()             # Creates the bioemu2 env (Python 3.12, bioemu2[cuda]), fetches the checkpoint
+    # Visualization & Analysis
+    PyMOL.install()               # Creates ProteinEnv (PyMOL, pandas, biopython, rdkit)
+    MutationProfiler.install()    # Creates MutationEnv
+    Gnina.install()               # Downloads weights
+    PoseBusters.install()         # CLones repository, creates environment
+
+    

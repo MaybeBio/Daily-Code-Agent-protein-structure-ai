@@ -1,0 +1,1698 @@
+/**
+ * The page.
+ *
+ * 🔴 IT RUNS THE GPU ENGINE, AND IT SAYS WHICH ENGINE RAN. For several
+ * iterations this page ran the host reference while a validated GPU engine sat
+ * beside it unreachable, which is the one genuinely misleading state this
+ * repository could be in. The engine selector exists so the host path is still
+ * available for comparison, and every log line names the path it took.
+ */
+import { parsePrmtop } from "../shared/amber/prmtop.js";
+import { moleculesOf } from "../shared/traj/imaging.js";
+import { parseInpcrd } from "../shared/amber/inpcrd.js";
+import { buildSystem } from "../shared/topology/system.js";
+import { DcdWriter } from "../shared/traj/dcd.js";
+import { writeRestart } from "../shared/traj/rst7.js";
+import { firstNonFinite } from "../shared/finite.js";
+import { requestMdDevice } from "../webgpu/runtime/device.js";
+import { yieldToBrowser, StopSignal } from "../webgpu/runtime/yield.js";
+import { GpuSimulation } from "../webgpu/simulation.js";
+import { potentialEnergy } from "../cpu/energy.js";
+import { createState, minimise } from "../cpu/simulation.js";
+import {
+  langevinStep, langevinFinishStep, instantaneousTemperature,
+} from "../cpu/integrate/langevin.js";
+import { Panel, PanelStack } from "./plot.js";
+import { MolstarViewer } from "./molstar-viewer.js";
+import { buildSelections, VIEW_PRESETS, BODY_COLOURS } from "../shared/analysis/selection.js";
+import { soluteHeavyAtoms } from "../shared/topology/restraints.js";
+import { LiveAnalysis } from "../shared/analysis/metrics.js";
+import { writePdb } from "../shared/traj/pdb.js";
+import { shareRun, logmdBundle, logmdRunId } from "../shared/traj/logmd.js";
+
+const element = (id) => document.getElementById(id);
+const logBox = element("log");
+let gpu = null;
+let loaded = null;
+let hostState = null;
+let stopSignal = null;
+/**
+ * One trajectory per stage and per stride, as the notebooks write them.
+ *
+ * 🔴 THIS WAS A SINGLE VARIABLE AND STRIDES SILENTLY OVERWROTE IT. Each call to
+ * `runOnDevice` built its own `DcdWriter` and finished it into one `trajectory`,
+ * so a three-stride production left only stride three, and production erased
+ * equilibration before that. The `appendTrajectory` flag the stride loop passed
+ * was never read by anything. Nothing reported the loss: the download worked,
+ * the file was valid, and it held a third of the run.
+ *
+ * The notebooks write `jobname_1.dcd`, `jobname_2.dcd`, … one per stride, and
+ * the stride loop exists so a session that dies can resume from the last
+ * restart. Keeping them separate and numbered is both faithful and the thing
+ * that cannot lose a frame.
+ */
+let trajectories = [];
+let finalState = null;
+let plot = null;
+let viewer = null;
+let selections = null;
+let analysis = null;
+let paused = false;
+let resumeGate = null;
+let lastPositions = null;
+let selectionSystem = null;
+/**
+ * Frames kept for the share, as PDB text.
+ *
+ * 🔴 CAPPED, AND THE CAP IS THE POINT. A 500 ns production at 10 ps writes
+ * 50,000 frames; a solute-only PDB is tens of kilobytes, so keeping them all
+ * would be gigabytes of strings in a tab that also has a simulation in it. The
+ * share is for showing somebody a run, not for archiving it - the `.dcd` is the
+ * archive - so this keeps the most recent `SHARE_FRAME_CAP` and says so.
+ */
+let shareFrames = [];
+const SHARE_FRAME_CAP = 200;
+let binderOverride = null;
+/** ms/step measured on THIS system, or null until someone measures it. */
+let measuredMsPerStep = null;
+/** Which stages have run, so a later stage cannot start before an earlier one. */
+const stagesDone = { minimise: false, equilibrate: false };
+
+function log(line = "") {
+  logBox.textContent += `${line}\n`;
+  logBox.scrollTop = logBox.scrollHeight;
+}
+
+function describe(list, rows) {
+  list.innerHTML = "";
+  for (const [term, definition] of rows) {
+    // 🔴 EACH PAIR IN ITS OWN BOX. A flat `dt, dd, dt, dd` list can only be a
+    // two-column grid, so ten pairs are ten rows tall; wrapping each pair makes
+    // the report flow into as many columns as the card is wide.
+    const pair = document.createElement("div");
+    const dt = document.createElement("dt");
+    dt.textContent = term;
+    const dd = document.createElement("dd");
+    dd.textContent = definition;
+    pair.append(dt, dd);
+    list.append(pair);
+  }
+  list.hidden = false;
+}
+
+function showLive(rows) {
+  const container = element("live");
+  container.innerHTML = "";
+  for (const [label, value] of rows) {
+    // 🔴 dt/dd, NOT span.label/span.value. The metrics strip is styled as the
+    // reference's pLDDT / pTM / ipTM row - a small grey caption over a bold
+    // tabular number - and that styling keys off the definition-list elements.
+    const cell = document.createElement("div");
+    const name = document.createElement("dt");
+    name.textContent = label;
+    const text = document.createElement("dd");
+    text.textContent = value;
+    cell.append(name, text);
+    container.append(cell);
+  }
+}
+
+function download(name, data, type) {
+  const blob = new Blob([data], { type });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = name;
+  anchor.click();
+  // 🔴 REVOKED ON A TIMER, NOT IMMEDIATELY. Revoking in the same task cancels
+  // the download in Safari before it has read the blob.
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+// ---------------------------------------------------------------- device ----
+(async () => {
+  const report = element("device-report");
+  try {
+    gpu = await requestMdDevice(navigator.gpu);
+    const rows = [
+      ["WebGPU", "available"],
+      ["adapter", gpu.report.description
+        || `${gpu.report.vendor ?? "?"} / ${gpu.report.architecture ?? "?"}`],
+      ["max storage binding",
+        `${(gpu.report.limits.maxStorageBufferBindingSize / 2 ** 20).toFixed(0)} MiB`],
+      ["invocations / workgroup", String(gpu.report.limits.maxComputeInvocationsPerWorkgroup)],
+    ];
+    if (gpu.report.adapterOfferedF16 !== gpu.report.deviceHasF16) {
+      rows.push(["shader-f16", "the adapter offers it and a default device does not "
+        + "— requested explicitly here"]);
+    }
+    describe(report, rows);
+  } catch (error) {
+    describe(report, [["WebGPU", "unavailable"], ["reason", error.message]]);
+    element("engine").value = "host";
+    log(`WebGPU unavailable, falling back to the host reference: ${error.message}`);
+  }
+})();
+
+// ------------------------------------------------------------------ load ----
+const dropZone = element("drop-zone");
+for (const name of ["dragenter", "dragover"]) {
+  dropZone.addEventListener(name, (event) => {
+    event.preventDefault();
+    dropZone.classList.add("over");
+  });
+}
+for (const name of ["dragleave", "drop"]) {
+  dropZone.addEventListener(name, () => dropZone.classList.remove("over"));
+}
+dropZone.addEventListener("drop", (event) => {
+  event.preventDefault();
+  void loadFiles([...event.dataTransfer.files]);
+});
+element("file-input").addEventListener("change", (event) => {
+  void loadFiles([...event.target.files]);
+});
+
+/**
+ * Load one of the bundled fixtures, so the page is usable by someone who has
+ * never run tleap.
+ *
+ * 🔴 RELATIVE URLs, NOT ABSOLUTE. GitHub Pages serves a project site from
+ * `/<repo>/`, so a leading slash resolves to the account root and every fetch
+ * 404s - the page would work on the dev server and be broken everywhere it is
+ * actually published. The test harness uses absolute paths because it drives a
+ * server rooted at the repository; the page cannot assume that.
+ *
+ * 🔴 AND IT GOES THROUGH `loadFiles`, THE SAME PATH A DROPPED FILE TAKES. An
+ * example that bypassed the loader would not exercise the format detection, the
+ * warnings or the error reporting - which is most of what could be wrong with
+ * a file a visitor supplies.
+ */
+element("load-example").addEventListener("click", async () => {
+  const button = element("load-example");
+  const name = element("example").value;
+  const errorBox = element("load-error");
+  button.disabled = true;
+  try {
+    const [topology, coordinates] = await Promise.all([
+      fetch(`test/fixtures/${name}.prmtop`).then((response) => {
+        if (!response.ok) throw new Error(`${name}.prmtop: HTTP ${response.status}`);
+        return response.text();
+      }),
+      fetch(`test/fixtures/${name}.inpcrd`).then((response) => {
+        if (!response.ok) throw new Error(`${name}.inpcrd: HTTP ${response.status}`);
+        return response.text();
+      }),
+    ]);
+    await loadFiles([
+      new File([topology], `${name}.prmtop`),
+      new File([coordinates], `${name}.inpcrd`),
+    ]);
+  } catch (error) {
+    errorBox.textContent = `could not load the example: ${error.message}`;
+    errorBox.hidden = false;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+async function loadFiles(files) {
+  const errorBox = element("load-error");
+  errorBox.hidden = true;
+  try {
+    const topologyFile = files.find((file) => /\.(prmtop|parm7|top)$/i.test(file.name));
+    const coordinateFile = files.find((file) => /\.(crd|inpcrd|rst7|rst)$/i.test(file.name));
+    if (topologyFile === undefined || coordinateFile === undefined) {
+      throw new Error(
+        "two files are needed: a topology (.prmtop or .parm7) and coordinates "
+        + "(.crd, .inpcrd or .rst7) from the same tleap run.",
+      );
+    }
+    const topology = parsePrmtop(await topologyFile.text());
+    const coordinates = parseInpcrd(await coordinateFile.text(),
+      { expectedAtomCount: topology.atomCount });
+    loaded = { topology, coordinates, name: topologyFile.name.replace(/\.[^.]+$/, "") };
+    // 🔴 SELECTIONS ARE BUILT ONCE, FROM THE TOPOLOGY, and everything else
+    // reads them: the viewer's visibility, the analysis's fit set, the RMSF's
+    // residue list and the receptor/binder split. Recomputing them per frame
+    // would be the obvious place for the viewer and the metrics to drift apart.
+    selectionSystem = buildSystem(topology, {
+      constraints: "HBonds", rigidWater: true,
+      cutoff: coordinates.box === null ? 0 : 1.0, box: coordinates.box,
+    });
+    binderOverride = null;
+    selections = buildSelections(selectionSystem);
+    analysis = null;
+    hostState = null;
+    trajectories = [];
+    finalState = null;
+    element("download-dcd").disabled = true;
+    element("download-state").disabled = true;
+
+    let chargeSum = 0;
+    for (const charge of topology.charges) chargeSum += charge;
+    const box = coordinates.box;
+    describe(element("system-report"), [
+      ["files", `${topologyFile.name} + ${coordinateFile.name}`],
+      ["atoms", topology.atomCount.toLocaleString()],
+      ["residues", `${topology.residueNames.length.toLocaleString()} in `
+        + `${topology.moleculeCount.toLocaleString()} molecules`],
+      ["bonds / angles / torsions",
+        `${topology.bonds.count} / ${topology.angles.count} / ${topology.dihedrals.count}`],
+      ["net charge", `${chargeSum.toFixed(4)} e`],
+      ["box", box === null ? "none (non-periodic)"
+        : `${box.lengths.map((v) => v.toFixed(3)).join(" × ")} nm, angles `
+          + `${box.angles.map((v) => v.toFixed(1)).join("/")}°`],
+      ["velocities in file", coordinates.velocities === null ? "no" : "yes"],
+      ["solute / water / ions",
+        `${selections.counts.solute} / ${selections.counts.water} / ${selections.counts.ion}`],
+      ["protein / ligand", `${selections.counts.protein} / ${selections.counts.ligand}`],
+      ["receptor / binder", selections.binder.length === 0
+        ? `${selections.receptor.length} (single body — no binder split)`
+        : `${selections.receptor.length} / ${selections.binder.length} `
+          + `(${selections.soluteMoleculeCount} solute molecules)`],
+    ]);
+    // Collapse the intro: see the `.pre-load-only` rules.
+    document.body.classList.add("loaded");
+    populateBinders();
+    populatePresets();
+    element("representation").value = defaultRepresentation();
+    // 🔴 DRAW ON LOAD, NOT ON RUN. The viewer used to be created by
+    // `attachViewer` inside Minimise and Run, so dropping a topology showed a
+    // black rectangle until the user started something - and a reader with a
+    // file they are unsure about has no way to check they loaded the right
+    // thing. JIGGLE shows the structure the moment it has one. This draws the
+    // file's own coordinates from its own buffer; the run then rebinds the
+    // viewer to the simulation's.
+    showLoadedStructure();
+    element("run-panel").hidden = false;
+    for (const id of ["download-dcd", "download-state", "download-pdb",
+      "download-metrics", "download-rmsf"]) element(id).disabled = true;
+    element("method").value = box === null ? "NoCutoff" : "PME";
+    logBox.textContent = "";
+    log(`loaded ${topology.atomCount} atoms from ${topologyFile.name}`);
+    for (const warning of topology.warnings) log(`note: ${warning}`);
+    for (const note of coordinates.ambiguous) log(`note: ${note}`);
+  } catch (error) {
+    errorBox.textContent = error.message;
+    errorBox.hidden = false;
+    loaded = null;
+    element("run-panel").hidden = true;
+  }
+}
+
+// ---------------------------------------------------------------- system ----
+function numberOf(id) { return Number(element(id).value); }
+
+/**
+ * The box the NEXT stage must use.
+ *
+ * 🔴 NOT THE COORDINATE FILE'S, ONCE A BAROSTAT HAS RUN. Every box reference on
+ * this page used to read `loaded.coordinates.box`, which is what tleap's
+ * `solvateBox` guessed - so production rebuilt the system in the ORIGINAL
+ * volume and discarded the density the NPT equilibration had just established.
+ * On the test fixture that is 0.587 g/cm^3 against the 0.98 water wants: the
+ * equilibration worked, reported the right density, and then production threw
+ * it away. Reported by a reader, not by a gate.
+ */
+/**
+ * Lengths and angles from box vectors, for a writer that wants the other form.
+ *
+ * 🔴 THE RESTART FILE CARRIES LENGTHS AND ANGLES, NOT VECTORS, so an NPT box
+ * has to be converted back or the .rst7 reports the volume the run STARTED in.
+ * The vectors are reduced upper triangular, which makes this the standard
+ * inverse: |a|, |b|, |c| and the three angles between them.
+ */
+function boxFromVectors(vectors) {
+  if (vectors === null || vectors === undefined || vectors.length < 9) return null;
+  const a = [vectors[0], vectors[1], vectors[2]];
+  const b = [vectors[3], vectors[4], vectors[5]];
+  const c = [vectors[6], vectors[7], vectors[8]];
+  const norm = (v) => Math.hypot(v[0], v[1], v[2]);
+  const dot = (u, v) => u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+  const degrees = (value) => (Math.acos(Math.max(-1, Math.min(1, value))) * 180) / Math.PI;
+  const la = norm(a);
+  const lb = norm(b);
+  const lc = norm(c);
+  return {
+    lengths: [la, lb, lc],
+    angles: [degrees(dot(b, c) / (lb * lc)),
+      degrees(dot(a, c) / (la * lc)),
+      degrees(dot(a, b) / (la * lb))],
+  };
+}
+
+function currentBoxVectors() {
+  return hostState?.boxVectors ?? null;
+}
+
+/** The current box in lengths-and-angles form, for anything that writes one. */
+function currentBox() {
+  return boxFromVectors(currentBoxVectors()) ?? loaded?.coordinates.box ?? null;
+}
+
+function assembleSystem() {
+  const method = element("method").value;
+  const system = buildSystem(loaded.topology, {
+    constraints: element("constraints").value,
+    rigidWater: true,
+    cutoff: method === "NoCutoff" ? 0 : numberOf("cutoff"),
+    box: loaded.coordinates.box,
+    boxVectors: currentBoxVectors(),
+  });
+  return { system, method };
+}
+
+function runOptions(method) {
+  const pressureText = element("pressure").value.trim();
+  return {
+    method,
+    timestep: numberOf("timestep") / 1000,
+    temperature: numberOf("temperature"),
+    friction: numberOf("friction"),
+    // Blank means NVT. An explicit 0 bar is a legitimate (if unusual) request,
+    // so emptiness rather than falsiness is what switches the barostat off.
+    pressure: pressureText === "" ? null : Number(pressureText),
+    seed: 20261106,
+    tolerance: 1e-5,
+  };
+}
+
+/**
+ * Push one frame to the viewer, for the live animation.
+ *
+ * 🔴 NOT IMAGED, DELIBERATELY, WHERE A WRITTEN FRAME IS. Wrapping on the
+ * molecule centroid is right for a file - it is what every analysis tool
+ * expects - and wrong for an animation, because a molecule that crosses a face
+ * jumps a whole box width in one frame. What you want to watch is continuous
+ * motion; what you want to analyse afterwards is wrapped. They are different
+ * requirements and this is the one place they diverge.
+ *
+ * 🔴 AND THE ATOM ORDER IS THE VIEWER'S, NOT THE SYSTEM'S. The viewer holds only
+ * the atoms the current preset shows, in the order `writePdb` emitted them, so
+ * the frame has to be built over the same index list. `setFrame` asserts the
+ * count, which is what turns a mismatch into an error instead of a plausible
+ * structure built from the wrong atoms.
+ */
+function animateFrame() {
+  if (viewer === null || loaded === null) return;
+  // 🔴 A PDB, NOT A FLAT ARRAY. 3Dmol took three writes per atom into a mutable
+  // `model.atoms`; Mol* holds coordinates in an immutable state tree, so a
+  // frame update is a reload and the currency is the same PDB a checkpoint
+  // uses. One formatter for both paths, and no second code path to keep in step
+  // with `visibleIndices`.
+  //
+  // 🔴 AND IT IS NOT AWAITED. The reload is a promise, and awaiting it inside
+  // the reporting loop would put the renderer on the integrator's critical
+  // path - a slow frame would slow the simulation rather than just dropping a
+  // frame.
+  void viewer.setFrame(viewerPdb(currentPreset()))
+    .catch((error) => log(`  viewer: ${error.message}`));
+}
+
+/**
+ * Draw the structure at a named moment, rather than every reporting frame.
+ *
+ * 🔴 THREE MOMENTS ARE WORTH A PICTURE AND A LIVE ANIMATION IS NOT ONE OF THEM:
+ * the system as loaded, the structure after minimisation, and the last frame
+ * when the run finishes. Drawing every report cost a full position readback, a
+ * styles rebuild and - in the cartoon modes - a whole ribbon rebuild, per
+ * frame, for an animation nobody watches through a multi-hour production run.
+ * The trajectory is still written, so the motion is not lost; it is just looked
+ * at afterwards, in this viewer or in VMD.
+ *
+ * Measured on the two-body fixture: 4000 steps went from 2.69 to 2.09 ms/step
+ * with the per-frame draw removed, which is 22% of the run.
+ */
+function showCheckpoint(what) {
+  if (loaded === null || viewer === null) return;
+  const positions = lastPositions ?? hostState?.positions
+    ?? loaded.coordinates.positions;
+  applyView(viewer, { topology: loaded.topology }, positions);
+  if (what !== undefined) log(`  viewer: showing the structure ${what}`);
+}
+
+/** Draw the coordinates as loaded, before anything has been run. */
+function showLoadedStructure() {
+  const view = ensureViewer();
+  if (view === null || loaded === null) return;
+  applyView(view, { topology: loaded.topology }, loaded.coordinates.positions);
+  // 🔴 ITS OWN BUFFER, UPLOADED FROM THE HOST. There is no simulation yet, so
+  // there is no device buffer to copy from - `setStructure` has already sized
+  // the viewer's own positions buffer, and this fills it.
+  // `setStructure` parses, styles and zooms; there is nothing further to push.
+}
+
+function ensureViewer() {
+  if (viewer === null) {
+    try {
+      viewer = new MolstarViewer(element("viewer"));
+    } catch (error) {
+      log(`viewer: ${error.message}`);
+      return null;
+    }
+  }
+  return viewer;
+}
+
+/**
+ * The atoms the current preset shows, as a PDB for the viewer.
+ *
+ * 🔴 A PDB PER CHECKPOINT, NOT PER FRAME. Three strings over a whole run, so
+ * the cost of building one is irrelevant - which is the trade that made a
+ * library viewer the right answer here. `writePdb` images the frame and gives
+ * each molecule its own chain letter, both of which the cartoon needs.
+ */
+function viewerPdb(preset) {
+  const indices = visibleIndices(preset);
+  const positions = lastPositions ?? hostState?.positions
+    ?? loaded.coordinates.positions;
+  // 🔴 NOT IMAGED, FOR THE VIEWER. Wrapping on the molecule centroid is right
+  // for a file and wrong for anything animated: a molecule crossing a face
+  // jumps a whole box width between frames. `image: false` keeps the drawing
+  // continuous; the DCD and the PDB download still wrap.
+  return writePdb({ topology: loaded.topology,
+    boxVectors: selectionSystem?.boxVectors ?? null },
+    positions, { indices, box: currentBox(), image: false });
+}
+
+/**
+ * Six panels, following JIGGLE's set: RMSD (split four ways), radius of
+ * gyration, potential energy, per-residue RMSF, interface distance, and
+ * temperature.
+ */
+function ensurePlot() {
+  if (plot !== null) return plot;
+  plot = new PanelStack([
+    new Panel(element("plot-rmsd"), {
+      title: "RMSD", unit: "nm",
+      series: [
+        // 🔴 THE SAME PALETTE THE VIEWER USES, so a reader can map a trace onto
+        // a molecule. "binder on receptor" is the exception and is deliberately
+        // a warning red: it is not a body, it is the pose-stability number.
+        { key: "rmsd", label: "complex", colour: BODY_COLOURS.complex.line },
+        { key: "rmsdReceptor", label: "receptor", colour: BODY_COLOURS.receptor.line },
+        { key: "rmsdBinder", label: "binder", colour: BODY_COLOURS.binder.line },
+        { key: "rmsdBinderOnReceptor", label: "binder on receptor", colour: "#b3443a" },
+      ],
+    }),
+    new Panel(element("plot-rg"), {
+      title: "Radius of gyration", unit: "nm",
+      series: [{ key: "radiusOfGyration", label: "Rg", colour: "#3f7f4f" }],
+    }),
+    new Panel(element("plot-energy"), {
+      title: "Potential energy", unit: "kJ/mol",
+      series: [{ key: "potential", label: "potential", colour: "#7a4fa3" }],
+    }),
+    new Panel(element("plot-rmsf"), {
+      title: "Per-residue RMSF", unit: "nm", kind: "bar",
+      series: [{ key: "rmsf", label: "RMSF", colour: BODY_COLOURS.receptor.line }],
+      labels: selections?.residueLabels ?? null,
+    }),
+    new Panel(element("plot-iface"), {
+      title: "Interface distance", unit: "nm",
+      series: [{ key: "interfaceDistance", label: "centroid separation", colour: "#c07a3a" }],
+    }),
+    new Panel(element("plot-temperature"), {
+      title: "Temperature", unit: "K",
+      series: [{ key: "temperature", label: "T", colour: "#b3443a" }],
+    }),
+  ]);
+  return plot;
+}
+
+/**
+ * Offer the molecule list in place of the chain letters a prmtop does not have.
+ *
+ * 🔴 THE DERIVED SPLIT IS RIGHT FOR A PROTEIN AND A LIGAND AND WRONG FOR A
+ * DIMERIC RECEPTOR, and until now there was no way to say so. "Largest solute
+ * molecule is the receptor" reports one chain of a two-chain receptor as the
+ * binder, so `binder on receptor` measures the two halves of the receptor
+ * moving relative to each other and reads like a pose coming apart. The row is
+ * hidden for a single-body system, because then there is nothing to choose.
+ */
+function populateBinders() {
+  const row = element("binder-row");
+  const select = element("binder");
+  const molecules = selections.soluteMolecules ?? [];
+  row.hidden = molecules.length < 2;
+  if (row.hidden) return;
+  select.innerHTML = "";
+  const auto = document.createElement("option");
+  auto.value = "auto";
+  auto.textContent = `auto — largest of ${molecules.length} is the receptor`;
+  select.append(auto);
+  for (const molecule of molecules) {
+    const option = document.createElement("option");
+    option.value = String(molecule.molecule);
+    option.textContent = `${molecule.label} (${molecule.atomCount} atoms)`;
+    select.append(option);
+  }
+  select.value = binderOverride === null ? "auto" : String(binderOverride);
+}
+
+/** Re-split the solute, then rebuild everything that reads the split. */
+function applyBinderChoice() {
+  if (loaded === null) return;
+  const value = element("binder").value;
+  binderOverride = value === "auto" ? null : Number(value);
+  selections = buildSelections(selectionSystem,
+    binderOverride === null ? {} : { binderMolecules: [binderOverride] });
+  populatePresets();
+  log(`split: receptor ${selections.receptor.length} atoms / binder `
+    + `${selections.binder.length}`
+    + (binderOverride === null ? " (derived from the molecule partition)"
+      : " (chosen)"));
+  if (viewer !== null) {
+    applyView(viewer, { topology: loaded.topology },
+      lastPositions ?? hostState?.positions ?? loaded.coordinates.positions);
+  }
+}
+
+function populatePresets() {
+  const select = element("view-preset");
+  select.innerHTML = "";
+  for (const preset of VIEW_PRESETS) {
+    const visible = preset.groups.reduce(
+      (total, name) => total + (selections.counts[name] ?? 0), 0);
+    if (visible === 0) continue;
+    const option = document.createElement("option");
+    option.value = preset.id;
+    option.textContent = `${preset.label} (${visible})`;
+    select.append(option);
+  }
+  select.value = selections.counts.ligand > 0 ? "protein-ligand" : "solute";
+}
+
+/**
+ * Pick the representation a reader would have picked.
+ *
+ * 🔴 THE CARTOON EXISTED AND NOBODY SAW IT, because "atoms" was the default and
+ * the control that changes it is a dropdown in a row of dropdowns. A renderer
+ * that has to be found is a renderer that is not there: the first report after
+ * it shipped was that the page still had no cartoon. So anything with a protein
+ * backbone opens as a ribbon, with the atoms alongside when there is a ligand
+ * to see - which is what a cartoon is FOR, looking at a fold - and a system
+ * with no backbone at all still opens as atoms, because a ribbon needs alpha
+ * carbons and a box of water has none.
+ */
+function defaultRepresentation() {
+  if (selections === null) return "spheres";
+  const backbone = selections.counts.alphaCarbon ?? 0;
+  if (backbone < 4) return "spheres";
+  return selections.counts.ligand > 0 ? "both" : "cartoon";
+}
+
+function currentPreset() {
+  return VIEW_PRESETS.find((preset) => preset.id === element("view-preset").value)
+    ?? VIEW_PRESETS[0];
+}
+
+const number = (value, digits, unit) => (value === null || value === undefined
+  || !Number.isFinite(value) ? "–" : `${value.toFixed(digits)}${unit}`);
+
+function report(row, extra = []) {
+  const tiles = [
+    ["step", row.step.toLocaleString()],
+    ["time", `${row.time.toFixed(3)} ps`],
+    ["potential", number(row.potential, 1, " kJ/mol")],
+    ["total energy", number(row.total, 1, " kJ/mol")],
+    ["temperature", number(row.temperature, 1, " K")],
+    ["RMSD", number(row.rmsd, 4, " nm")],
+    ["Rg", number(row.radiusOfGyration, 4, " nm")],
+  ];
+  if (row.rmsdBinderOnReceptor !== null && row.rmsdBinderOnReceptor !== undefined) {
+    tiles.push(["receptor RMSD", number(row.rmsdReceptor, 4, " nm")]);
+    tiles.push(["binder RMSD", number(row.rmsdBinder, 4, " nm")]);
+    // The pose-stability number, labelled so it is not mistaken for the others.
+    tiles.push(["binder on receptor", number(row.rmsdBinderOnReceptor, 4, " nm")]);
+    tiles.push(["interface", number(row.interfaceDistance, 4, " nm")]);
+  }
+  showLive([...tiles, ...extra]);
+  const stack = ensurePlot();
+  // 🔴 HIDDEN UNTIL THERE IS SOMETHING IN THEM. Six empty black rectangles
+  // below the structure read as a viewer that failed, not as plots waiting for
+  // data - and they were on screen from the moment a file loaded.
+  element("panels").hidden = false;
+  // The solute only: a share of a solvated box is mostly water, and water is
+  // what nobody wants to look at.
+  if (loaded !== null && selections !== null) {
+    shareFrames.push({
+      pdb: viewerPdb(currentPreset()),
+      values: {
+        "potential / kJ/mol": Number(row.potential?.toFixed(1) ?? 0),
+        "temperature / K": Number(row.temperature?.toFixed(1) ?? 0),
+        "RMSD / nm": Number(row.rmsd?.toFixed(4) ?? 0),
+      },
+    });
+    if (shareFrames.length > SHARE_FRAME_CAP) shareFrames.shift();
+    element("share-logmd").disabled = false;
+  }
+  stack.push(row);
+  if (analysis !== null) stack.setBars("rmsf", analysis.rmsf.values());
+  stack.draw();
+}
+
+// ------------------------------------------------------- GPU kernel check ----
+element("check-gpu").addEventListener("click", async () => {
+  if (gpu === null) { log("no WebGPU device on this machine"); return; }
+  const button = element("check-gpu");
+  button.disabled = true;
+  try {
+    log("");
+    log("running the kernel checks on your GPU (bundled test system, not your files)…");
+    // 🔴 THE SAME CHECK MODULES THE COMMAND LINE RUNS. They carry their own
+    // fixtures and their own tolerances, so what a reader sees here is the same
+    // statement `npm run test:gpu` makes - about their hardware rather than
+    // about this code.
+    for (const name of ["check-forces", "check-integrator"]) {
+      const module = await import(`../tools/gpu/${name}.mjs`);
+      const result = await module.main(gpu.device);
+      log(`  ${name}: ${result.failures === 0 ? "PASS" : `${result.failures} FAILURE(S)`}`);
+      if (name === "check-forces") {
+        for (const comparison of result.energy.comparisons) {
+          log(`    ${comparison.ok ? "ok  " : "FAIL"} ${comparison.label.padEnd(20)} `
+            + `relative ${comparison.relative.toExponential(2)}`);
+        }
+        log(`    ${result.force.ok ? "ok  " : "FAIL"} ${"per-atom forces".padEnd(20)} `
+          + `relative ${result.force.relative.toExponential(2)}`);
+      } else {
+        const conservative = result.results.conservative;
+        log(`    one step vs host: ${result.results.oneStep.worstPosition.toExponential(2)} nm`);
+        log(`    energy drift: ${conservative.energyDriftPerNsPerAtom.toFixed(3)} `
+          + `kJ/mol/ns/atom over ${conservative.steps} steps`);
+        log(`    ${conservative.millisecondsPerStep.toFixed(2)} ms/step on this GPU`);
+      }
+      await yieldToBrowser();
+    }
+  } catch (error) {
+    log(`error: ${error.stack ?? error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+// -------------------------------------------------------------- minimise ----
+element("minimise").addEventListener("click", async () => {
+  if (loaded === null) return;
+  const button = element("minimise");
+  button.disabled = true;
+  try {
+    const { system, method } = assembleSystem();
+    const options = runOptions(method);
+    const engine = element("engine").value;
+    log("");
+    if (engine === "gpu" && gpu !== null && method === "PME") {
+      const simulation = new GpuSimulation(gpu.device, system, {
+        ...options, rebuildInterval: Math.max(1, numberOf("rebuild")),
+      });
+      try {
+        simulation.setState(hostState?.positions ?? loaded.coordinates.positions,
+          new Float64Array(system.topology.atomCount * 3));
+        await simulation.initialise();
+        attachViewer(simulation, system);
+        log("minimising on the GPU (steepest descent, backtracking)…");
+        await yieldToBrowser();
+        const result = await simulation.minimise({
+          // The notebooks' own settings: steps from the dropdown, tolerance
+          // 10 kJ/mol/nm.
+          maxIterations: Math.max(1, Math.round(numberOf("min-steps"))),
+          forceTolerance: 10,
+        });
+        log(`  potential ${result.history[0].potential.toFixed(2)} → `
+          + `${result.potential.toFixed(2)} kJ/mol in ${result.iterations} iterations`);
+        log(`  max force ${result.history[0].maxForce.toFixed(0)} → `
+          + `${result.maxForce.toFixed(0)} kJ/mol/nm`);
+        if (result.stalled && !result.converged) {
+          log(`  stalled: f32 resolves the energy to about `
+            + `${result.energyResolution.toFixed(3)} kJ/mol, below which the line `
+            + `search cannot tell whether a step helped. The host engine (f64) `
+            + `minimises further.`);
+        }
+        const state = await simulation.readState();
+        // 🔴 NULL, NOT A ZERO ARRAY - SEE `startState`. A minimised state has
+        // no velocities; recording that as zeros made it a valid draw at 0 K.
+        // Velocities stay null - minimisation destroys them, see `startState`
+        // - but the box carries, so a second minimisation after an NPT stage
+        // does not revert the volume.
+        hostState = {
+          positions: Float64Array.from(state.positions),
+          velocities: null,
+          boxVectors: Float64Array.from(state.boxVectors),
+          step: 0,
+        };
+        lastPositions = hostState.positions;
+      } finally {
+        simulation.release();
+      }
+      return;
+    }
+    if (hostState === null) {
+      hostState = createState(system, loaded.coordinates.positions, {
+        ...options, velocities: loaded.coordinates.velocities,
+        temperature: loaded.coordinates.velocities === null ? options.temperature : undefined,
+      });
+    }
+    log("minimising on the host (steepest descent, f64)…");
+    await yieldToBrowser();
+    const result = minimise(system, hostState, {
+      ...options, maxIterations: 80, forceTolerance: 500,
+    });
+    log(`  energy ${result.history[0].energy.toFixed(2)} → ${result.energy.total.toFixed(2)} kJ/mol`);
+    log(`  max force ${result.history[0].maxForce.toFixed(0)} → ${result.maxForce.toFixed(0)} `
+      + `kJ/mol/nm in ${result.iterations} iterations`);
+    // The velocities in this state were drawn for the structure that went IN;
+    // what came out is a different structure, and the run temperature may have
+    // been changed since. Draw fresh at run time.
+    hostState.velocities = null;
+  } catch (error) {
+    log(`error: ${error.stack ?? error.message}`);
+  } finally {
+    button.disabled = false;
+    // 🔴 A STAGE UNLOCKS THE NEXT ONE, AS THE NOTEBOOKS' CELLS DO. Running
+    // production on an unminimised structure is the single easiest way to get
+    // a trajectory that looks fine and started from a clash, and nothing in
+    // the output would say so. The notebooks make it impossible by reading the
+    // previous cell's restart file; this makes it impossible by gating.
+    stagesDone.minimise = true;
+    element("equilibrate").disabled = false;
+    element("calibrate").disabled = false;
+    // Show what the minimiser produced, which is the second of the two moments
+    // worth looking at a structure.
+    showCheckpoint("after minimisation");
+    refreshEstimates();
+  }
+});
+
+/**
+ * Point the viewer at a simulation's position buffer.
+ *
+ * 🔴 THE BUFFER, NOT A COPY. The viewer binds the same GPUBuffer the
+ * integrator writes, so a redraw after a block of steps shows the current state
+ * with no readback at all - which is why `draw()` can be called every report
+ * without costing anything measurable.
+ */
+function attachViewer(simulation, system) {
+  // 🔴 NOTHING IS BOUND ANY MORE. This used to hand the viewer the
+  // simulation's own GPU position buffer so a redraw cost no readback; with the
+  // structure drawn at three checkpoints the readback is irrelevant and the
+  // viewer is a library that wants a PDB. Kept as a named call so the two
+  // places that start a stage still say "show me the system".
+  if (ensureViewer() === null) return;
+  showCheckpoint("as this stage starts");
+}
+
+function applyView(view, system, positions) {
+  const preset = currentPreset();
+  const colourBy = element("colour-by").value;
+  const representation = element("representation").value;
+  const indices = visibleIndices(preset);
+  const pdb = writePdb({ topology: system.topology,
+    boxVectors: selectionSystem?.boxVectors ?? null },
+    positions, { indices, box: currentBox(), image: false });
+  // Mol*'s build is asynchronous; nothing downstream needs the result, and a
+  // failure is logged rather than thrown so a checkpoint cannot abort a run.
+  void view.setStructure(pdb, { colourBy, representation }).then(() => {
+    if (view.parseWarning) log(`  viewer: ${view.parseWarning}`);
+  }).catch((error) => log(`  viewer: ${error.message}`));
+  const shown = indices === null ? system.topology.atomCount : indices.length;
+  element("view-counts").textContent =
+    `${shown.toLocaleString()} of ${system.topology.atomCount.toLocaleString()} atoms drawn`
+    + (preset.heavyOnly === true ? ", hydrogens hidden" : "")
+    ;
+}
+
+/**
+ * The state a run starts from.
+ *
+ * 🔴 ABSENT VELOCITIES ARE `null`, AND A ZERO ARRAY IS NOT THE SAME THING.
+ * Minimisation destroys velocities - it is a walk downhill in position with no
+ * dynamics - and the GPU minimiser recorded that as `new Float64Array(3N)`.
+ * That is a VALID Maxwell-Boltzmann draw at 0 K, so the run's presence test
+ * (`=== null`) accepted it and every trajectory after a minimisation started at
+ * ABSOLUTE ZERO: measured on the two-body fixture, frame 0 came back at 0.00 K
+ * with 0.00 kJ/mol of kinetic energy while the box was asked for 298 K.
+ * Langevin friction heats it back within about a picosecond, which is why
+ * nothing looked broken - but frame 0 is the reference every RMSD is measured
+ * from, so the early rise in every curve was partly the system warming up, and
+ * the temperature panel's axis ran from -24 K. The same shape as any `?? 0` on
+ * a missing value: an ABSENT thing collapsed onto a valid one.
+ *
+ * 🔴 AND ONE RESOLVER, BECAUSE THE TWO HALVES DISAGREED. The run read
+ * `hostState?.velocities ?? loaded.coordinates.velocities` for the array but
+ * `(hostState ?? loaded.coordinates).velocities === null` for the temperature,
+ * so a minimised state beside an inpcrd that carries velocities would have
+ * taken the FILE's pre-minimisation velocities while reporting that it drew
+ * fresh ones. Whichever state is current decides both, or neither is right.
+ */
+function startState(system, options) {
+  const current = hostState ?? loaded.coordinates;
+  const supplied = current.velocities ?? null;
+  const state = createState(system, hostState?.positions ?? loaded.coordinates.positions, {
+    ...options,
+    velocities: supplied,
+    temperature: supplied === null ? options.temperature : undefined,
+  });
+  log(supplied === null
+    ? `  velocities drawn at ${options.temperature} K and projected onto the `
+      + `constraint manifold`
+    : "  velocities carried over from the current state");
+  return state;
+}
+
+// --------------------------------------------------------------- dynamics ----
+element("stop").addEventListener("click", () => {
+  // Release a held pause so the loop can observe the stop.
+  paused = false;
+  resumeGate?.();
+  resumeGate = null;
+  element("pause").textContent = "Pause";
+  stopSignal?.stop();
+});
+
+element("pause").addEventListener("click", () => {
+  paused = !paused;
+  element("pause").textContent = paused ? "Resume" : "Pause";
+  if (!paused) { resumeGate?.(); resumeGate = null; }
+  log(paused ? "  paused — the integrator is not being advanced" : "  resumed");
+});
+
+/**
+ * Time this system, so the estimates are a measurement rather than a guess.
+ *
+ * 🔴 A SHORT BURST ON THE REAL SYSTEM, BECAUSE ms/step IS NOT PORTABLE. It
+ * depends on the atom count, the PME grid, the neighbour density and the GPU -
+ * the test fixture runs at 1.0 ms/step and the two-body one at 2.7 on the same
+ * machine. Estimating from anything but the system in front of the reader would
+ * be inventing a number, and the whole purpose of the estimate is to tell
+ * someone that the 500 ns they typed is eight days.
+ */
+element("calibrate").addEventListener("click", () => runStage("timing", async (engine) => {
+  if (engine !== "gpu") throw new Error("timing is for the device engine");
+  const { system, method } = assembleSystem();
+  if (method !== "PME") throw new Error("the device engine needs a periodic system");
+  const options = runOptions(method);
+  const simulation = new GpuSimulation(gpu.device, system, {
+    ...options, rebuildInterval: Math.max(1, numberOf("rebuild")), barostatInterval: 25,
+  });
+  try {
+    const start = startState(system, options);
+    simulation.setState(start.positions, start.velocities);
+    await simulation.initialise();
+    await simulation.run(50, { blockSize: 25 });          // warm the pipelines
+    const began = performance.now();
+    const burst = 300;
+    await simulation.run(burst, { blockSize: 25, stopSignal });
+    measuredMsPerStep = (performance.now() - began) / burst;
+    const timestepPs = options.timestep;
+    const perDay = ((burst * timestepPs) / 1000)
+      / ((measuredMsPerStep * burst) / 1000 / 86400);
+    log("");
+    log(`timing: ${measuredMsPerStep.toFixed(2)} ms/step on this system `
+      + `(${perDay.toFixed(0)} ns/day at ${options.timestep * 1000} fs)`);
+    log("  the estimates beside each stage are now measured rather than blank");
+  } finally { simulation.release(); }
+}));
+
+/**
+ * Steps from a duration, which is how the notebooks ask for it.
+ *
+ * 🔴 NANOSECONDS, BECAUSE NOBODY PLANS A SIMULATION IN STEPS. The notebooks
+ * take `Time` in ns and derive `nsteps = time_ps / dt_ps`; this page used to
+ * take steps directly, which makes the one number a reader has in mind - "I
+ * need 500 ns" - something they have to convert, with the timestep, in their
+ * head. It also hid the cost: 500 ns at 2 fs is 250 million steps.
+ */
+const stepsForNanoseconds = (nanoseconds, timestepPs) =>
+  Math.max(0, Math.round((nanoseconds * 1000) / timestepPs));
+
+/** Reporting interval in steps, from an interval in picoseconds. */
+const stepsForPicoseconds = (picoseconds, timestepPs) =>
+  Math.max(1, Math.round(picoseconds / timestepPs));
+
+/** "3 d 4 h", "2 h 15 min", "45 s" - whichever units the number deserves. */
+function humanDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "—";
+  if (seconds < 90) return `${seconds.toFixed(0)} s`;
+  const minutes = seconds / 60;
+  if (minutes < 90) return `${minutes.toFixed(0)} min`;
+  const hours = minutes / 60;
+  if (hours < 48) return `${hours.toFixed(1)} h`;
+  return `${(hours / 24).toFixed(1)} days`;
+}
+
+/**
+ * Put the cost of each stage on screen, from a MEASURED rate where there is one.
+ *
+ * 🔴 THE HONEST NUMBER IS THE POINT, NOT THE PROGRESS BAR. Literature protocols
+ * are hundreds of nanoseconds, and this page will not reach them for a solvated
+ * protein - at the measured 2.7 ms/step a 1190-atom box does about 64 ns/day,
+ * so 500 ns is roughly eight days of a tab staying open. Someone who types 500
+ * deserves to see that before they press the button, not after.
+ */
+function refreshEstimates() {
+  const timestepPs = numberOf("timestep") / 1000;
+  const rate = measuredMsPerStep;
+  const describe = (steps) => {
+    const nanoseconds = (steps * timestepPs) / 1000;
+    if (rate === null) {
+      return `${steps.toLocaleString()} steps — press “Time this system” for a wall-clock estimate`;
+    }
+    const seconds = (steps * rate) / 1000;
+    const perDay = (nanoseconds / seconds) * 86400;
+    return `${steps.toLocaleString()} steps ≈ ${humanDuration(seconds)} `
+      + `at ${rate.toFixed(2)} ms/step (${perDay.toFixed(0)} ns/day)`;
+  };
+  element("eq-estimate").textContent =
+    describe(stepsForNanoseconds(numberOf("eq-time"), timestepPs));
+  const strides = Math.max(1, Math.round(numberOf("prod-strides")));
+  element("prod-estimate").textContent =
+    describe(stepsForNanoseconds(numberOf("prod-time") * strides, timestepPs));
+}
+
+for (const control of ["timestep", "eq-time", "prod-time", "prod-strides"]) {
+  element(control).addEventListener("input", refreshEstimates);
+}
+
+/**
+ * Run one stage, with the bookkeeping every stage shares.
+ *
+ * 🔴 ONE DRIVER FOR BOTH STAGES, because equilibration and production differ in
+ * exactly two things - the restraint and the duration - and everything else
+ * about them is identical. Two copies of this would be two places to forget to
+ * re-enable the Stop button.
+ */
+async function runStage(label, body) {
+  if (loaded === null) return;
+  // 🔴 THE PANELS ARE CLEARED PER STAGE, AND NOT DOING SO DREW TWO RUNS AS ONE.
+  // Every stage builds a fresh simulation whose step counter starts at zero, so
+  // its rows carry times 0..T again - and a panel that still held the previous
+  // stage's rows drew one polyline right across the axis, back to the left, and
+  // right again. That renders as TWO traces per panel: the equilibration
+  // transient and the production run superimposed, with the potential energy
+  // showing a steep descent that had already finished. Reported by a reader
+  // from a screenshot; no gate was watching for it.
+  //
+  // Cleared here rather than in the run loop so a stage that fails before its
+  // first report still leaves the panels empty rather than stale.
+  ensurePlot().clear();
+  element("panels").hidden = true;
+  const buttons = ["minimise", "equilibrate", "produce", "calibrate"];
+  const stopButton = element("stop");
+  for (const id of buttons) element(id).disabled = true;
+  stopButton.disabled = false;
+  element("pause").disabled = false;
+  stopButton.disabled = false;
+  element("pause").disabled = false;
+  // 🔴 THE SPLIT IS FROZEN WHILE A RUN IS IN FLIGHT. `LiveAnalysis` takes the
+  // receptor and binder sets once, at the first frame, and every row after
+  // that is measured against them - so re-splitting mid-run would leave the
+  // series with two different meanings for one column and no way to tell
+  // which rows were which. The view presets stay live; only the split locks.
+  element("binder").disabled = true;
+  paused = false;
+  element("pause").textContent = "Pause";
+  shareFrames = [];
+  stopSignal = new StopSignal();
+  try {
+    const engine = element("engine").value;
+    if (engine === "gpu" && gpu === null) throw new Error("no WebGPU device");
+    await body(engine);
+  } catch (error) {
+    log(error.name === "SimulationStopped" ? "  stopped" : `error: ${error.stack ?? error.message}`);
+  } finally {
+    stopButton.disabled = true;
+    element("pause").disabled = true;
+    element("binder").disabled = false;
+    paused = false;
+    resumeGate = null;
+    stopSignal = null;
+    element("minimise").disabled = false;
+    element("calibrate").disabled = false;
+    // Equilibration needs a minimised structure; production needs an
+    // equilibrated one. The notebooks enforce that by being separate cells
+    // that read the previous one's restart file.
+    element("equilibrate").disabled = stagesDone.minimise !== true;
+    element("produce").disabled = stagesDone.equilibrate !== true;
+    refreshEstimates();
+  }
+}
+
+element("equilibrate").addEventListener("click", () => runStage("equilibration", async (engine) => {
+  const timestepPs = numberOf("timestep") / 1000;
+  const steps = stepsForNanoseconds(numberOf("eq-time"), timestepPs);
+  if (steps === 0) throw new Error("equilibration time is zero");
+  const { system } = assembleSystem();
+  const selections = buildSelections(system);
+  const restraintAtoms = soluteHeavyAtoms(system, selections);
+  const force = Math.max(0, numberOf("eq-restraint"));
+  log("");
+  log(`equilibration: ${numberOf("eq-time")} ns = ${steps.toLocaleString()} steps, `
+    + `NPT, ${restraintAtoms.length} solute heavy atoms restrained at `
+    + `${force} kJ/mol/nm²`);
+  if (force === 0) {
+    log("  note: a zero force constant is an unrestrained equilibration, which "
+      + "lets the solute drift while the water finds its density");
+  }
+  await runDynamics(engine, {
+    steps,
+    writeEverySteps: stepsForPicoseconds(Number(element("eq-write").value), timestepPs),
+    restraintForce: force,
+    restraintAtoms,
+    stage: "equilibration",
+    trajectoryLabel: "equil",
+  });
+  stagesDone.equilibrate = true;
+}));
+
+element("produce").addEventListener("click", () => runStage("production", async (engine) => {
+  const timestepPs = numberOf("timestep") / 1000;
+  const perStride = stepsForNanoseconds(numberOf("prod-time"), timestepPs);
+  const strides = Math.max(1, Math.round(numberOf("prod-strides")));
+  if (perStride === 0) throw new Error("production time is zero");
+  log("");
+  log(`production: ${strides} × ${numberOf("prod-time")} ns = `
+    + `${(perStride * strides).toLocaleString()} steps, NPT, unrestrained`);
+  for (let stride = 0; stride < strides; stride += 1) {
+    if (strides > 1) log(`  stride ${stride + 1} of ${strides}`);
+    await runDynamics(engine, {
+      steps: perStride,
+      writeEverySteps: stepsForPicoseconds(Number(element("prod-write").value), timestepPs),
+      restraintForce: 0,
+      restraintAtoms: [],
+      stage: strides > 1 ? `production ${stride + 1}/${strides}` : "production",
+      // The notebooks number a stride's files; so does this.
+      trajectoryLabel: strides > 1 ? `prod_${stride + 1}` : "prod",
+    });
+  }
+}));
+
+/**
+ * One stage of dynamics, on whichever engine was chosen.
+ *
+ * 🔴 THE STAGE SUPPLIES ITS DURATION AND ITS RESTRAINT; EVERYTHING ELSE IS THE
+ * SYSTEM'S. That division is what lets equilibration and production share this
+ * function - they are the same integrator over the same topology, differing in
+ * a force constant and a step count.
+ */
+async function runDynamics(engine, stageConfig) {
+  if (engine !== "gpu") return runOnHost(stageConfig);
+  return runOnDevice(stageConfig);
+}
+
+async function runOnDevice(stageConfig = {}) {
+  const { system, method } = assembleSystem();
+  if (method !== "PME") {
+    throw new Error(
+      "the device engine implements PME, so it needs a periodic system. A "
+      + "non-periodic one can still be run on the host reference.",
+    );
+  }
+  const options = runOptions(method);
+  const steps = stageConfig.steps ?? 0;
+  const trajectoryInterval = stageConfig.writeEverySteps ?? 0;
+  const rebuildInterval = Math.max(1, numberOf("rebuild"));
+
+  const simulation = new GpuSimulation(gpu.device, system, {
+    ...options, rebuildInterval, barostatInterval: 25,
+    // 🔴 THE RESTRAINT REFERENCE IS THE STRUCTURE THIS STAGE STARTS FROM, which
+    // after minimisation is the minimised structure - the same thing the
+    // notebooks restrain towards, because they add the force to a context whose
+    // positions are the minimiser's output.
+    restraintForce: stageConfig.restraintForce ?? 0,
+    restraintAtoms: stageConfig.restraintAtoms ?? [],
+    restraintReference: hostState?.positions ?? loaded.coordinates.positions,
+  });
+  // 🔴 DECLARED OUTSIDE THE `try`, SO `finally` CAN SEE THEM. `let` inside a
+  // `try` block is scoped to that block, and the whole point of the change
+  // below is that this stage's output is committed from `finally` - which runs
+  // whether the loop finished, threw, or was stopped by the user.
+  /** @type {DcdWriter|null} */
+  let writer = null;
+  let done = 0;
+  let began = 0;
+  try {
+    const start = startState(system, options);
+    simulation.setState(start.positions, start.velocities);
+    log("");
+    log(`GPU: ${steps} steps, ${options.timestep * 1000} fs, ${options.temperature} K, `
+      + `friction ${options.friction}/ps`
+      + (options.pressure === null ? " (NVT)" : `, ${options.pressure} bar (NPT)`));
+    log(`  ${system.constraints.count} constraints in ${simulation.clusters.layout.clusterCount} `
+      + `clusters, ${simulation.plan.counts.join("×")} cells, PME grid `
+      + `${simulation.pme.grid.join("×")}, α ${simulation.pme.alpha.toFixed(4)}`);
+    await simulation.initialise();
+    attachViewer(simulation, system);
+    const diagnostics = await simulation.diagnostics();
+    if (diagnostics.toleranceWasClamped) {
+      log(`  note: constraint tolerance raised to ${diagnostics.constraintTolerance.toExponential(2)} `
+        + `— ${diagnostics.requestedTolerance.toExponential(0)} is below what f32 coordinates `
+        + `can reach on this box (floor ${diagnostics.toleranceFloor.toExponential(2)})`);
+    }
+
+    writer = trajectoryInterval > 0
+      ? new DcdWriter({
+        molecules: moleculesOf(system.topology),
+        atomCount: system.topology.atomCount,
+        timestep: options.timestep,
+        interval: trajectoryInterval,
+        periodic: true,
+        title: `RainMD ${loaded.name}`,
+      })
+      : null;
+
+    const chunk = trajectoryInterval > 0 ? trajectoryInterval
+      : Math.max(1, Math.floor(steps / 20));
+
+    // 🔴 THE REFERENCE FRAME IS THE FIRST FRAME OF THIS RUN, not the file on
+    // disk. Every RMSD is measured from it, so taking the input coordinates
+    // instead would fold the minimisation and the constraint projection into
+    // frame one - a step change of a tenth of a nanometre before any dynamics
+    // has happened.
+    lastPositions = await simulation.readPositions();
+    analysis = new LiveAnalysis(system, selections, lastPositions);
+    log(`  analysis: fitting on ${analysis.fit.length} heavy solute atoms, `
+      + `${selections.residueLabels.length} residues tracked`
+      + (analysis.hasBinder
+        ? `; receptor ${analysis.receptorFit.length} / binder ${analysis.binderFit.length} `
+          + "— RMSD is split four ways"
+        : "; single body — no binder split"));
+
+    began = performance.now();
+    // 🔴 THE LIVE BOX, NOT `system.boxVectors`, AND THAT WAS WRONG IN EVERY NPT
+    // FILE THIS PORT HAS EVER WRITTEN. `system.boxVectors` is fixed at
+    // `assembleSystem()`; the barostat changes the box on the simulation, and
+    // `#updateBox` mutates the simulation's OWN copy - so the writer never saw
+    // a volume move. Measured over 800 NPT steps whose live volume walked
+    // 20.4979 -> 19.2124 nm³, MDAnalysis read every one of the 8 frames as
+    // 20.5203 nm³: the starting cell, constant. The documented equilibration
+    // takes 20.52 -> 14.39 nm³, so the file was out by 43% in cell volume on
+    // every frame.
+    //
+    // 🔴 AND IT IS NOT ONLY THE CELL RECORD THAT IS WRONG. `DcdWriter` images
+    // molecule centroids into the box it is handed, so a box that is too large
+    // fails to wrap molecules that really have left the cell - the same class
+    // of defect as the imaging that was never implemented at all. Both the
+    // record a reader sees and the coordinates it holds depend on this.
+    const opening = await simulation.energy();
+    report(analysis.addFrame(lastPositions, opening));
+    if (writer !== null) writer.appendFrame(lastPositions, opening.boxVectors);
+    while (done < steps) {
+      stopSignal.throwIfStopped();
+      // 🔴 A TRUE PAUSE: the gate is awaited BETWEEN blocks, so the integrator
+      // is not advanced while it is held and resuming continues from the
+      // identical state. Pausing inside a block would leave positions updated
+      // and velocities not.
+      if (paused) {
+        await new Promise((resolve) => { resumeGate = resolve; });
+      }
+      const take = Math.min(chunk, steps - done);
+      await simulation.run(take, { blockSize: rebuildInterval, stopSignal });
+      done += take;
+      const energy = await simulation.energy();
+      lastPositions = await simulation.readPositions();
+      const row = analysis.addFrame(lastPositions, energy);
+      const elapsed = (performance.now() - began) / 1000;
+      const extra = [
+        ["ms / step", ((elapsed / done) * 1000).toFixed(2)],
+        ["ns / day", ((energy.time / 1000) / (elapsed / 86400)).toFixed(1)],
+        ["frames", String(writer?.frameCount ?? 0)],
+      ];
+      if (options.pressure !== null) {
+        extra.push(["volume", `${energy.volume.toFixed(3)} nm³`]);
+        extra.push(["density", `${densityOf(system, energy.volume).toFixed(4)} g/cm³`]);
+      }
+      report(row, extra);
+      // 🔴 OFF BY DEFAULT, AND THE CONTROL SAYS WHAT IT COSTS. Drawing every
+      // report was measured at 17% of a run on the two-body fixture, which on a
+      // multi-hour production stage is an hour nobody is watching. It is worth
+      // having for a short equilibration, where seeing the water settle is the
+      // point - so it is a choice rather than a default.
+      // 🔴 PRODUCTION ONLY BY DEFAULT, WHICH IS WHAT A READER ASKED FOR AND IS
+      // ALSO THE CHEAP CHOICE. Equilibration is short and restrained - there is
+      // little to see - while production is the run anyone wants to watch. The
+      // cost is per REPORT, not per step, so at the default 10 ps interval it
+      // is one Mol* reload every 5000 steps and does not move ms/step at all;
+      // the 17% figure recorded earlier was measured at a 1 ps interval, which
+      // is 500 steps and ten times as many reloads.
+      const animate = element("animate").value;
+      const isProduction = (stageConfig.stage ?? "").startsWith("production");
+      if (animate === "all" || (animate === "production" && isProduction)) {
+        animateFrame();
+      }
+      // The live box, for the reason above; `energy.boxVectors` is read from
+      // the simulation at this report, so it is the cell these coordinates
+      // were actually produced in.
+      if (writer !== null) writer.appendFrame(lastPositions, energy.boxVectors);
+      element("download-pdb").disabled = false;
+      element("download-metrics").disabled = false;
+      element("download-rmsf").disabled = analysis.rmsf.frames < 2;
+      await yieldToBrowser();
+    }
+  } finally {
+    // 🔴 THE STAGE COMMITS ITS OUTPUT HERE, NOT AFTER THE LOOP, AND THAT IS THE
+    // WHOLE FIX. `hostState`, `finalState`, `writer.finish()`,
+    // `trajectories.push()` and both download buttons all used to sit after the
+    // `while`, so `stopSignal.throwIfStopped()` threw straight past them.
+    // Measured: Stop at step 2,500 of an equilibration with 5 frames already
+    // written left `trajectoryFiles []`, `trajectoryBytes 0`, both downloads
+    // disabled, `hostState` still at the post-minimise checksum, and a log line
+    // reading "stopped". Six hours of production cost the same. `finally` runs
+    // on the way out whether the loop returned, threw or was stopped, so there
+    // is one path and it cannot be skipped.
+    try {
+      await commitStage();
+    } catch (error) {
+      // 🔴 A FAILURE TO SAVE MUST NOT REPLACE THE FAILURE THAT CAUSED IT. An
+      // uncaught throw inside `finally` discards the in-flight exception, so a
+      // blow-up would be reported as whatever went wrong while saving it.
+      log(`  ⚠ this stage's output could not be saved: ${error.name}: ${error.message}`);
+    }
+    simulation.release();
+  }
+
+  /**
+   * Everything this stage produced, saved whether or not its loop finished.
+   *
+   * 🔴 WHAT IS SAFE TO KEEP DEPENDS ON THE STATE, NOT ON WHY THE LOOP ENDED.
+   * Classifying the error would mean enumerating every way a run can stop -
+   * user Stop, a non-finite state, a lost device, a neighbour overflow - and
+   * getting one wrong silently. Reading the state and asking whether it is a
+   * number answers the only question that matters: a clean stop hands its state
+   * on, a blown-up one must not, and a lost device cannot be read at all. The
+   * trajectory is kept in every one of those cases, because it is held on this
+   * side and the frames written before the trouble are real data.
+   */
+  async function commitStage() {
+    const interrupted = done < steps;
+    const label = stageConfig.trajectoryLabel ?? "run";
+    const elapsed = (performance.now() - began) / 1000;
+    if (done > 0) {
+      log(`  ${done} steps in ${elapsed.toFixed(1)} s — `
+        + `${((elapsed / done) * 1000).toFixed(2)} ms/step`
+        + (interrupted ? ` — stopped after ${done} of ${steps} steps` : ""));
+    } else {
+      // 🔴 NOT AN EARLY RETURN, AND THE FIRST VERSION OF THIS WAS. `done === 0`
+      // means no BLOCK completed, not that nothing was written: the opening
+      // frame is appended before the loop, and it is the structure this stage
+      // started from. Returning here discarded it and - worse - skipped the
+      // message below explaining why nothing was carried forward, so a run that
+      // went non-finite inside its first block said only "nothing to save".
+      // Caught by the blow-up arm of `npm run test:page:stop`.
+      log(`  no block completed — the stage ended after ${elapsed.toFixed(1)} s, `
+        + "so only the opening frame exists");
+    }
+
+    // 🔴 THE DEVICE MAY BE GONE, AND THE TRAJECTORY IS NOT ON IT. A driver
+    // reset or a destroyed context makes `readState` throw; the frames are in
+    // host memory, so that must not cost them.
+    let state = null;
+    try {
+      state = await simulation.readState();
+    } catch (error) {
+      log(`  ⚠ the device state could not be read (${error.name}: ${error.message}). `
+        + "The trajectory below is still whole up to the last frame written, "
+        + "because it is held in the page rather than on the GPU.");
+    }
+    const firstBad = state === null ? -1 : firstNonFinite(state.positions);
+    const usable = state !== null && firstBad < 0;
+
+    if (usable) {
+      showCheckpoint(interrupted
+        ? `where ${stageConfig.stage ?? "the run"} was stopped`
+        : `at the end of ${stageConfig.stage ?? "the run"}`);
+    }
+
+    try {
+      const after = await simulation.diagnostics();
+      if (after.barostat !== null) {
+        log(`  barostat: ${after.barostat.accepted}/${after.barostat.attempts} moves accepted `
+          + `(${(after.barostat.acceptanceRate * 100).toFixed(0)}%), `
+          + `${after.barostat.refusedForCutoff} refused because the cutoff would not fit; `
+          + `volume ${after.volume.toFixed(3)} nm³, density `
+          + `${densityOf(system, after.volume).toFixed(4)} g/cm³`);
+      }
+      log(`  constraints: ${after.maxShakeIterations} SHAKE iterations at most, `
+        + `iteration cap reached: ${after.shakeHitIterationCap || after.rattleHitIterationCap}`);
+      log(`  neighbours: ${after.neighbourRequired} needed of ${after.neighbourCapacity} capacity`);
+      // 🔴 THE SKIN LINE IS NOT OPTIONAL OUTPUT. If the neighbour list was ever
+      // stale, this run's forces were missing pairs inside the cutoff - a loss
+      // of exactness the energies and the trajectory will not show. Reporting
+      // the margin on every run, and the violation loudly when there is one, is
+      // the whole user-facing point of measuring it.
+      // 🔴 THE SKIN ACCOUNTING IS VOID IF THE STATE IS NOT A NUMBER, and
+      // printing it anyway is how this used to lie. The displacement detector
+      // throws BEFORE it updates its own maxima, so a blown-up stage reports
+      // `worstDisplacement 0` and `skinViolations 0` - which rendered as "worst
+      // displacement 0 pm — 0% of the budget used" for a run that had just
+      // died. Saying the numbers do not apply is the only honest line here.
+      if (usable) {
+        log(`  skin: ${(after.skin * 1000).toFixed(0)} pm, worst displacement `
+          + `${(after.worstDisplacement * 1000).toFixed(0)} pm — `
+          + `${(after.worstSkinUsage * 100).toFixed(0)}% of the budget used; `
+          + `rebuild every ${after.rebuildInterval} steps `
+          + `(asked ${after.requestedRebuildInterval})`);
+      } else {
+        log(`  skin: ${(after.skin * 1000).toFixed(0)} pm — the displacement `
+          + "accounting does not apply to this stage, because the detector "
+          + "stopped the run before it recorded a maximum");
+      }
+      if (usable && after.skinViolations > 0) {
+        log(`  ⚠ the neighbour list was stale for ${after.stepsWithStaleList} of `
+          + `${Math.max(done, 1)} steps, over ${after.skinViolations} block(s). Some pair may `
+          + `have been inside the cutoff and not counted. A pair that close is `
+          + `worth at most ${after.missedPairForceBound.toFixed(2)} kJ/mol/nm `
+          + `against an rms of a few hundred, so this costs exactness rather than `
+          + `stability — but the run is not exact. The rebuild interval was `
+          + `shortened to ${after.rebuildInterval}; a larger box or a shorter `
+          + `cutoff would give the skin room to grow instead.`);
+      }
+      log(`  device memory: peak ${(after.allocator.peakBytes / 2 ** 20).toFixed(1)} MiB`);
+    } catch (error) {
+      log(`  (diagnostics unavailable: ${error.message})`);
+    }
+
+    if (usable) {
+      // 🔴 THE STAGE HANDS ON ITS WHOLE STATE, WHICH IT DID NOT BEFORE. This set
+      // `finalState` - used only by the .rst7 download - and left `hostState`
+      // alone, so the next stage read the structure from BEFORE this one. A
+      // production run therefore restarted from the minimised structure and
+      // threw the entire equilibration away, silently: the trajectory looked
+      // fine, the energies looked fine, and the solvent had never relaxed.
+      // Positions, velocities AND the box, because a barostat changes all three.
+      hostState = {
+        positions: Float64Array.from(state.positions),
+        velocities: Float64Array.from(state.velocities),
+        boxVectors: Float64Array.from(state.boxVectors),
+        step: simulation.step,
+      };
+      lastPositions = hostState.positions;
+      // 🔴 THE RESTART CARRIES THE STAGE IT CAME FROM, SO A STALE ONE CANNOT
+      // MASQUERADE. Every stage used to write `<name>.rst7`, and the button
+      // stayed enabled from the previous stage - so stopping a production and
+      // pressing it handed over the EQUILIBRATION's state under a filename that
+      // said nothing, and the run continued from the wrong structure. That is
+      // the stage-handoff defect over again, reached through Stop.
+      finalState = {
+        positions: state.positions,
+        velocities: state.velocities,
+        time: simulation.step * options.timestep,
+        box: boxFromVectors(state.boxVectors),
+        stage: label,
+        interrupted,
+      };
+      element("download-state").disabled = false;
+      log(`  carried forward: ${state.volume.toFixed(3)} nm³ box, `
+        + `${hostState.positions.length / 3} positions and their velocities`
+        + (interrupted ? " — a further run of this stage continues from here" : ""));
+    } else if (state !== null) {
+      // 🔴 A NON-FINITE STATE IS NOT HANDED ON, AND THAT IS THE POINT OF
+      // CHECKING RATHER THAN CLASSIFYING. Writing it into `hostState` would
+      // start the next stage from NaN, and `finalState` would offer a restart
+      // the writer refuses - so the handoff stops here and says so.
+      log(`  ⚠ this stage's final state is not a number (first at component `
+        + `${firstBad}, atom ${Math.floor(firstBad / 3)}), so it has NOT been `
+        + "carried forward and no restart is offered for it. The next stage "
+        + "still holds the last good state.");
+      if (finalState !== null) {
+        log(`    the restart button still offers the ${finalState.stage ?? "earlier"} `
+          + "state, which is the last one that was a number");
+      }
+    }
+
+    if (writer !== null && writer.frameCount > 0) {
+      const bytes = writer.finish();
+      trajectories.push({ label, bytes, frames: writer.frameCount });
+      element("download-dcd").disabled = false;
+      const total = trajectories.reduce((sum, t) => sum + t.frames, 0);
+      log(`  trajectory: ${writer.frameCount} frames, `
+        + `${(bytes.length / 2 ** 20).toFixed(2)} MiB — `
+        + `${trajectories.length} file(s) held, ${total} frames in total`
+        + (interrupted ? ", kept despite the run not finishing" : ""));
+    }
+  }
+}
+
+async function runOnHost(stageConfig = {}) {
+  const { system, method } = assembleSystem();
+  const options = runOptions(method);
+  const steps = stageConfig.steps ?? 0;
+  // Unconditional: on a second Run the current state's velocities ARE supplied,
+  // so this continues the trajectory rather than restarting it.
+  hostState = startState(system, options);
+  log("");
+  log(`host reference: ${steps} steps — this is the oracle, not a simulator, `
+    + `and it is roughly sixty times slower than the GPU path`);
+  const interval = Math.max(1, Math.floor(steps / 20));
+  let evaluation = potentialEnergy(system, hostState.positions, options);
+  const began = performance.now();
+  for (let step = 0; step < steps; step += 1) {
+    stopSignal.throwIfStopped();
+    langevinStep(hostState, system, evaluation.forces, options);
+    evaluation = potentialEnergy(system, hostState.positions, options);
+    langevinFinishStep(hostState, system, evaluation.forces, options);
+    if ((step + 1) % interval === 0 || step === steps - 1) {
+      const kinetic = instantaneousTemperature(system, hostState.velocities);
+      const elapsed = (performance.now() - began) / 1000;
+      report({
+        step: hostState.step,
+        time: hostState.step * options.timestep,
+        potential: evaluation.energy.total,
+        kinetic: kinetic.kineticEnergy,
+        total: evaluation.energy.total + kinetic.kineticEnergy,
+        temperature: kinetic.temperature,
+      }, [["ms / step", ((elapsed / (step + 1)) * 1000).toFixed(1)]]);
+      await yieldToBrowser();
+    }
+  }
+  const elapsed = (performance.now() - began) / 1000;
+  log(`  ${steps} steps in ${elapsed.toFixed(1)} s — ${((elapsed / steps) * 1000).toFixed(0)} ms/step`);
+  finalState = { positions: hostState.positions, velocities: hostState.velocities,
+    time: hostState.step * options.timestep,
+    box: boxFromVectors(currentBoxVectors()) ?? loaded.coordinates.box };
+  element("download-state").disabled = false;
+}
+
+// --------------------------------------------------------------- downloads ----
+element("download-dcd").addEventListener("click", () => {
+  if (trajectories.length === 0) return;
+  // 🔴 EVERY FILE, NOT THE LAST ONE. One download per stage and per stride, the
+  // way the notebooks name them - `_equil`, `_prod_1`, `_prod_2` - so a
+  // multi-stride production comes down whole. cpptraj and MDAnalysis both take
+  // a list of trajectories against one topology, so they reassemble in order.
+  for (const entry of trajectories) {
+    download(`${loaded.name}_${entry.label}.dcd`, entry.bytes,
+      "application/octet-stream");
+  }
+  const total = trajectories.reduce((sum, t) => sum + t.frames, 0);
+  log(`  wrote ${trajectories.length} file(s), ${total} frames in total:`);
+  for (const entry of trajectories) {
+    log(`    ${loaded.name}_${entry.label}.dcd — ${entry.frames} frames`);
+  }
+  // 🔴 NO SUMMARY LINE NAMING A FILE THAT WAS NEVER WRITTEN. This used to log
+  // `wrote <name>.dcd` after writing `<name>_equil.dcd` and `<name>_prod_1.dcd`,
+  // so the one filename a reader could copy was the one that did not exist.
+  log("  load them in order against the .prmtop you loaded; cpptraj and "
+    + "MDAnalysis both take a list of trajectories for one topology, and VMD "
+    + "and PyMOL will open them one at a time");
+});
+
+element("download-state").addEventListener("click", () => {
+  if (finalState === null) return;
+  const text = writeRestart({
+    positions: finalState.positions,
+    velocities: finalState.velocities,
+    box: finalState.box,
+    time: finalState.time,
+    title: `RainMD ${loaded.name}`,
+  });
+  // 🔴 THE FILENAME NAMES THE STAGE. Every stage wrote `<name>.rst7`, and the
+  // button stayed enabled across stages - so a stopped production handed over
+  // the equilibration's state under a filename that said nothing about it.
+  const stage = finalState.stage ?? "run";
+  const name = `${loaded.name}_${stage}.rst7`;
+  download(name, text, "text/plain");
+  log(`  wrote ${name} — an AMBER restart from ${stage}`
+    + (finalState.interrupted === true ? " (which was stopped early)" : "")
+    + ", so this run can be continued here, in the notebooks, or in AMBER");
+});
+
+/** g/cm^3, so the number means something to a chemist. */
+function densityOf(system, volume) {
+  let mass = 0;
+  for (const value of system.topology.masses) mass += value;
+  return (mass * 1.66053906660e-24) / (volume * 1e-21);
+}
+
+/**
+ * The atoms a preset shows, in index order.
+ *
+ * 🔴 ONE RESOLVER FOR THE VIEWER AND THE PDB. The download button sits beside
+ * the view bar and writes what is on screen, so deriving the two atom sets
+ * separately would eventually hand the reader a file that is not the thing they
+ * were looking at. `viewer.setStructure` marks the same groups the same way;
+ * this is that loop with the result kept as indices.
+ */
+function visibleIndices(preset) {
+  const topology = loaded.topology;
+  if (selections === null) return null;
+  const flags = new Uint8Array(topology.atomCount);
+  for (const name of preset.groups) {
+    const group = selections.groups[name];
+    if (group === undefined) continue;
+    for (const atom of group) flags[atom] = 1;
+  }
+  const heavyOnly = preset.heavyOnly === true;
+  const shown = [];
+  for (let atom = 0; atom < flags.length; atom += 1) {
+    if (flags[atom] === 0) continue;
+    if (heavyOnly && topology.atomicNumbers[atom] === 1) continue;
+    shown.push(atom);
+  }
+  return shown;
+}
+
+// ------------------------------------------------------------------ view ----
+/**
+ * The result tabs.
+ *
+ * 🔴 THREE VIEWS IN ONE PANE RATHER THAN THREE SCREENS OF SCROLLING, which is
+ * what the reference does with Structure / PAE / Contact. The structure, the six
+ * analysis panels and the log were stacked, so reading the log meant scrolling
+ * the structure off the top. Switching to Analysis also has to redraw the
+ * panels: a canvas sized while its container was `display: none` has a zero
+ * backing store, and the plots came back blank the first time they were shown.
+ */
+for (const tab of document.querySelectorAll(".tab")) {
+  tab.addEventListener("click", () => {
+    const wanted = tab.dataset.pane;
+    for (const other of document.querySelectorAll(".tab")) {
+      other.classList.toggle("is-active", other === tab);
+    }
+    for (const body of document.querySelectorAll(".tab-body")) {
+      body.hidden = body.dataset.body !== wanted;
+    }
+    if (wanted === "analysis") plot?.draw();
+    if (wanted === "structure") viewer?.resize();
+  });
+}
+
+element("share-logmd").addEventListener("click", async () => {
+  const button = element("share-logmd");
+  if (shareFrames.length === 0) return;
+  button.disabled = true;
+  const runId = logmdRunId();
+  log("");
+  log(`sharing ${shareFrames.length} frames to LogMD as run ${runId} — this `
+    + "leaves your machine");
+  try {
+    const result = await shareRun(shareFrames, {
+      runId,
+      onProgress: (sent, total) => {
+        if (sent % 10 === 0 || sent === total) log(`  uploaded ${sent}/${total}`);
+      },
+    });
+    if (result.ok) {
+      log(`  done: ${result.url}`);
+    } else {
+      // 🔴 THE EXACT FAILURE, THEN A WAY THROUGH IT. A share that just says
+      // "failed" against a third-party service tells a reader nothing they can
+      // act on, and this particular service was returning 404 when the feature
+      // was written.
+      log(`  failed after ${result.sent}/${result.total} frames: ${result.failure}`);
+      log("  downloading the frames in LogMD's own format instead — their "
+        + "Python client can upload them; the file says how");
+      download("logmd-frames.json", logmdBundle(shareFrames, runId),
+        "application/json");
+    }
+  } catch (error) {
+    log(`  failed: ${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+element("binder").addEventListener("change", applyBinderChoice);
+
+for (const control of ["view-preset", "colour-by", "representation"]) {
+  element(control).addEventListener("change", () => {
+    if (loaded === null || viewer === null) return;
+    // 🔴 THE STYLES BUFFER IS REBUILT AND THE POSITIONS ARE NOT. Switching the
+    // view while a run is in flight must not touch the buffer the integrator is
+    // writing, so this re-derives colour and visibility only - which is what
+    // makes it safe to call mid-run, and why it needs no readback. It is handed
+    // the topology rather than a rebuilt system for the same reason: a dropdown
+    // must not re-run `buildSystem` over every exclusion in the box.
+    applyView(viewer, { topology: loaded.topology },
+      lastPositions ?? hostState?.positions ?? loaded.coordinates.positions);
+  });
+}
+
+element("download-pdb").addEventListener("click", () => {
+  if (loaded === null) return;
+  const preset = currentPreset();
+  const indices = visibleIndices(preset);
+  // The last frame the run read back, so the file is the structure on screen
+  // rather than the one that was loaded.
+  const positions = lastPositions ?? hostState?.positions
+    ?? loaded.coordinates.positions;
+  const text = writePdb({ topology: loaded.topology }, positions, {
+    indices,
+    box: currentBox(),
+    remarks: [
+      `RainMD ${loaded.name}`,
+      `view ${preset.label}: ${indices === null ? loaded.topology.atomCount : indices.length}`
+      + ` of ${loaded.topology.atomCount} atoms`,
+    ],
+  });
+  download(`${loaded.name}.pdb`, text, "chemical/x-pdb");
+  log(`  wrote ${loaded.name}.pdb - ${indices === null ? loaded.topology.atomCount : indices.length}`
+    + ` atoms, the view on screen, as the topology for the .dcd`);
+});
+
+element("download-metrics").addEventListener("click", () => {
+  if (analysis === null) return;
+  download(`${loaded.name}-metrics.csv`, analysis.metricsCsv(), "text/csv");
+  log(`  wrote ${loaded.name}-metrics.csv - ${analysis.series.length} frames, `
+    + `one column per panel`);
+});
+
+element("download-rmsf").addEventListener("click", () => {
+  if (analysis === null) return;
+  download(`${loaded.name}-rmsf.csv`, analysis.rmsfCsv(), "text/csv");
+  log(`  wrote ${loaded.name}-rmsf.csv - per-residue fluctuation over `
+    + `${analysis.rmsf.frames} frames`);
+});
+
+window.addEventListener("resize", () => { plot?.draw(); viewer?.resize(); });
+
+/**
+ * A debugging handle.
+ *
+ * 🔴 IT IS HERE SO THE BROWSER LANE CAN CHECK WHAT THE PAGE ACTUALLY DID, and
+ * because a reader with the console open should be able to reach the same
+ * objects. `tools/gpu-page.mjs --simulate` drives the controls and then reads
+ * this to confirm the viewer validated and the right number of atoms reached
+ * it - neither of which is visible from the DOM.
+ */
+window.rainmd = {
+  get device() { return gpu?.device ?? null; },
+  get viewer() { return viewer; },
+  get loaded() { return loaded; },
+  get trajectoryBytes() {
+    return trajectories.reduce((total, entry) => total + entry.bytes.length, 0);
+  },
+  get trajectoryFiles() { return trajectories.map((e) => `${e.label}:${e.frames}`); },
+  get selections() { return selections; },
+  // The stage handoff is only checkable from outside if the state is reachable.
+  get hostState() { return hostState; },
+  // 🔴 WHICH STAGE THE OFFERED RESTART BELONGS TO. A stopped stage used to
+  // leave the previous stage's restart on an enabled button under a filename
+  // that named no stage, so the only way to gate that is to expose the label.
+  get restartStage() { return finalState === null ? null : (finalState.stage ?? "run"); },
+  get restartInterrupted() { return finalState === null ? null : finalState.interrupted === true; },
+  // The first panel's time column, so a gate can check it is monotonic - two
+  // stages superimposed is only visible as time going backwards.
+  plotRows() { return plot === null ? null : plot.panels[0].rows.map((r) => r.time); },
+  get analysis() { return analysis; },
+};

@@ -1,0 +1,202 @@
+import { frontendMessage, type FrontendMessage, type Translate } from "./frontendError";
+// =====================================================================
+// Disponibilidad de WebGL, dicha por MolDesign y no por la librería
+// =====================================================================
+//
+// EL FALLO QUE ARREGLA. En una máquina virtual sin aceleración 3D, el visor
+// mostraba el mensaje crudo de la librería:
+//
+//     WebGL does not seem to be available.
+//     This can be caused by an outdated browser, graphics card driver issue,
+//     or bad weather. Sometimes, just restarting the browser helps.
+//
+// Ese texto es de Mol*, no nuestro. Habla de navegadores y de «bad weather» a
+// alguien que está usando una aplicación de escritorio, no dice qué parte de
+// MolDesign sigue funcionando, y deja al investigador sin saber si su análisis
+// es válido o si acaba de perder la corrida.
+//
+// El visor no debe montarse cuando esta comprobación falla: así MolDesign
+// sustituye el mensaje interno de la librería por un estado propio que explica
+// qué parte del análisis sigue siendo utilizable.
+//
+// ── POR QUÉ NO BASTA CON «¿HAY CONTEXTO?» ───────────────────────────────────
+//
+// La versión anterior sólo preguntaba si se podía crear un contexto, y con eso
+// respondía sí o no. Entre esos dos extremos hay un tercer estado que es
+// justamente el de una VM: **hay contexto, pero lo dibuja la CPU**.
+//
+// MEDIDO, comparando la misma máquina con y sin aceleración por hardware:
+//
+//     hardware   ANGLE (NVIDIA … D3D11)          Mol* listo en 1 072 ms
+//     software   ANGLE (… SwiftShader driver)    Mol* listo en 1 260 ms
+//
+// Las dos funcionan, y las dos tienen las extensiones que Mol* necesita
+// (`EXT_color_buffer_float`, `OES_texture_float_linear`, draw buffers y
+// texturas de profundidad). Así que por software NO hay que bloquear nada: hay
+// que decirlo, porque una escena grande sí se va a arrastrar, y dejar que el
+// usuario elija el visor ligero si prefiere fluidez.
+//
+// Lo que sí hace falta para que ese repliegue exista es que el contenedor lo
+// autorice: ver `permitir_webgl_por_software` en `src-tauri/src/lib.rs`.
+
+/** Cómo se está dibujando, cuando se puede dibujar. */
+export type Aceleracion = "hardware" | "software";
+
+/** Resultado de la comprobación, con el motivo cuando falla. */
+export interface EstadoWebGL {
+  readonly disponible: boolean;
+  /** `null` si está disponible. */
+  readonly motivo: string | null;
+  readonly motivoMessage?: FrontendMessage;
+  /** `null` si no hay contexto o si el equipo no quiere identificarse. */
+  readonly aceleracion: Aceleracion | null;
+  /** Lo que anuncia el equipo, tal cual. Para diagnóstico, no para decidir. */
+  readonly renderer: string | null;
+}
+
+/**
+ * Nombres con los que se anuncian los rasterizadores por software.
+ *
+ * Es una lista de reconocimiento, no una regla: si aparece uno nuevo, lo peor
+ * que pasa es que se le trate como hardware y el usuario note que va lento sin
+ * que se lo hayamos avisado. Nunca al revés — nada se bloquea por estar aquí.
+ */
+const POR_SOFTWARE = [
+  "swiftshader",
+  "llvmpipe",
+  "softpipe",
+  "software adapter",
+  "microsoft basic render",
+  "basic display adapter",
+  "mesa offscreen",
+  "gallium, llvmpipe",
+];
+
+let cache: EstadoWebGL | null = null;
+
+function clasificar(renderer: string | null): Aceleracion | null {
+  if (!renderer) return null;
+  const bajo = renderer.toLowerCase();
+  return POR_SOFTWARE.some((nombre) => bajo.includes(nombre)) ? "software" : "hardware";
+}
+
+/**
+ * Comprueba si el equipo puede crear un contexto WebGL, y cómo lo dibuja.
+ *
+ * Se crea un canvas desechable y se descarta de inmediato: crear el contexto es
+ * la ÚNICA forma fiable de saberlo. Preguntar por el navegador o por el driver
+ * da falsos positivos —una VM anuncia un navegador moderno y aun así no expone
+ * aceleración— y ese es justo el caso que hay que detectar.
+ *
+ * El resultado se memoriza: crear contextos WebGL de prueba consume recursos de
+ * GPU de verdad. La capacidad SÍ puede cambiar con la sesión abierta —si el
+ * proceso de GPU se cae varias veces, Chromium deja de dar contextos—, así que
+ * quien ve fallar un visor llama antes a `reiniciarComprobacionWebGL()`.
+ */
+export function comprobarWebGL(): EstadoWebGL {
+  if (cache) return cache;
+  if (typeof window === "undefined" || typeof document === "undefined") {
+    // En render de servidor no se puede saber. Se responde «disponible» para no
+    // pintar una advertencia que quizá no corresponde: el cliente lo corregirá.
+    return { disponible: true, motivo: null, aceleracion: null, renderer: null };
+  }
+  const estado = medirWebGL();
+  cache = estado;
+  anunciarModoDeDibujo(estado);
+  return estado;
+}
+
+/**
+ * Deja dicho en `<html data-dibujo>` si la pantalla la compone el procesador.
+ *
+ * PARA QUÉ. Sin tarjeta gráfica, cada fotograma de una animación CSS lo compone
+ * el procesador. Medido en el export sin GPU (2026-11-09), con una evaluación en
+ * marcha: la pantalla «evaluando» gastaba el 57 % de un núcleo con sus
+ * animaciones a 60 fotogramas por segundo, el 27 % con doce pasos por vuelta
+ * (lo que se aplica) y el 15 % sin ninguna. En una máquina virtual ese núcleo
+ * es de los pocos que tiene Vina. `globals.css` lee este atributo y da las
+ * animaciones por pasos. Cifras y condiciones en
+ * `docs/auditorias/evaluacion-visores-y-rendimiento-2026-11-09.md`.
+ *
+ * Sin contexto 3D la composición también es por software, así que cuenta igual.
+ * Si el equipo no dice cómo dibuja (`aceleracion: null`), no se toca nada.
+ */
+function anunciarModoDeDibujo(estado: EstadoWebGL): void {
+  try {
+    const porSoftware = !estado.disponible || estado.aceleracion === "software";
+    document.documentElement.dataset.dibujo = porSoftware ? "software" : "hardware";
+  } catch {
+    // Sólo es una optimización: si no se puede escribir el atributo, no pasa nada.
+  }
+}
+
+/** La medida, sin memoria: crea un contexto de prueba y mira quién lo dibuja. */
+function medirWebGL(): EstadoWebGL {
+  try {
+    const canvas = document.createElement("canvas");
+    const contexto =
+      canvas.getContext("webgl2") ||
+      canvas.getContext("webgl") ||
+      canvas.getContext("experimental-webgl");
+    if (!contexto) {
+      return {
+        disponible: false,
+        aceleracion: null,
+        renderer: null,
+        motivo:
+          String(frontendMessage("pr_webgl_no_hardware")),
+        motivoMessage: frontendMessage("pr_webgl_no_hardware"),
+      };
+    }
+
+    const gl = contexto as WebGLRenderingContext;
+    let renderer: string | null = null;
+    try {
+      // `WEBGL_debug_renderer_info` puede no estar: algunos equipos lo ocultan
+      // por privacidad. Sin él no se sabe cómo se dibuja, y eso es un estado
+      // legítimo —`aceleracion: null`— y no un fallo.
+      const info = gl.getExtension("WEBGL_debug_renderer_info");
+      if (info) {
+        const crudo = gl.getParameter(info.UNMASKED_RENDERER_WEBGL);
+        renderer = typeof crudo === "string" ? crudo : null;
+      }
+    } catch {
+      renderer = null;
+    }
+
+    // Liberar el contexto de prueba en vez de dejarlo colgando: los navegadores
+    // limitan cuántos hay vivos a la vez, y el visor real necesita el suyo.
+    const perder = gl.getExtension("WEBGL_lose_context");
+    perder?.loseContext();
+
+    return {
+      disponible: true,
+      motivo: null,
+      aceleracion: clasificar(renderer),
+      renderer,
+    };
+  } catch (error) {
+    return {
+      disponible: false,
+      aceleracion: null,
+      renderer: null,
+      motivo: String(frontendMessage("pr_webgl_error", { detail: String(error).slice(0, 80) })),
+      motivoMessage: frontendMessage("pr_webgl_error", { detail: String(error).slice(0, 80) }),
+    };
+  }
+}
+
+/**
+ * Olvida la comprobación memorizada, para volver a medir.
+ *
+ * La usan las pruebas y quien ve fallar un visor a media sesión: lo que el equipo
+ * podía dibujar al abrir la pestaña puede no ser lo que puede dibujar ahora.
+ */
+export function reiniciarComprobacionWebGL(): void {
+  cache = null;
+}
+
+/** Presentación desde el descriptor; la comprobación física y su caché no dependen del idioma. */
+export function webglReason(state: EstadoWebGL, t: Translate): string | null {
+  return state.motivoMessage ? state.motivoMessage.render(t) : state.motivo;
+}

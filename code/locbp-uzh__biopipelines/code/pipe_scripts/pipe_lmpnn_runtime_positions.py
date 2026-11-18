@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+"""
+Position determination for LigandMPNN from tables or direct specifications.
+
+This script processes a DataStream JSON file to create a JSON file with LigandMPNN position arguments.
+
+Usage:
+    python pipe_lmpnn_runtime_positions.py <config_json>
+
+<config_json> is a JSON object with keys:
+    structures_json: Path to DataStream JSON file with input structures
+    input_source: "table" (e.g. RFdiffusion table), "selection" (use direct positions), or "ligand" (ligand-based)
+    input_table: Path to table file (or "-" if not using table)
+    fixed_positions: PyMOL selection for fixed positions (or "-")
+    designed_positions: PyMOL selection for designed positions (or "-")
+    ligand: compounds-stream JSON; the residue `code` is read from it
+    design_within: Distance cutoff for ligand-based design
+    output_file: Path to output JSON file
+    default_chain: Chain for chainless positions, or "auto" to read it off each structure
+
+Output:
+    JSON file mapping design_id -> {fixed_option, redesigned_option} for LigandMPNN. A structure that cannot be parsed maps to {error} instead, so the step reports that one id rather than stopping the batch.
+"""
+
+import sys
+import os
+import json
+import pandas as pd
+import glob
+from pathlib import Path
+
+# Import unified I/O utilities
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from biopipelines.biopipelines_io import load_datastream, iterate_files, load_table, lookup_table_value
+from biopipelines.ligand_utils import resolve_ligand_code
+from biopipelines.pdb_parser import parse_pdb_file, STANDARD_RESIDUES
+from biopipelines.sele_utils import sele_to_list
+
+
+class UnreadableStructure(Exception):
+    """A structure file that cannot be parsed; reported against its own id, not the batch's."""
+
+
+def parse_structure(pdb_path):
+    """parse_pdb_file, with any failure to read the file named after it."""
+    try:
+        return parse_pdb_file(pdb_path)
+    except Exception as exc:
+        raise UnreadableStructure(
+            f"{os.path.basename(pdb_path)}: cannot be parsed ({type(exc).__name__}: {exc})") from exc
+
+
+def process_table_source(input_table, design_entries):
+    """Process input table to get fixed/designed positions.
+
+    Args:
+        input_table: Path to CSV table with fixed/designed columns
+        design_entries: List of (design_id, pdb_file) tuples from DataStream
+    """
+    if not os.path.exists(input_table):
+        raise FileNotFoundError(f"Table not found: {input_table}")
+
+    df = pd.read_csv(input_table)
+    positions_data = {}
+
+    for design_id, pdb_file in design_entries:
+        # Find matching row in table - try by id column first, then by pdb column
+        matching_rows = df[df['id'] == design_id] if 'id' in df.columns else pd.DataFrame()
+        if matching_rows.empty and 'pdb' in df.columns:
+            pdb_name = os.path.basename(pdb_file)
+            matching_rows = df[df['pdb'] == pdb_name]
+
+        if not matching_rows.empty:
+            row = matching_rows.iloc[0]
+            fixed_positions = sele_to_list(row.get('fixed', ''))
+            designed_positions = sele_to_list(row.get('designed', ''))
+
+            # fixed wins: drop fixed residues from the designed set.
+            if fixed_positions and designed_positions:
+                fixed_set = set(fixed_positions)
+                designed_positions = [p for p in designed_positions if p not in fixed_set]
+
+            positions_data[design_id] = {
+                'fixed_positions': fixed_positions,
+                'designed_positions': designed_positions,
+                'pdb_file': pdb_file
+            }
+        else:
+            print(f"Warning: No table entry found for {design_id}")
+            positions_data[design_id] = {
+                'fixed_positions': [],
+                'designed_positions': [],
+                'pdb_file': pdb_file
+            }
+
+    return positions_data
+
+
+def resolve_table_reference(reference, design_ids, map_table_paths=None):
+    """
+    Resolve table reference to per-design selections.
+
+    Args:
+        reference: Either a table reference like "TABLE_REFERENCE:path:column" or direct PyMOL selection
+        design_ids: List of design IDs from DataStream
+        map_table_paths: Input stream's map_table, so ids renamed upstream still
+            resolve against the table's original id space
+
+    Returns:
+        Dictionary mapping design IDs to position lists
+    """
+    if not reference or reference == "-":
+        return {design_id: [] for design_id in design_ids}
+    if not reference.startswith("TABLE_REFERENCE:"):
+        # Direct PyMOL selection - same for all designs
+        return {design_id: sele_to_list(reference) for design_id in design_ids}
+
+    # Use pipe_biopipelines_io to load table and column
+    table, column_name = load_table(reference)
+    positions_per_design = {}
+
+    for design_id in design_ids:
+        try:
+            selection_value = lookup_table_value(table, design_id, column_name,
+                                                 map_table_paths=map_table_paths)
+            positions_per_design[design_id] = sele_to_list(selection_value)
+        except KeyError:
+            print(f"Warning: No table entry found for {design_id} in column {column_name}")
+            positions_per_design[design_id] = []
+
+    return positions_per_design
+
+
+def get_protein_residues_from_pdb(pdb_path):
+    """Get all protein (chain, resnum) tuples from PDB file."""
+    atoms = parse_structure(pdb_path)
+    residues = set()
+    for atom in atoms:
+        if atom.res_name in STANDARD_RESIDUES:
+            residues.add((atom.chain, atom.res_num))
+    return sorted(residues, key=lambda x: (x[0], x[1]))
+
+
+def process_selection_source(fixed_positions, designed_positions, design_entries,
+                             map_table_paths=None):
+    """Process direct PyMOL selections or table references for fixed/designed positions.
+
+    Args:
+        fixed_positions: Fixed positions string or TABLE_REFERENCE
+        designed_positions: Designed positions string or TABLE_REFERENCE
+        design_entries: List of (design_id, pdb_file) tuples from DataStream
+        map_table_paths: Input stream's map_table, so ids renamed upstream still
+            resolve against the table's original id space
+    """
+    design_ids = [entry[0] for entry in design_entries]
+    fixed_per_design = resolve_table_reference(fixed_positions, design_ids, map_table_paths)
+    designed_per_design = resolve_table_reference(designed_positions, design_ids, map_table_paths)
+
+    positions_data = {}
+    for design_id, pdb_file in design_entries:
+        fixed = fixed_per_design.get(design_id, [])
+        designed = designed_per_design.get(design_id, [])
+
+        # fixed wins: a residue named in fixed is never redesigned, even if it
+        # also falls in the redesigned set (e.g. a catalytic residue inside the
+        # pocket selection).
+        if fixed and designed:
+            fixed_set = set(fixed)
+            designed = [p for p in designed if p not in fixed_set]
+
+        # When redesigned resolves to empty and fixed is also empty,
+        # fix all residues so the tool outputs the original sequence.
+        # This handles the case where a table reference (e.g. DistanceSelector "within")
+        # resolved to empty at runtime.
+        if not designed and not fixed:
+            try:
+                fixed = get_protein_residues_from_pdb(pdb_file)
+            except UnreadableStructure as exc:
+                positions_data[design_id] = {'error': str(exc)}
+                continue
+            print(f"No positions to redesign for {design_id}, fixing all residues")
+
+        positions_data[design_id] = {
+            'fixed_positions': fixed,
+            'designed_positions': designed,
+            'pdb_file': pdb_file
+        }
+
+    return positions_data
+
+
+def process_ligand_source(ligand, design_within, design_entries):
+    """Process ligand-based design - determine positions based on distance to ligand.
+
+    Args:
+        ligand: Ligand identifier
+        design_within: Distance cutoff in Angstroms
+        design_entries: List of (design_id, pdb_file) tuples from DataStream
+    """
+    # For now, implement a simple fallback - in practice this would need
+    # structural analysis to find residues near the ligand
+    print("Warning: no fixed or redesigned positions were given, so every position is redesigned. "
+          f"design_within={design_within} A is only the scoring cutoff of the ligand context and does not select residues; "
+          "give `redesigned` (a DistanceSelector shell, for instance) to restrict the design.")
+
+    positions_data = {}
+    for design_id, pdb_file in design_entries:
+        # Fallback: assume all positions are designable for ligand-based approach
+        # In a full implementation, this would analyze the PDB structure
+        positions_data[design_id] = {
+            'fixed_positions': [],
+            'designed_positions': [],  # Would be populated by structural analysis
+            'pdb_file': pdb_file
+        }
+
+    return positions_data
+
+
+def protein_chains_of(pdb_path):
+    """Sorted protein chain ids present in a structure."""
+    return sorted({atom.chain for atom in parse_structure(pdb_path)
+                   if atom.res_name in STANDARD_RESIDUES})
+
+
+def resolve_default_chain(default_chain, pdb_path, has_chainless):
+    """The chain a chainless position attaches to for this structure.
+
+    "auto" means read it off the structure. One protein chain answers it; several make an
+    unqualified position ambiguous, which is an error rather than a guess. This used to be
+    the literal "A", which was silently wrong whenever the chain was called anything else.
+    """
+    if default_chain != "auto":
+        return default_chain
+    chains = protein_chains_of(pdb_path)
+    if len(chains) == 1:
+        return chains[0]
+    if len(chains) > 1:
+        if has_chainless:
+            raise ValueError(
+                f"{os.path.basename(pdb_path)}: {len(chains)} protein chains "
+                f"({'+'.join(chains)}) and an unqualified position selection: which chain do "
+                f"the residues belong to? Qualify them (\"{chains[0]}10-20\"), name them per "
+                f"chain (fixed={{'{chains[0]}': ...}}), or restrict the step with "
+                f"chains=\"{chains[0]}\".")
+        return chains[0]
+    return "A"
+
+
+def write_positions_json(positions_data, output_file, default_chain="auto"):
+    """Write positions data as JSON for runtime lookup.
+
+    Args:
+        positions_data: Dict mapping design_id -> {fixed_positions, designed_positions, pdb_file}
+        output_file: Path to output JSON file
+        default_chain: Chain for chainless positions, or "auto" to read it off each structure
+    """
+    result = {}
+    for design_id, positions in positions_data.items():
+        if 'error' in positions:
+            result[design_id] = {"error": positions['error']}
+            continue
+        all_positions = positions['fixed_positions'] + positions['designed_positions']
+        has_chainless = any(not chain for chain, _ in all_positions)
+        try:
+            chain_here = resolve_default_chain(default_chain, positions['pdb_file'], has_chainless)
+        except UnreadableStructure as exc:
+            result[design_id] = {"error": str(exc)}
+            continue
+
+        # Build fixed positions option for this design
+        fixed_option = ""
+        if positions['fixed_positions']:
+            fixed_str = " ".join([f"{chain if chain else chain_here}{resnum}" for chain, resnum in positions['fixed_positions']])
+            fixed_option = f'--fixed_residues "{fixed_str}"'
+
+        # Build designed positions option for this design
+        redesigned_option = ""
+        if positions['designed_positions']:
+            designed_str = " ".join([f"{chain if chain else chain_here}{resnum}" for chain, resnum in positions['designed_positions']])
+            redesigned_option = f'--redesigned_residues "{designed_str}"'
+
+        result[design_id] = {
+            "fixed_option": fixed_option,
+            "redesigned_option": redesigned_option
+        }
+
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, 'w') as f:
+        json.dump(result, f, indent=2)
+
+    print(f"Created LigandMPNN positions JSON: {output_file}")
+
+
+def main():
+    if len(sys.argv) != 2:
+        print("Usage: python pipe_lmpnn_runtime_positions.py <config_json>")
+        sys.exit(1)
+
+    with open(sys.argv[1]) as f:
+        cfg = json.load(f)
+    structures_json = cfg["structures_json"]
+    input_source = cfg["input_source"]
+    input_table = cfg["input_table"]
+    fixed_positions = cfg["fixed_positions"]
+    designed_positions = cfg["designed_positions"]
+    ligand_json = cfg["ligand"]  # compounds-stream JSON; `code` read from it below
+    design_within = float(cfg["design_within"])
+    output_file = cfg["output_file"]
+    default_chain = cfg.get("default_chain", "auto")
+
+    # Load DataStream and get (id, file) pairs
+    structures_ds = load_datastream(structures_json)
+    design_entries = list(iterate_files(structures_ds))  # List of (design_id, pdb_file) tuples
+
+    if not design_entries:
+        raise ValueError(f"No structures found in DataStream: {structures_json}")
+
+    print(f"Processing {len(design_entries)} structures with input_source='{input_source}'")
+
+    # Process based on input source
+    if input_source == "table" and input_table != "-":
+        positions_data = process_table_source(input_table, design_entries)
+    elif input_source == "selection":
+        positions_data = process_selection_source(
+            fixed_positions, designed_positions, design_entries,
+            [structures_ds.map_table] if structures_ds.map_table else None)
+    elif input_source == "ligand":
+        ligand_code = resolve_ligand_code(ligand_json)
+        positions_data = process_ligand_source(ligand_code, design_within, design_entries)
+    else:
+        raise ValueError(f"Invalid input_source: {input_source}")
+
+    # Write positions JSON for runtime lookup
+    write_positions_json(positions_data, output_file, default_chain)
+
+
+if __name__ == "__main__":
+    main()

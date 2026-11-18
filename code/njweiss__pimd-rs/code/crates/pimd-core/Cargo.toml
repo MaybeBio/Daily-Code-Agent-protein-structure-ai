@@ -1,0 +1,14 @@
+[package]
+name = "pimd-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+rand_distr.workspace = true
+# FFT normal-mode transform (RP-4, MILESTONE_4), scalar planner only.
+rustfft.workspace = true

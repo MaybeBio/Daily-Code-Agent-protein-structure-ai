@@ -1,0 +1,7 @@
+ase >= 3.23
+coverage[toml]
+pytest
+pytest-cov
+pytest-doctestplus
+scipy
+vesin >= 0.3.0

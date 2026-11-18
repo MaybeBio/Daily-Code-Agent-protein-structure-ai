@@ -1,0 +1,37 @@
+# Project-level myxcel configuration for prolix.
+# Override resolution: built-in → ~/.myxcel.toml → this file (env/extra_args merged).
+
+[push]
+# Local GPU traces / scratch — not source; keep off worktree scratch.
+# Root-anchored (leading "/") so tests/bench and tests/profiling still sync.
+excludes = ["/profiling/", "/bench/", "/p5c_stage1_v2/"]
+
+[tier]
+kind = "research"
+
+[slurm.presets.preempt_gpu]
+# Preemptable GPU jobs — long walltime, fault-tolerant workloads.
+# Use for multi-hour GPU runs that can tolerate preemption.
+partition    = "mit_preemptable"
+time         = "47:00:00"
+cpus_per_task = 16
+mem          = "64G"
+gpus         = "1"
+
+[slurm.presets.pi_so3_preempt_gpu]
+# pi_so3 long GPU jobs with Blackwell (SM120) workaround.
+# XLA_FLAGS is a no-op on non-Blackwell nodes; safe to set unconditionally.
+# Use for production MD runs that need > 6h on dedicated hardware.
+partition    = "pi_so3"
+time         = "47:00:00"
+cpus_per_task = 16
+mem          = "128G"
+gpus         = "1"
+env          = { XLA_FLAGS = "--xla_gpu_shard_autotuning=false" }
+
+[uv]
+# One shared venv per uv.lock hash (profile uv.venv_root). Dependencies only: prolix is NOT installed
+# into it (scripts/slurm/_uv_env.sh puts this worktree's src/ on PYTHONPATH), so worktrees never
+# import each other's source. sync_args feed the lock key and must equal PROLIX_UV_SYNC_ARGS there.
+venv = "lock-keyed"
+sync_args = ["--frozen", "--extra", "cuda", "--extra", "openmm", "--extra", "dev", "--no-install-project"]

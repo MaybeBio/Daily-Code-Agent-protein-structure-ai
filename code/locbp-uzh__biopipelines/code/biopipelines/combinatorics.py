@@ -1,0 +1,1183 @@
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+"""
+Combinatorics module for Bundle/Each input handling in BioPipelines.
+
+Provides wrapper classes and config generation for controlling how multiple
+inputs are combined in tools.
+
+Design:
+- Each: Iterate over elements (cartesian product axis) - DEFAULT behavior
+- Bundle: Group elements together as one entity
+- configuration time: Generate a combinatorics config file describing groupings
+- execution time: pipe_script reads config and generates appropriate configs
+
+Example usage:
+    outputA = Tool1()  # a1, a2
+    outputB = Tool2()  # b1, b2
+
+    # Default (Each): cartesian product a1+b1, a1+b2, a2+b1, a2+b2
+    Tool3(input1=outputA, input2=outputB)
+
+    # Bundled: all together a1+a2+b1+b2
+    Tool3(input1=Bundle(outputA), input2=Bundle(outputB))
+
+    # Mixed: a1+(b1+b2), a2+(b1+b2)
+    Tool3(input1=outputA, input2=Bundle(outputB))
+"""
+
+import os
+import json
+import warnings
+from dataclasses import dataclass, field, asdict
+from typing import List, Any, Union, Optional, Dict, Tuple
+
+
+class Each:
+    """
+    Marks input for iteration (cartesian product axis).
+    This is the DEFAULT behavior for bare inputs.
+    """
+    def __init__(self, *sources):
+        if not sources:
+            raise ValueError("Each requires at least one source")
+        self.sources = sources
+
+    def __repr__(self) -> str:
+        return f"Each({', '.join(repr(s) for s in self.sources)})"
+
+
+class Bundle:
+    """
+    Groups multiple inputs together as one entity.
+    All elements appear together in one config.
+    """
+    def __init__(self, *sources):
+        if not sources:
+            raise ValueError("Bundle requires at least one source")
+        self.sources = sources
+
+    def __repr__(self) -> str:
+        return f"Bundle({', '.join(repr(s) for s in self.sources)})"
+
+
+class Grouped:
+    """
+    Iterates the *groups* of a stream: one output per group, carrying all of that
+    group's rows together.
+
+    ``Each`` makes one output per row and ``Bundle`` makes one output from every row;
+    ``Grouped`` sits between them, which is what a multi-chain design needs — a design
+    is several ``sequences`` rows that belong in one prediction. The partition comes
+    from ``groups``, a stream whose ids are the group keys, exactly as ``Consensus``
+    takes it. Membership is resolved at runtime by the framework's id matching, so the
+    group ids are all that has to be known at configuration time.
+
+    ``groups`` is any stream whose ids are the keys, and it needs no relationship to the
+    grouped stream beyond ancestry — matching walks the parent chain, so a key may be the
+    rows' parent, grandparent or any ancestor. Grouping four chain rows ``A_1_1, A_1_2,
+    A_2_1, A_2_2`` under the two designs ``A_1, A_2`` and under the one backbone ``A`` are
+    the same call with a different ``groups``::
+
+        Boltz2(proteins=Grouped(pmpnn.streams.sequences, groups=pmpnn.streams.designs))
+        Boltz2(proteins=Grouped(pmpnn.streams.sequences, groups=rfd))   # one per backbone
+
+    Omitting ``groups`` defaults to the source output's ``designs``, which is the common
+    case, and requires a tool output rather than a bare stream::
+
+        Boltz2(proteins=Bundle(Grouped(pmpnn), tag))
+    """
+
+    #: The stream name a tool output falls back to when ``groups`` is not given.
+    DEFAULT_GROUP_STREAM = "designs"
+
+    def __init__(self, source, groups=None):
+        self.source = source
+        self.groups = groups
+
+    def resolve_groups(self, stream_name: str):
+        """The group stream as a DataStream, from ``groups`` or the source's ``designs``.
+
+        A given ``groups`` is resolved on its own terms, never under the consuming axis's
+        stream name: the keys commonly live on a differently-named stream (an RFdiffusion
+        output groups sequences by its ``structures``), so looking for ``sequences`` there
+        would refuse a perfectly good partition.
+        """
+        if self.groups is not None:
+            return self._as_group_stream(self.groups)
+
+        # A tool output carries its sibling streams directly; a bare stream carries the
+        # tool that produced it, which is how `Grouped(tool.streams.sequences)` -- the
+        # spelling that reads most naturally -- finds the same siblings.
+        streams = getattr(self.source, "streams", None)
+        group_stream = getattr(streams, self.DEFAULT_GROUP_STREAM, None) if streams else None
+        if group_stream is None:
+            group_stream = self._sibling_from_producer(self.source)
+
+        if group_stream is None:
+            raise ValueError(
+                f"Grouped(...) could not find a '{self.DEFAULT_GROUP_STREAM}' stream to group "
+                f"'{stream_name}' by. Pass groups= naming the stream whose ids are the group "
+                f"keys, e.g. groups=tool.streams.{self.DEFAULT_GROUP_STREAM}."
+            )
+        if not len(group_stream):
+            raise ValueError(
+                f"Grouped(...): the '{self.DEFAULT_GROUP_STREAM}' stream it would group "
+                f"'{stream_name}' by is empty; pass groups= explicitly."
+            )
+        return group_stream
+
+    @classmethod
+    def _sibling_from_producer(cls, source):
+        """The producer's ``designs`` stream, reached from a bare stream's back-reference.
+
+        ``get_output_files()`` is declarative -- it predicts paths and touches no disk -- so
+        asking the producing tool for its own streams again at configuration time is free.
+        """
+        producer = getattr(source, "_producer", None)
+        if producer is None or not hasattr(producer, "get_output_files"):
+            return None
+        try:
+            outputs = producer.get_output_files()
+        except Exception:
+            return None
+        candidate = outputs.get(cls.DEFAULT_GROUP_STREAM) if isinstance(outputs, dict) else None
+        return candidate if hasattr(candidate, "ids") else None
+
+    @staticmethod
+    def _as_group_stream(groups):
+        """A DataStream from whatever the caller passed as ``groups``.
+
+        Mirrors ``Consensus._resolve_group_stream``: streams sharing one id set yield the
+        same partition, so picking between them is harmless, while streams that disagree
+        would change the answer and are refused rather than guessed.
+        """
+        if hasattr(groups, "ids") and hasattr(groups, "map_table"):
+            return groups
+        streams = getattr(groups, "streams", None)
+        if streams is None:
+            raise ValueError(
+                f"Grouped(groups=...) must be a DataStream or a tool output, got {type(groups)}")
+        candidates = [ds for _, ds in streams.items() if ds is not None and len(ds) > 0]
+        if not candidates:
+            raise ValueError("Grouped(groups=...): no non-empty stream found in that output")
+        if len({tuple(ds.ids) for ds in candidates}) > 1:
+            raise ValueError(
+                f"Grouped(groups=...): output streams disagree on ids "
+                f"({[(c.name, len(c)) for c in candidates]}); pass an explicit stream, "
+                f"e.g. groups=tool.streams.structures")
+        return candidates[0]
+
+    def __repr__(self) -> str:
+        return f"Grouped({self.source!r}, groups={self.groups!r})"
+
+
+@dataclass
+class AxisConfig:
+    """
+    Configuration for a single combinatorics axis.
+
+    Each source is a dict with:
+    - path: Path to source CSV
+    - iterate: True = part of iteration (Each), False = static/bundled with each iteration
+    """
+    name: str                                    # Axis name (e.g., "proteins", "ligands")
+    mode: str = "each"                           # "each" or "bundle"
+    sources: List[Dict] = field(default_factory=list)  # [{"path": str, "iterate": bool}]
+    entity_type: Optional[str] = None            # e.g., "protein", "dna", "rna", "ligand"
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+
+@dataclass
+class CombinatoricsConfig:
+    """
+    Configuration describing how multiple input axes should be combined.
+    This gets written to a JSON file for pipe_script consumption.
+
+    Generic design: supports any number of named axes.
+    """
+    axes: Dict[str, AxisConfig] = field(default_factory=dict)
+
+    predicted_ids: List[str] = field(default_factory=list)
+    provenance: Dict[str, List[str]] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict:
+        result = {
+            "axes": {name: axis.to_dict() for name, axis in self.axes.items()}
+        }
+        if self.predicted_ids:
+            result["predicted_ids"] = self.predicted_ids
+        if self.provenance:
+            result["provenance"] = self.provenance
+        return result
+
+    def save(self, path: str):
+        """Save config to JSON file."""
+        with open(path, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> 'CombinatoricsConfig':
+        """Load config from JSON file."""
+        with open(path, 'r') as f:
+            data = json.load(f)
+        axes = {}
+        for name, axis_data in data.get("axes", {}).items():
+            axes[name] = AxisConfig(**axis_data)
+        return cls(
+            axes=axes,
+            predicted_ids=data.get("predicted_ids", []),
+            provenance=data.get("provenance", {})
+        )
+
+    def get_axis(self, name: str) -> Optional[AxisConfig]:
+        """Get axis config by name."""
+        return self.axes.get(name)
+
+    def get_mode(self, axis_name: str) -> str:
+        """Get mode for an axis, defaults to 'each'."""
+        axis = self.axes.get(axis_name)
+        return axis.mode if axis else "each"
+
+    def get_sources(self, axis_name: str) -> List[Dict]:
+        """Get sources for an axis (list of dicts with 'path' and 'iterate' keys)."""
+        axis = self.axes.get(axis_name)
+        return axis.sources if axis else []
+
+    def get_source_paths(self, axis_name: str) -> List[str]:
+        """Get just the source paths for an axis."""
+        axis = self.axes.get(axis_name)
+        if not axis:
+            return []
+        return [s["path"] if isinstance(s, dict) else s for s in axis.sources]
+
+
+def _unpack_input(name: str, value: Any) -> Tuple[Any, str, Optional[str]]:
+    """
+    Unpack the (value, stream_name) or (value, stream_name, entity_type) tuple convention.
+
+    Each named input can be either:
+    - A bare value: the key serves as both alias and stream name
+    - A (value, stream_name) tuple: key is alias, stream_name tells which stream to extract
+    - A (value, stream_name, entity_type) triple: adds entity_type metadata for the axis
+
+    Args:
+        name: The kwarg key (alias for provenance columns)
+        value: The kwarg value — bare, (value, stream_name) tuple, or (value, stream_name, entity_type) triple
+
+    Returns:
+        (actual_value, stream_name, entity_type)
+    """
+    if isinstance(value, tuple):
+        if len(value) == 3 and isinstance(value[1], str) and isinstance(value[2], str):
+            actual_value, stream_name, entity_type = value
+            if not isinstance(actual_value, str):
+                return actual_value, stream_name, entity_type
+        elif len(value) == 2 and isinstance(value[1], str):
+            actual_value, stream_name = value
+            if not isinstance(actual_value, str):
+                return actual_value, stream_name, None
+    return value, name, None
+
+
+def _source_entry(stream: Any) -> Dict[str, Any]:
+    """
+    Build a source entry {path, ids} for a DataStream.
+
+    The map_table does not exist at config time (upstream runs later), so we
+    carry the stream's id *patterns* (``stream.ids``, possibly deterministic
+    and/or lazy). At runtime the consumer reads the map_table as the source of
+    truth and selects the rows the patterns cover (:func:`id_patterns.select_ids`).
+    This honors upstream filtering without a config-time flag: a filtered stream
+    simply has fewer rows, so fewer are selected.
+    """
+    return {"path": stream.map_table, "ids": list(stream.ids)}
+
+
+def _extract_source_entries(source: Any, stream_name: str) -> List[Dict[str, Any]]:
+    """Like :func:`_extract_source_paths` but returns {path, ids?} dicts."""
+    if source is None:
+        return []
+    if isinstance(source, str):
+        return [{"path": source}] if source.endswith('.csv') else []
+    if isinstance(source, list):
+        entries: List[Dict[str, Any]] = []
+        for item in source:
+            entries.extend(_extract_source_entries(item, stream_name))
+        return entries
+    if hasattr(source, 'map_table') and hasattr(source, 'ids'):
+        if source.map_table:
+            return [_source_entry(source)]
+        raise ValueError(f"DataStream for stream '{stream_name}' has no map_table")
+    if hasattr(source, 'streams'):
+        stream = getattr(source.streams, stream_name, None)
+        # `stream is not None`, NOT `stream`: DataStream.__bool__ is len(ids) > 0,
+        # so a stream whose cardinality is only known at runtime (e.g. RFdiffusion3's
+        # sequences for a multi-chain design, or anything downstream of it) reads as
+        # falsy and gets reported as having no map_table when it has a perfectly good
+        # one. Emptiness at config time is not absence.
+        if stream is not None and hasattr(stream, 'map_table') and stream.map_table:
+            return [_source_entry(stream)]
+        raise ValueError(f"Source for '{stream_name}' stream must have {stream_name} with map_table")
+    raise ValueError(f"Cannot extract source paths from {type(source)} for stream '{stream_name}'")
+
+
+def _grouped_source_entries(value: 'Grouped', stream_name: str) -> List[Dict[str, Any]]:
+    """Source entries for a Grouped axis, each tagged with where its group keys live.
+
+    ``group_by`` is the group stream's map_table and ``group_ids`` its id patterns; the
+    runtime loader reads the keys from there and matches the member rows against them.
+    """
+    group_stream = value.resolve_groups(stream_name)
+    if not group_stream.map_table:
+        raise ValueError(
+            f"Grouped(...): the group stream '{group_stream.name}' has no map_table, so its "
+            f"keys cannot be read at runtime")
+    group_entry = _source_entry(group_stream)
+    entries = []
+    for entry in _extract_source_entries(value.source, stream_name):
+        entries.append({**entry,
+                        "group_by": group_entry["path"],
+                        "group_ids": list(group_entry.get("ids") or [])})
+    return entries
+
+
+def _extract_source_paths(source: Any, stream_name: str) -> List[str]:
+    """
+    Extract CSV file paths from a source (StandardizedOutput, ToolOutput, DataStream, etc.).
+
+    Args:
+        source: The source object to extract paths from
+        stream_name: Which stream to extract ("sequences", "compounds", "structures")
+
+    Returns list of paths to CSV files containing the data.
+    """
+    if source is None:
+        return []
+
+    # Direct path string
+    if isinstance(source, str):
+        if source.endswith('.csv'):
+            return [source]
+        return []
+
+    # List of sources
+    if isinstance(source, list):
+        paths = []
+        for item in source:
+            paths.extend(_extract_source_paths(item, stream_name))
+        return paths
+
+    # DataStream - use map_table path
+    if hasattr(source, 'map_table') and hasattr(source, 'ids'):
+        if source.map_table:
+            return [source.map_table]
+        raise ValueError(f"DataStream for stream '{stream_name}' has no map_table")
+
+    # StandardizedOutput - use stream_name to determine which DataStream to use
+    if hasattr(source, 'streams'):
+        stream = getattr(source.streams, stream_name, None)
+        # `stream is not None`, NOT `stream`: DataStream.__bool__ is len(ids) > 0,
+        # so a stream whose cardinality is only known at runtime (e.g. RFdiffusion3's
+        # sequences for a multi-chain design, or anything downstream of it) reads as
+        # falsy and gets reported as having no map_table when it has a perfectly good
+        # one. Emptiness at config time is not absence.
+        if stream is not None and hasattr(stream, 'map_table') and stream.map_table:
+            return [stream.map_table]
+        raise ValueError(f"Source for '{stream_name}' stream must have {stream_name} with map_table")
+
+    raise ValueError(f"Cannot extract source paths from {type(source)} for stream '{stream_name}'")
+
+
+def _unwrap_sources(value: Any, stream_name: str) -> tuple:
+    """
+    Unwrap Bundle/Each wrappers and return (mode, sources).
+
+    Args:
+        value: The value to unwrap (already unpacked from tuple convention)
+        stream_name: Which stream to extract ("sequences", "compounds", "structures")
+
+    Returns:
+        (mode: str, sources: list) where mode is "bundle" or "each"
+        sources is a list of dicts: [{"path": str, "iterate": bool, "ids"?: [...]}]
+
+    Each source carries the stream's expanded ``ids`` so a filtered upstream
+    stream contributes only its selected ids; runtime consumers intersect the
+    source CSV rows with these ids.
+
+    For Bundle(Each(library), cofactor):
+    - mode = "bundle" (preserves the bundle semantics)
+    - Each sources marked iterate=True
+    - Bare sources marked iterate=False
+    """
+    if isinstance(value, Grouped):
+        return ("each", [{**entry, "iterate": True}
+                         for entry in _grouped_source_entries(value, stream_name)])
+
+    if isinstance(value, Bundle):
+        sources_with_iterate = []
+        order = 0
+        for src in value.sources:
+            if isinstance(src, Grouped):
+                # Grouped inside Bundle - iterated, one output per group
+                for entry in _grouped_source_entries(src, stream_name):
+                    sources_with_iterate.append({**entry, "iterate": True, "order": order})
+                    order += 1
+            elif isinstance(src, Each):
+                # Each inside Bundle - these are iterated
+                for sub_src in src.sources:
+                    for entry in _extract_source_entries(sub_src, stream_name):
+                        sources_with_iterate.append({**entry, "iterate": True, "order": order})
+                        order += 1
+            else:
+                # Bare source inside Bundle - static (bundled with each iteration)
+                for entry in _extract_source_entries(src, stream_name):
+                    sources_with_iterate.append({**entry, "iterate": False, "order": order})
+                    order += 1
+
+        return ("bundle", sources_with_iterate)
+
+    elif isinstance(value, Each):
+        # Each iterates - all sources are iterated
+        sources_with_iterate = []
+        for src in value.sources:
+            if isinstance(src, Grouped):
+                sources_with_iterate.extend(
+                    {**entry, "iterate": True}
+                    for entry in _grouped_source_entries(src, stream_name))
+                continue
+            for entry in _extract_source_entries(src, stream_name):
+                sources_with_iterate.append({**entry, "iterate": True})
+        return ("each", sources_with_iterate)
+
+    elif isinstance(value, list):
+        # Bare list defaults to Each - all iterated
+        sources_with_iterate = []
+        for item in value:
+            if isinstance(item, (Bundle, Each)):
+                _, sub_sources = _unwrap_sources(item, stream_name)
+                sources_with_iterate.extend(sub_sources)
+            elif isinstance(item, Grouped):
+                sources_with_iterate.extend(
+                    {**entry, "iterate": True}
+                    for entry in _grouped_source_entries(item, stream_name))
+            else:
+                for entry in _extract_source_entries(item, stream_name):
+                    sources_with_iterate.append({**entry, "iterate": True})
+        return ("each", sources_with_iterate)
+
+    else:
+        # Bare value defaults to Each - iterated
+        sources_with_iterate = []
+        for entry in _extract_source_entries(value, stream_name):
+            sources_with_iterate.append({**entry, "iterate": True})
+        return ("each", sources_with_iterate)
+
+
+def generate_combinatorics_config(
+    output_path: str,
+    **named_inputs: Any
+) -> CombinatoricsConfig:
+    """
+    Generate combinatorics config file from named inputs.
+
+    This is the main entry point called by tools.
+
+    Args:
+        output_path: Path to write the config JSON file
+        **named_inputs: Named inputs — each value is either a bare value or
+                       a (value, stream_name) tuple. The key is the alias
+                       (used for provenance column naming).
+                       e.g., proteins=(lmpnn, "sequences"), ligands=(compounds, "compounds")
+
+    Returns:
+        CombinatoricsConfig object (also saved to output_path)
+
+    Example:
+        generate_combinatorics_config(
+            "config.json",
+            proteins=(lmpnn, "sequences", "protein"),
+            ligands=(Bundle(compounds), "compounds", "ligand")
+        )
+    """
+    axes = {}
+    for name, raw_value in named_inputs.items():
+        actual_value, stream_name, entity_type = _unpack_input(name, raw_value)
+        if actual_value is None:
+            continue
+        mode, sources = _unwrap_sources(actual_value, stream_name)
+        axes[name] = AxisConfig(name=name, mode=mode, sources=sources, entity_type=entity_type)
+
+    config = CombinatoricsConfig(axes=axes)
+
+    # Compute and store predicted IDs and provenance.
+    # Non-critical: pipe script can still re-compute at execution time.
+    try:
+        predicted_ids, provenance = predict_output_ids_with_provenance(**named_inputs)
+        config.predicted_ids = predicted_ids
+        config.provenance = provenance
+    except (ValueError, KeyError, TypeError, FileNotFoundError) as e:
+        warnings.warn(
+            f"generate_combinatorics_config: could not pre-compute predicted IDs "
+            f"for {output_path} ({type(e).__name__}: {e}). "
+            f"IDs will be re-computed at execution time."
+        )
+
+    config.save(output_path)
+    return config
+
+
+def is_combinatorics_wrapper(value: Any) -> bool:
+    """Check if a value is wrapped in Bundle, Each or Grouped."""
+    return isinstance(value, (Bundle, Each, Grouped))
+
+
+def contains_combinatorics_wrapper(value: Any) -> bool:
+    """Check if a value contains any Bundle, Each or Grouped wrappers."""
+    if isinstance(value, (Bundle, Each, Grouped)):
+        return True
+    if isinstance(value, list):
+        return any(contains_combinatorics_wrapper(item) for item in value)
+    return False
+
+
+def get_mode(value: Any) -> str:
+    """
+    Get the combinatorics mode for a value.
+
+    Returns "bundle" if wrapped in Bundle, "each" otherwise.
+    """
+    if isinstance(value, Bundle):
+        return "bundle"
+    return "each"
+
+
+def load_ids_from_sources(sources: List[Union[str, Dict]], iterate_only: bool = False) -> List[str]:
+    """
+    Select source ids by reading each source map_table as the source of truth.
+
+    Each source's ``ids`` (if present) are patterns that *select* among the
+    actual rows (:func:`id_patterns.select_ids`); a source without ``ids`` takes
+    every row. The map_table must exist, so this runs at execution time.
+
+    Args:
+        sources: List of CSV file paths or dicts with {"path": str, "iterate": bool, "ids"?: [...]}
+        iterate_only: If True, only load IDs from sources with iterate=True
+
+    Returns:
+        List of selected ids in row order.
+    """
+    import pandas as pd
+    try:
+        from . import id_patterns
+    except ImportError:
+        import id_patterns
+
+    all_ids = []
+    for source in sources:
+        # Handle both string and dict formats
+        if isinstance(source, dict):
+            source_path = source.get("path")
+            is_iterate = source.get("iterate", True)
+            if iterate_only and not is_iterate:
+                continue
+        else:
+            source_path = source
+
+        if not source_path or not os.path.exists(source_path):
+            continue
+        patterns = source.get("ids") if isinstance(source, dict) else None
+        try:
+            df = pd.read_csv(source_path, dtype={'id': str})
+            if 'id' in df.columns:
+                row_ids = [str(v) for v in df['id'].tolist()]
+                if patterns:
+                    all_ids.extend(id_patterns.select_ids([str(p) for p in patterns], row_ids))
+                else:
+                    all_ids.extend(row_ids)
+        except Exception as e:
+            print(f"Warning: Could not load IDs from {source_path}: {e}")
+    return all_ids
+
+
+def _collect_iterated_ids_from_value(value: Any, stream_name: str, iterate_only: bool = False) -> List[str]:
+    """
+    Collect iterated IDs from a value, handling Bundle/Each wrappers.
+
+    For Each(a, b), collects IDs from both a and b.
+    For Bundle(Each(library), cofactor), collects IDs from the Each (library) only.
+    For Bundle(cofactor, Each(library)), finds the Each and collects its IDs only.
+    For pure Bundle(a, b), collects IDs from all sources (single bundled config).
+
+    Args:
+        value: A value that may be wrapped in Bundle/Each (already unpacked from tuple)
+        stream_name: Which stream to access ("sequences", "compounds", "structures")
+        iterate_only: If True, only collect IDs from iterated sources (used for Bundle mode)
+
+    Returns:
+        List of all IDs from the relevant sources
+    """
+    def get_ids_from_source(src: Any) -> List[str]:
+        """Get IDs from a single unwrapped source."""
+        if hasattr(src, 'streams'):
+            stream = getattr(src.streams, stream_name, None)
+            if stream:
+                return list(stream.ids)
+        if hasattr(src, 'ids') and hasattr(src, 'map_table'):
+            # Bare DataStream passed directly (e.g. a filtered .filter_by_ids() view)
+            return list(src.ids)
+        if isinstance(src, str):
+            return [stream_name]
+        return []
+
+    if isinstance(value, Grouped):
+        # The axis iterates groups, so its ids are the group keys.
+        return list(value.resolve_groups(stream_name).ids)
+
+    if isinstance(value, Bundle):
+        # Check if there's an Each/Grouped inside - if so, only collect IDs from those
+        has_each_inside = any(isinstance(src, (Each, Grouped)) for src in value.sources)
+
+        if has_each_inside:
+            # Collect IDs only from the iterated sources
+            all_ids = []
+            for src in value.sources:
+                if isinstance(src, Grouped):
+                    all_ids.extend(_collect_iterated_ids_from_value(src, stream_name))
+                elif isinstance(src, Each):
+                    for each_src in src.sources:
+                        all_ids.extend(_collect_iterated_ids_from_value(each_src, stream_name))
+            return all_ids
+        else:
+            # Pure Bundle - return unique IDs from all sources (order-preserving)
+            all_ids = []
+            for src in value.sources:
+                for id_ in _collect_iterated_ids_from_value(src, stream_name):
+                    if id_ not in all_ids:
+                        all_ids.append(id_)
+            return all_ids
+
+    elif isinstance(value, Each):
+        # Collect IDs from all sources in the Each
+        all_ids = []
+        for src in value.sources:
+            all_ids.extend(_collect_iterated_ids_from_value(src, stream_name))
+        return all_ids
+
+    else:
+        # Bare value - get IDs directly
+        return get_ids_from_source(value)
+
+
+def _collect_static_ids_from_value(value: Any, stream_name: str) -> Tuple[List[str], bool]:
+    """
+    For Bundle with nested Each, collect IDs from non-Each (static) sources.
+
+    Returns:
+        (static_ids, static_first):
+        - static_ids: IDs from bare/static sources inside the Bundle
+        - static_first: True if static sources appear before the Each in the Bundle
+    """
+    if not isinstance(value, Bundle):
+        return [], False
+    has_each = any(isinstance(src, (Each, Grouped)) for src in value.sources)
+    if not has_each:
+        return [], False  # Pure bundle — no static/iterated split
+    static_ids = []
+    for src in value.sources:
+        if not isinstance(src, (Each, Grouped)):
+            ids = _collect_iterated_ids_from_value(src, stream_name)
+            for id_ in ids:
+                if id_ not in static_ids:
+                    static_ids.append(id_)
+    # static_first: True if first non-Each source comes before first Each
+    static_first = False
+    for src in value.sources:
+        if isinstance(src, (Each, Grouped)):
+            break
+        else:
+            static_first = True
+            break
+    return static_ids, static_first
+
+
+def _collect_axes_info(
+    **named_inputs: Any
+) -> Tuple[List[tuple], List[tuple], List[tuple]]:
+    """
+    Collect axis info from named inputs and classify into iterated/pure_bundle.
+
+    Each named_input value can be a bare value or a (value, stream_name) tuple.
+    The key (name) is preserved as the provenance column alias.
+
+    Returns:
+        (axes_info, iterated_axes, pure_bundle_axes) where:
+        - axes_info: [(name, mode, has_iteration, ids, static_ids, static_first), ...]
+        - iterated_axes: [(name, ids, static_ids, static_first), ...] for axes with iteration
+        - pure_bundle_axes: [(name, ids), ...] for pure bundle axes
+    """
+    axes_info = []
+    for name, raw_value in named_inputs.items():
+        actual_value, stream_name, _entity_type = _unpack_input(name, raw_value)
+        if actual_value is None:
+            continue
+        mode, sources = _unwrap_sources(actual_value, stream_name)
+        has_iteration = any(s.get("iterate", True) for s in sources)
+        ids = _collect_iterated_ids_from_value(actual_value, stream_name)
+        static_ids, static_first = _collect_static_ids_from_value(actual_value, stream_name)
+        if not ids:
+            raise ValueError(f"No {name} found in input")
+        axes_info.append((name, mode, has_iteration, ids, static_ids, static_first))
+
+    iterated_axes = [(name, ids, static_ids, static_first)
+                     for name, mode, has_iteration, ids, static_ids, static_first in axes_info
+                     if mode == "each" or has_iteration]
+    pure_bundle_axes = [(name, ids)
+                        for name, mode, has_iteration, ids, static_ids, static_first in axes_info
+                        if mode == "bundle" and not has_iteration]
+
+    return axes_info, iterated_axes, pure_bundle_axes
+
+
+def predict_output_ids_with_provenance(
+    **named_inputs: Any
+) -> Tuple[List[str], Dict[str, List[str]]]:
+    """
+    Predict output IDs AND provenance mapping.
+
+    ID generation always uses the full cartesian product of iterated axes
+    joined with "+". The "+" separator is distinct from "_" which is reserved
+    for parent→child suffixes (e.g., protein_1, protein_2). This ensures that
+    multi-axis IDs like "prot1+lig1" are not confused with suffix patterns,
+    and id_map_utils can correctly match each component independently.
+
+    Provenance columns track which input from each axis contributed to each
+    output, enabling downstream joins on any axis.
+
+    Each named_input value can be:
+    - A bare value: the key serves as both alias and stream name
+    - A (value, stream_name) tuple: key is alias (provenance column name),
+      stream_name tells which stream to extract IDs from
+
+    Returns:
+        (output_ids, provenance) where provenance keys are the input aliases:
+        {alias: [input_id_for_output_0, input_id_for_output_1, ...]}
+
+    Example with 2 proteins x 3 ligands:
+        predict_output_ids_with_provenance(
+            proteins=(prot_source, "sequences"),
+            ligands=(lig_source, "compounds")
+        )
+        output_ids = ["prot1+lig1", "prot1+lig2", "prot1+lig3",
+                      "prot2+lig1", "prot2+lig2", "prot2+lig3"]
+        provenance = {
+            "proteins": ["prot1", "prot1", "prot1", "prot2", "prot2", "prot2"],
+            "ligands": ["lig1", "lig2", "lig3", "lig1", "lig2", "lig3"]
+        }
+    """
+    if not named_inputs:
+        raise ValueError("predict_output_ids_with_provenance requires at least one named input")
+
+    axes_info, iterated_axes, pure_bundle_axes = _collect_axes_info(
+        **named_inputs
+    )
+
+    # If no iterated axes, return single ID from unique bundle IDs
+    if not iterated_axes:
+        provenance = {}
+        all_unique_parts = []
+        seen_all = set()
+        for name, ids in pure_bundle_axes:
+            bundled_value = "+".join(ids)
+            provenance[name] = [bundled_value]
+            if len(ids) > 1:
+                for i, bid in enumerate(ids, start=1):
+                    provenance[f"{name}.{i}"] = [bid]
+            for bid in ids:
+                if bid not in seen_all:
+                    seen_all.add(bid)
+                    all_unique_parts.append(bid)
+        output_name = "+".join(all_unique_parts)
+        return [output_name], provenance
+
+    # Build prefix from pure bundle axes (unique IDs only, order-preserving)
+    bundle_prefix_parts = []
+    for _, bundle_ids in pure_bundle_axes:
+        seen_b = set()
+        for bid in bundle_ids:
+            if bid not in seen_b:
+                seen_b.add(bid)
+                bundle_prefix_parts.append(bid)
+    bundle_prefix = "+".join(bundle_prefix_parts) if bundle_prefix_parts else ""
+
+    # If single iterated axis, return its IDs (with bundle prefix if any)
+    if len(iterated_axes) == 1:
+        iter_name, iter_ids, iter_static_ids, iter_static_first = iterated_axes[0]
+        # Apply static IDs from Bundle(Each(...), static) pattern
+        if iter_static_ids:
+            static_part = "+".join(iter_static_ids)
+            if iter_static_first:
+                output_ids = [f"{static_part}+{iid}" for iid in iter_ids]
+            else:
+                output_ids = [f"{iid}+{static_part}" for iid in iter_ids]
+        else:
+            output_ids = list(iter_ids)
+        if bundle_prefix:
+            output_ids = [f"{bundle_prefix}+{oid}" for oid in output_ids]
+        provenance = {iter_name: list(iter_ids)}
+        # Add pure bundle axes: repeat a joined representation for every output
+        for bundle_name, bundle_ids in pure_bundle_axes:
+            bundled_value = "+".join(bundle_ids)
+            provenance[bundle_name] = [bundled_value] * len(iter_ids)
+            if len(bundle_ids) > 1:
+                for i, bid in enumerate(bundle_ids, start=1):
+                    provenance[f"{bundle_name}.{i}"] = [bid] * len(iter_ids)
+        return output_ids, provenance
+
+    # Multiple iterated axes: always full cartesian product, no shortcuts
+    # Start with first axis — apply static IDs per axis
+    first_name, first_ids, first_static_ids, first_static_first = iterated_axes[0]
+    output_ids = list(first_ids)
+    provenance = {first_name: list(first_ids)}
+
+    # Apply static IDs for first axis
+    if first_static_ids:
+        static_part = "+".join(first_static_ids)
+        if first_static_first:
+            output_ids = [f"{static_part}+{oid}" for oid in output_ids]
+        else:
+            output_ids = [f"{oid}+{static_part}" for oid in output_ids]
+
+    for axis_name, axis_ids, axis_static_ids, axis_static_first in iterated_axes[1:]:
+        new_ids = []
+        new_provenance = {k: [] for k in provenance}
+        new_provenance[axis_name] = []
+        # Prepare axis IDs with their static parts
+        if axis_static_ids:
+            static_part = "+".join(axis_static_ids)
+            if axis_static_first:
+                display_ids = [f"{static_part}+{aid}" for aid in axis_ids]
+            else:
+                display_ids = [f"{aid}+{static_part}" for aid in axis_ids]
+        else:
+            display_ids = list(axis_ids)
+        for i, existing_id in enumerate(output_ids):
+            for j, new_id in enumerate(display_ids):
+                new_ids.append(f"{existing_id}+{new_id}")
+                for k in provenance:
+                    new_provenance[k].append(provenance[k][i])
+                new_provenance[axis_name].append(axis_ids[j])
+        output_ids = new_ids
+        provenance = new_provenance
+
+    # Prepend bundle prefix to output IDs
+    if bundle_prefix:
+        output_ids = [f"{bundle_prefix}+{oid}" for oid in output_ids]
+
+    # Add pure bundle axes: repeat a joined representation for every output
+    for bundle_name, bundle_ids in pure_bundle_axes:
+        bundled_value = "+".join(bundle_ids)
+        provenance[bundle_name] = [bundled_value] * len(output_ids)
+        if len(bundle_ids) > 1:
+            for i, bid in enumerate(bundle_ids, start=1):
+                provenance[f"{bundle_name}.{i}"] = [bid] * len(output_ids)
+
+    return output_ids, provenance
+
+
+def predict_output_ids(
+    **named_inputs: Any
+) -> List[str]:
+    """
+    Predict the output IDs that will be generated by combinatorics.
+
+    This function is called at configuration time to predict what structure IDs
+    will be generated at execution time based on the combinatorics modes.
+
+    The ID generation follows these rules:
+    - If all axes are fully bundled (no iterate sources): single ID from unique bundled IDs joined with "+"
+    - If one axis has iteration (each mode or bundle with iterate sources): IDs from that axis
+    - If multiple axes have iteration: cartesian product of IDs joined with "+"
+
+    Args:
+        **named_inputs: Named inputs, each may be wrapped in Bundle/Each or bare
+
+    Returns:
+        List of expected output IDs
+    """
+    output_ids, _ = predict_output_ids_with_provenance(**named_inputs)
+    return output_ids
+
+
+def predict_single_output_id(
+    **axis_selections: Tuple[str, List[str], Optional[int], List[str], bool]
+) -> str:
+    """
+    Predict the output ID for a single combination of axis selections.
+
+    Used by pipe scripts at execution time in their iteration loops.
+
+    This mirrors predict_output_ids() logic but for a single output row,
+    ensuring pipeline-time and SLURM-time ID generation always agree.
+
+    Always uses full cartesian naming (all iterated axes joined with "+"),
+    no shortcuts based on axis length.
+
+    Args:
+        **axis_selections: Named tuples of (mode, all_ids, selected_idx, static_ids, static_first)
+            where selected_idx is None for bundle mode (no iteration)
+
+    Returns:
+        Single output ID string
+
+    Example:
+        predict_single_output_id(
+            sequences=("each", ["prot1", "prot2"], 0, [], False),
+            compounds=("each", ["lig1", "lig2", "lig3"], 1, [], False)
+        )
+        → "prot1+lig2"
+    """
+    # A pipe script loads this module standalone via sys.path, where a relative import has no package.
+    try:
+        from .idset import AXIS_MODES, IdSet, compose_axes
+    except ImportError:
+        import os
+        import sys
+        sys.path.append(os.path.dirname(__file__))
+        from idset import AXIS_MODES, IdSet, compose_axes
+
+    axes = []
+    for name, (mode, all_ids, idx, static_ids, static_first) in axis_selections.items():
+        if mode not in AXIS_MODES:
+            # A misspelling used to fall through to the iterated branch and quietly pick one id.
+            raise ValueError(
+                f"Axis {name!r} has unknown mode {mode!r}; expected one of {AXIS_MODES}")
+        if mode == "bundle" and idx is None:
+            axes.append((IdSet(all_ids), "bundle"))
+            continue
+        selected = all_ids[idx if idx is not None else 0]
+        axes.append((IdSet([selected]), "each", IdSet(static_ids or []), bool(static_first)))
+
+    composed = compose_axes(axes)
+    if not composed:
+        raise ValueError("predict_single_output_id requires at least one axis with IDs")
+    return composed[0]
+
+
+def _idset_module():
+    """The idset module, imported on first use: a pipe script loads this one standalone, where a relative import has no package."""
+    try:
+        from . import idset
+    except ImportError:
+        import sys
+        sys.path.append(os.path.dirname(__file__))
+        import idset
+    return idset
+
+
+def join_axis_ids(parts: List[Any]) -> str:
+    """One output id from the ids its axes contributed, in axis order, joined by the axis separator.
+
+    For a tool whose axes are not input streams (Fuse: slots and junction lengths), where predict_single_output_id has no stream to select from. The config-time predictor and the runtime script both call this, so the separator is written once.
+
+    Example:
+        join_axis_ids(["donor", 3, "cam"]) -> "donor+3+cam"
+    """
+    if not parts:
+        raise ValueError("join_axis_ids requires at least one part")
+    return _idset_module().AXIS_SEPARATOR.join(str(part) for part in parts)
+
+
+def predict_single_provenance(
+    **axis_selections: Tuple[str, List[str], Optional[int], List[str], bool]
+) -> Dict[str, str]:
+    """Provenance of one output row, one value per axis, as predict_output_ids_with_provenance records it.
+
+    Takes the same (mode, all_ids, selected_idx, static_ids, static_first) tuples as predict_single_output_id, so a pipe script that composes a row's id from them gets that row's provenance from the same selections.
+    An iterated axis contributes the id it selected, without its static companions. A bundled axis contributes its ids joined by the axis separator and, when it holds more than one, each member under "<axis>.<position>" (1-based). A bundled axis with no ids left contributes an empty cell, since predict_single_output_id accepts it too.
+
+    Example:
+        predict_single_provenance(
+            sequences=("each", ["p1", "p2"], 1, [], False),
+            ligands=("bundle", ["l1", "l2"], None, [], False)
+        )
+        -> {"sequences": "p2", "ligands": "l1+l2", "ligands.1": "l1", "ligands.2": "l2"}
+    """
+    axis_modes = _idset_module().AXIS_MODES
+    provenance = {}
+    for name, (mode, all_ids, idx, _static_ids, _static_first) in axis_selections.items():
+        if mode not in axis_modes:
+            raise ValueError(f"Axis {name!r} has unknown mode {mode!r}; expected one of {axis_modes}")
+        if mode == "bundle" and idx is None:
+            # An axis whose members were all filtered upstream contributes an empty cell, as predict_single_output_id has it.
+            provenance[name] = join_axis_ids(all_ids) if all_ids else ""
+            if len(all_ids) > 1:
+                for position, member in enumerate(all_ids, start=1):
+                    provenance[f"{name}.{position}"] = member
+        else:
+            provenance[name] = all_ids[idx if idx is not None else 0]
+    return provenance
+
+
+def assemble_provenance_id(
+    template_id: str,
+    axis_source_ids: List[str],
+    raw_indices: List[int],
+) -> str:
+    """Assemble a stitched output id that carries its own per-axis provenance.
+
+    Tool-output axes contribute their full matched source id, joined with "+"
+    (the multi-axis separator id_map_utils splits on first). Raw literal axes
+    have no source id, so their 1-based indices are appended as a "_"-tail.
+
+    With no tool-output axes the result is the classic "<template>_<i>_<j>";
+    with no raw axes it is the pure "+"-joined block. Single source of truth so
+    the runtime and the config-time predictor cannot drift.
+    """
+    base = "+".join(axis_source_ids) if axis_source_ids else template_id
+    if raw_indices:
+        base = base + "_" + "_".join(str(i) for i in raw_indices)
+    return base
+
+
+def generate_multiplied_ids(
+    input_ids: List[str],
+    suffixes: List[str],
+    input_stream_name: str = ""
+) -> Tuple[List[str], Dict[str, List[str]]]:
+    """
+    Generate output IDs by appending suffixes to each input ID.
+
+    Args:
+        input_ids: Parent IDs to multiply
+        suffixes: Suffixes to append (e.g., ["1","2","3"] or ["50A","50V"])
+        input_stream_name: Name of the input stream for provenance tracking
+
+    Returns:
+        (output_ids, provenance) where provenance maps input_stream_name
+        to the parent ID for each output.
+
+    Example:
+        generate_multiplied_ids(
+            ["prot_1", "prot_2"],
+            ["1", "2", "3"],
+            input_stream_name="structures"
+        )
+        -> (["prot_1_1", "prot_1_2", "prot_1_3", "prot_2_1", "prot_2_2", "prot_2_3"],
+           {"structures": ["prot_1", "prot_1", "prot_1", "prot_2", "prot_2", "prot_2"]})
+    """
+    output_ids = []
+    parent_ids = []
+    for parent_id in input_ids:
+        for suffix in suffixes:
+            output_ids.append(f"{parent_id}_{suffix}")
+            parent_ids.append(parent_id)
+
+    provenance = {}
+    if input_stream_name:
+        provenance[input_stream_name] = parent_ids
+
+    return output_ids, provenance
+
+
+def ranked_id(parent_id: str, rank: int) -> str:
+    """The id of the ``rank``-th pose of ``parent_id``: ``<parent>_rank<rank>``, ranks counted from 1.
+
+    Docking tools multiply each pair id by a rank suffix. The declared ids and the ids written at execution time both come from here, so they cannot drift. The parent is the whole pair id (``prot+lig``); the suffix is appended and never parsed back.
+    """
+    if rank < 1:
+        raise ValueError(f"rank must be at least 1, got {rank}")
+    ids, _ = generate_multiplied_ids([parent_id], [f"rank{rank}"])
+    return ids[0]
+
+
+def numbered_id(prefix: str, number: int, width: int = 3) -> str:
+    """The id of the ``number``-th member of a generated set: ``<prefix>_<number>``, zero-padded to ``width`` digits.
+
+    A tool that invents its sequences from tables rather than from a parent stream names them by a prefix and a running number. The declared ids and the ids written at execution time both come from here, so they cannot drift. The prefix is never empty: a default has to be chosen once, where it can be declared.
+    """
+    if not prefix:
+        raise ValueError("numbered_id needs a prefix; the caller resolves its default")
+    ids, _ = generate_multiplied_ids([prefix], [f"{number:0{width}d}"])
+    return ids[0]
+
+
+def generate_multiplied_ids_pattern(
+    input_ids: List[str],
+    suffix_pattern: str,
+    input_stream_name: str = ""
+) -> List[str]:
+    """
+    Compose patterns: append suffix pattern to each input ID.
+
+    Returns pattern-based IDs (not expanded).
+
+    Args:
+        input_ids: Parent IDs (may contain patterns, e.g., ["5HG6_<0..4>"])
+        suffix_pattern: Pattern suffix (e.g., "<1..3>" or "<42A 42V>")
+        input_stream_name: Unused here but kept for API consistency
+
+    Returns:
+        Pattern-based IDs (e.g., ["5HG6_<0..4>_<1..3>"])
+
+    Example:
+        generate_multiplied_ids_pattern(
+            ["5HG6_<0..4>"], "<1..3>"
+        )
+        -> ["5HG6_<0..4>_<1..3>"]
+    """
+    return [f"{parent}_{suffix_pattern}" for parent in input_ids]
+
+
+def prefixed_parent_key(parent: str, key_prefix: str = "") -> str:
+    """The key a multiplier tool names one parent's outputs by: ``<key_prefix>_<parent>``, or the bare parent."""
+    return f"{key_prefix}_{parent}" if key_prefix else parent
+
+
+def recounted_id(prefix: str, numbering: Dict[Tuple[int, str], str], pool_idx: int, original_id: str) -> str:
+    """The id a pooled row gets under Pool's ``recount_prefix``: ``<prefix>_<n>``, n counting the distinct (run, original id) pairs in order of first use.
+
+    A pair keeps its number in every stream and table of the pool, so a row a stream lacks (an id an upstream step filtered) leaves a gap there instead of shifting every later id, and `missing` names the same row as the other tables.
+    ``numbering`` is the caller's running dict: the configuration step fills it from the declared ids and writes it to the pool config, and ``pipe_pool.py`` starts from it and extends it with any pair it finds that was not declared.
+    """
+    key = (int(pool_idx), str(original_id))
+    if key not in numbering:
+        numbering[key] = f"{prefix}_{len(numbering) + 1}"
+    return numbering[key]
+
+
+def multiplied_id_parents(
+    parent_ids: List[str],
+    suffix_pattern: str,
+    key_prefix: str = ""
+) -> Dict[str, str]:
+    """
+    Map every concrete id a multiplier tool makes to the parent it was made from.
+
+    The ids are exactly those ``generate_multiplied_ids_pattern`` declares at configuration time, expanded, so a pipe script that calls this with the parents that exist at runtime cannot drift from the declared ids.
+    Provenance is then looked up by exact id, never recovered by stripping a suffix off the output id.
+
+    Args:
+        parent_ids: Concrete parent ids (a lazy parent must be resolved first).
+        suffix_pattern: Suffix pattern appended to each parent (e.g., "<1..3>").
+        key_prefix: For a tool that names its outputs ``<key_prefix>_<parent>_<n>`` while the parent stays the bare input id.
+
+    Example:
+        multiplied_id_parents(["5HG6_1"], "<1..2>")
+        -> {"5HG6_1_1": "5HG6_1", "5HG6_1_2": "5HG6_1"}
+    """
+    try:
+        from . import id_patterns
+    except ImportError:
+        import id_patterns
+
+    parents = {}
+    for parent in parent_ids:
+        key = prefixed_parent_key(parent, key_prefix)
+        for output_id in id_patterns.expand_ids(generate_multiplied_ids_pattern([key], suffix_pattern)):
+            parents[output_id] = parent
+    return parents

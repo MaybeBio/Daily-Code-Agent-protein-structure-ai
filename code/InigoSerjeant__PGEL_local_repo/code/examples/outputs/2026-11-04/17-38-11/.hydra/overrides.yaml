@@ -1,0 +1,5 @@
+- inference.input_pdb=input_pdbs/5UDC_H_renumbered.pdb
+- inference.output_prefix=example_outputs/pgel_train
+- contigmap.contigs=[H103-112]
+- inference.num_designs=1
+- inference.inversion_train=True

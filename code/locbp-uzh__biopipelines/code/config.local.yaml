@@ -1,0 +1,113 @@
+# BioPipelines Configuration — Local / laptop variant
+# Loaded as `config.local.yaml`. Selected explicitly via
+# `Pipeline(config="local")`, or auto-detected when the current Unix user
+# matches `machine.username` below.
+#
+# This variant targets a developer laptop: no SLURM, no GPU mappings, no
+# container executor, no env-manager activation (pip mode means the
+# generated bash emits empty shell-hook / activate lines, so pipeline.sh
+# runs on any host with python on PATH).
+#
+# Placeholders such as <biopipelines>, <biopipelines_output> are resolved
+# by FolderManager against folders.base entries below.
+
+
+# Machine / Site Configuration — no SLURM, no GPU mappings, no env manager
+# activation (pip mode means the generated bash emits empty shell-hook /
+# activate lines, so pipeline.sh runs on any host with python on PATH).
+machine:
+  # Set this to your laptop's Unix username to have the loader auto-detect
+  # this variant when you run on your own machine. Leave empty to force
+  # explicit selection via Pipeline(config="local").
+  username: ""
+  email: ""
+  env_manager:
+    name: "pip"
+    init: []
+  scheduler:
+    name: "none"
+    init: []
+    modules: []
+  container_executor: "none"
+folders:
+  base:
+    home: "."
+    data: "."
+    scratch: "."
+    biopipelines: "<cwd>"
+    biopipelines_output: "./outputs"
+
+  infrastructure:
+    pipe_scripts: "<biopipelines>/pipe_scripts"
+    scripts: "<biopipelines>/my_scripts"
+    pdbs: "<biopipelines>/pdbs"
+    ligands: "<biopipelines>/ligands"
+    sequences: "<biopipelines>/sequences"
+    tables: "<biopipelines>/tables"
+    cache: "./cache"
+    containers: "./containers"
+
+  # Installation files. Every tool that reads its checkout as a hard
+  # folders["<Tool>"] subscript must appear here or constructing it raises
+  # KeyError before anything runs. <data> is "." on this variant, so an
+  # install() clones next to the repository.
+  repositories:
+    AlphaFold: "<data>/localcolabfold"
+    DiffDock: "<data>/DiffDock"
+    DynamicBind: "<data>/DynamicBind"
+    ESM2: "<data>/esm2"
+    FLOWR: "<data>/FLOWR"
+    GEMS: "<data>/GEMS"
+    Gnina: "<data>/gnina"
+    IPSAE: "<data>/ipsae"
+    LASErMPNN: "<data>/LASErMPNN"
+    MMseqs2: "<data>/mmseqs"
+    NeuralPLexer: "<data>/NeuralPLexer"
+    PLACER: "<data>/PLACER"
+    PocketGen: "<data>/PocketGen"
+    ProteinMPNN: "<data>/ProteinMPNN"
+    RFD4Proteina: "<data>/rfd4_proteina"
+    RFdiffusion: "<data>/RFdiffusion"
+    RFdiffusion2: "<data>/RFdiffusion2"
+    RFdiffusion3: "<data>/rfdiffusion3"
+    RF3: "<data>/rf3"
+    FoundryMPNN: "<data>/foundry_mpnn"
+    RFdiffusionAllAtom: "<data>/rf_diffusion_all_atom"
+    RTMScore: "<data>/RTMScore"
+
+  cache:
+    BoltzCache: "<cache>/Boltz"
+    ColabFoldDatabases: "<cache>/colabfold_databases"
+    MMseqs2Databases: "<ColabFoldDatabases>"
+    # AF2 params shared by every AF2-consuming tool; its params/ subdir holds
+    # params_model_*.npz.
+    AlphaFoldParams: "<data>/localcolabfold/colabfold"
+
+  server:
+    MMseqs2Server: "<biopipelines_output>/MMseqs2Server"
+
+# Controls how tool outputs are displayed in Jupyter notebooks.
+# Maps stream formats (or stream names) to renderer scripts in the renderers/ folder.
+# Lookup order: stream name first, then format, then _default.
+renderers:
+  streams:
+    _metadata: renderers/streams.py
+    pdb: renderers/structures.py
+    cif: renderers/structures.py
+    "pdb|cif": renderers/structures.py
+    pqr: renderers/structures.py
+    dx: renderers/grids.py
+    png: renderers/images.py
+    jpg: renderers/images.py
+    jpeg: renderers/images.py
+    svg: renderers/images.py
+    gif: renderers/images.py
+    bmp: renderers/images.py
+    tiff: renderers/images.py
+    webp: renderers/images.py
+    plots: renderers/plots.py
+    fasta: renderers/fasta.py
+    fa: renderers/fasta.py
+    _default: renderers/streams.py
+  tables:
+    _default: renderers/tables.py

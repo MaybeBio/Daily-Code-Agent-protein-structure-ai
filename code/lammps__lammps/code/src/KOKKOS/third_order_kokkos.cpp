@@ -1,0 +1,330 @@
+// clang-format off
+/* ----------------------------------------------------------------------
+   LAMMPS - Large-scale Atomic/Molecular Massively Parallel Simulator
+   https://www.lammps.org/, Sandia National Laboratories
+   LAMMPS development team: developers@lammps.org
+
+   Copyright (2003) Sandia Corporation.  Under the terms of Contract
+   DE-AC04-94AL85000 with Sandia Corporation, the U.S. Government retains
+   certain rights in this software.  This software is distributed under
+   the GNU General Public License.
+
+   See the README file in the top-level LAMMPS directory.
+------------------------------------------------------------------------- */
+
+/* ----------------------------------------------------------------------
+   Contributing author: Charlie Sievers (UC Davis), charliesievers at cox.net
+------------------------------------------------------------------------- */
+
+#include "third_order_kokkos.h"
+
+#include "angle.h"
+#include "atom_kokkos.h"
+#include "atom_masks.h"
+#include "bond.h"
+#include "comm.h"
+#include "dihedral.h"
+#include "domain.h"
+#include "force.h"
+#include "improper.h"
+#include "kokkos.h"
+#include "kspace.h"
+#include "fix.h"
+#include "modify.h"
+#include "neighbor.h"
+#include "pair.h"
+#include "timer.h"
+#include "update.h"
+
+using namespace LAMMPS_NS;
+enum{REGULAR,ESKM};
+
+namespace {
+template<class ViewA, class ViewB>
+struct ForceAdder {
+  ViewA a;
+  ViewB b;
+  ForceAdder(const ViewA& a_, const ViewB& b_):a(a_),b(b_) {}
+// NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  void operator() (const int& i) const {
+    a(i,0) += b(i,0);
+    a(i,1) += b(i,1);
+    a(i,2) += b(i,2);
+  }
+};
+}    // namespace
+
+/* ---------------------------------------------------------------------- */
+
+namespace {
+template<class View>
+struct Zero {
+  View v;
+  Zero(const View &v_):v(v_) {}
+// NOLINTNEXTLINE
+  KOKKOS_INLINE_FUNCTION
+  void operator()(const int &i) const {
+    v(i,0) = 0;
+    v(i,1) = 0;
+    v(i,2) = 0;
+  }
+};
+}    // namespace
+
+/* ---------------------------------------------------------------------- */
+
+ThirdOrderKokkos::ThirdOrderKokkos(LAMMPS *lmp) : ThirdOrder(lmp)
+{
+  atomKK = (AtomKokkos *) atom;
+}
+
+/* ---------------------------------------------------------------------- */
+
+void ThirdOrderKokkos::command(int narg, char **arg)
+{
+  atomKK->sync(Host, X_MASK|RMASS_MASK|TYPE_MASK);
+  ThirdOrder::command(narg, arg);
+}
+
+/* ----------------------------------------------------------------------
+   evaluate potential energy and forces
+   may migrate atoms due to reneighboring
+   return new energy, which should include nextra_global dof
+   return negative gradient stored in atom->f
+   return negative gradient for nextra_global dof in fextra
+------------------------------------------------------------------------- */
+
+void ThirdOrderKokkos::update_force()
+{
+
+  lmp->kokkos->auto_sync = 0;
+
+  f_merge_copy = DAT::t_kkacc_1d_3("ThirdOrderKokkos::f_merge_copy",atomKK->k_f.extent(0));
+
+  atomKK->modified(Host,X_MASK);
+  atomKK->sync(Device,X_MASK);
+
+  force_clear();
+
+  neighbor->ago = 0;
+  if ((modify->get_fix_by_id("package_intel")) != nullptr)
+    neighbor->decide();
+
+  if (modify->has_fixes(FixConst::PRE_FORCE)) {
+    modify->pre_force(vflag);
+    timer->stamp(Timer::MODIFY);
+  }
+
+  bool execute_on_host = false;
+  uint64_t datamask_read_host = 0;
+
+  if (pair_compute_flag) {
+    if (force->pair->execution_space==Host ||
+        force->pair->execution_space==HostKK) {
+      execute_on_host  = true;
+      datamask_read_host   |= force->pair->datamask_read;
+    }
+  }
+  if (atomKK->molecular && force->bond)  {
+    if (force->bond->execution_space==Host ||
+        force->bond->execution_space==HostKK) {
+      execute_on_host  = true;
+      datamask_read_host   |= force->bond->datamask_read;
+    }
+  }
+  if (atomKK->molecular && force->angle) {
+    if (force->angle->execution_space==Host ||
+        force->angle->execution_space==HostKK) {
+      execute_on_host  = true;
+      datamask_read_host   |= force->angle->datamask_read;
+    }
+  }
+  if (atomKK->molecular && force->dihedral) {
+    if (force->dihedral->execution_space==Host ||
+        force->dihedral->execution_space==HostKK) {
+      execute_on_host  = true;
+      datamask_read_host   |= force->dihedral->datamask_read;
+    }
+  }
+  if (atomKK->molecular && force->improper) {
+    if (force->improper->execution_space==Host ||
+        force->improper->execution_space==HostKK) {
+      execute_on_host  = true;
+      datamask_read_host   |= force->improper->datamask_read;
+    }
+  }
+  if (kspace_compute_flag) {
+    if (force->kspace->execution_space==Host ||
+        force->kspace->execution_space==HostKK) {
+      execute_on_host  = true;
+      datamask_read_host   |= force->kspace->datamask_read;
+    }
+  }
+
+  // as in VerletKokkos::run()
+
+  if (execute_on_host)
+    atomKK->sync(pair_compute_flag ? force->pair->execution_space : Device,
+                 F_MASK | ENERGY_MASK | VIRIAL_MASK);
+
+  AtomKokkos::ExcludeMask exclude_guard(atomKK,
+    (execute_on_host && !std::is_same_v<LMPHostType,LMPDeviceType>)
+      ? (F_MASK | ENERGY_MASK | VIRIAL_MASK) : 0);
+
+  // when a non-KOKKOS style runs inside a KOKKOS run, enable auto_sync for
+  // the duration of its compute so that any sync()/modified() it triggers
+  // (e.g. via the DomainKokkos x2lamda/lamda2x overrides) writes changes
+  // through to the legacy host arrays the style reads and writes
+
+  if (pair_compute_flag) {
+    int prev_auto_sync = lmp->kokkos->auto_sync;
+    if (!force->pair->kokkosable) lmp->kokkos->auto_sync = 1;
+    atomKK->sync(force->pair->execution_space,force->pair->datamask_read);
+    Kokkos::Timer ktimer;
+    force->pair->compute(eflag,vflag);
+    lmp->kokkos->auto_sync = prev_auto_sync;
+    atomKK->modified(force->pair->execution_space,force->pair->datamask_modify);
+    timer->stamp(Timer::PAIR);
+  }
+
+  if (execute_on_host) {
+    if (pair_compute_flag && force->pair->datamask_modify!=(F_MASK | ENERGY_MASK | VIRIAL_MASK))
+      Kokkos::fence();
+    atomKK->sync_pinned(Host,~(~datamask_read_host|(F_MASK | ENERGY_MASK | VIRIAL_MASK)),1);
+
+    // zero the host-side force buffers before the host styles accumulate into
+    // them, so the merge below does not re-add stale values.  skip this only
+    // when the pair style itself runs on the host, since then the pair force
+    // we want to merge already lives in them.  a /kk/host style accumulates
+    // into the Kokkos host view, a style without KOKKOS support into the
+    // legacy host array behind it, which is a separate allocation whenever the
+    // two need a transform
+
+    if (!pair_compute_flag || (force->pair->execution_space!=Host &&
+        force->pair->execution_space!=HostKK)) {
+      Kokkos::deep_copy(LMPHostType(),atomKK->k_f.view_hostkk(),0.0);
+      atomKK->k_f.modify_hostkk_legacy();
+      if (decltype(atomKK->k_f)::NEED_TRANSFORM)
+        Kokkos::deep_copy(LMPHostType(),atomKK->k_f.view_host(),0.0);
+    }
+  }
+
+  if (atomKK->molecular) {
+    if (force->bond) {
+      int prev_auto_sync = lmp->kokkos->auto_sync;
+      if (!force->bond->kokkosable) lmp->kokkos->auto_sync = 1;
+      atomKK->sync(force->bond->execution_space,force->bond->datamask_read);
+      force->bond->compute(eflag,vflag);
+      lmp->kokkos->auto_sync = prev_auto_sync;
+      atomKK->modified(force->bond->execution_space,force->bond->datamask_modify);
+    }
+    if (force->angle) {
+      int prev_auto_sync = lmp->kokkos->auto_sync;
+      if (!force->angle->kokkosable) lmp->kokkos->auto_sync = 1;
+      atomKK->sync(force->angle->execution_space,force->angle->datamask_read);
+      force->angle->compute(eflag,vflag);
+      lmp->kokkos->auto_sync = prev_auto_sync;
+      atomKK->modified(force->angle->execution_space,force->angle->datamask_modify);
+    }
+    if (force->dihedral) {
+      int prev_auto_sync = lmp->kokkos->auto_sync;
+      if (!force->dihedral->kokkosable) lmp->kokkos->auto_sync = 1;
+      atomKK->sync(force->dihedral->execution_space,force->dihedral->datamask_read);
+      force->dihedral->compute(eflag,vflag);
+      lmp->kokkos->auto_sync = prev_auto_sync;
+      atomKK->modified(force->dihedral->execution_space,force->dihedral->datamask_modify);
+    }
+    if (force->improper) {
+      int prev_auto_sync = lmp->kokkos->auto_sync;
+      if (!force->improper->kokkosable) lmp->kokkos->auto_sync = 1;
+      atomKK->sync(force->improper->execution_space,force->improper->datamask_read);
+      force->improper->compute(eflag,vflag);
+      lmp->kokkos->auto_sync = prev_auto_sync;
+      atomKK->modified(force->improper->execution_space,force->improper->datamask_modify);
+    }
+    timer->stamp(Timer::BOND);
+  }
+
+  if (kspace_compute_flag) {
+    int prev_auto_sync = lmp->kokkos->auto_sync;
+    if (!force->kspace->kokkosable) lmp->kokkos->auto_sync = 1;
+    atomKK->sync(force->kspace->execution_space,force->kspace->datamask_read);
+    force->kspace->compute(eflag,vflag);
+    lmp->kokkos->auto_sync = prev_auto_sync;
+    atomKK->modified(force->kspace->execution_space,force->kspace->datamask_modify);
+    timer->stamp(Timer::KSPACE);
+  }
+
+  if (execute_on_host && !std::is_same_v<LMPHostType,LMPDeviceType>) {
+    if (f_merge_copy.extent(0)<atomKK->k_f.extent(0)) {
+      f_merge_copy = DAT::t_kkacc_1d_3("ThirdOrderKokkos::f_merge_copy",atomKK->k_f.extent(0));
+    }
+    f = atomKK->k_f.view_device();
+
+    // both host copies can hold a contribution: a /kk/host style accumulates
+    // into the Kokkos host view, a style without KOKKOS support into the legacy
+    // host array behind atom->f.  Add the legacy one in and copy through the
+    // Kokkos host view, which is the one that matches f_merge_copy in value
+    // type and layout
+
+    if (decltype(atomKK->k_f)::NEED_TRANSFORM) {
+      auto h_f_kk = atomKK->k_f.view_hostkk();
+      auto h_f_legacy = atomKK->k_f.view_host();
+      Kokkos::parallel_for(Kokkos::RangePolicy<LMPHostType>(0,atomKK->k_f.extent(0)),
+        ForceAdder<decltype(h_f_kk),decltype(h_f_legacy)>(h_f_kk,h_f_legacy));
+    }
+    Kokkos::deep_copy(LMPHostType(),f_merge_copy,atomKK->k_f.view_hostkk());
+    Kokkos::parallel_for(atomKK->k_f.extent(0),
+                         ForceAdder<DAT::t_kkacc_1d_3,DAT::t_kkacc_1d_3>(atomKK->k_f.view_device(),f_merge_copy));
+    atomKK->k_f.clear_sync_state(); // special case
+    atomKK->k_f.modify_device();
+  }
+
+  // host and device forces are merged, so sync() and modified() may touch them again
+
+  exclude_guard.release();
+
+  if (modify->has_fixes(FixConst::PRE_REVERSE)) {
+    modify->pre_reverse(eflag,vflag);
+    timer->stamp(Timer::MODIFY);
+  }
+  if (force->newton) {
+    comm->reverse_comm();
+    timer->stamp(Timer::COMM);
+  }
+  // force modifications
+
+  if (modify->has_fixes(FixConst::POST_FORCE_ANY)) {
+    modify->post_force(vflag);
+    timer->stamp(Timer::MODIFY);
+  }
+
+  atomKK->sync(Host,F_MASK);
+  lmp->kokkos->auto_sync = 1;
+
+  ++ update->nsteps;
+}
+
+/* ----------------------------------------------------------------------
+   clear force on own & ghost atoms
+   clear other arrays as needed
+------------------------------------------------------------------------- */
+
+void ThirdOrderKokkos::force_clear()
+{
+  if (external_force_clear) return;
+
+  atomKK->k_f.clear_sync_state(); // ignore host forces/torques since device views
+
+  // clear force on all particles
+  // if either newton flag is set, also include ghosts
+  // when using threads always clear all forces.
+
+  int nall = atomKK->nlocal;
+  if (force->newton) nall += atomKK->nghost;
+
+  Kokkos::parallel_for(nall, Zero<DAT::t_kkacc_1d_3>(atomKK->k_f.view_device()));
+  atomKK->modified(Device,F_MASK);
+
+}

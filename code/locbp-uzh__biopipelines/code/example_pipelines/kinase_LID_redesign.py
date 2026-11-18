@@ -1,0 +1,40 @@
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+# tested: 
+
+from biopipelines.pipeline import *
+from biopipelines import RFdiffusion, ProteinMPNN, AlphaFold, ConformationalChange, Panda, PyMOL
+
+with Pipeline(project="AdenylateKinase", job="LID_Redesign"):
+    Resources(gpu="A100", time="4:00:00", memory="16GB")
+    kinase = PDB("4AKE")
+    backbones = RFdiffusion(pdb=kinase,
+                            contigs='A1-117/50-70/A161-214', 
+                            num_designs=10)
+    sequences = ProteinMPNN(structures=backbones,
+                            num_sequences=2,
+                            redesigned=backbones.tables.structures.designed)
+    refolded = AlphaFold(proteins=sequences)    
+    conf_change = ConformationalChange(reference_structures = kinase,
+                                       target_structures = refolded,
+                                       selection = backbones.tables.structures.fixed)
+    top3 = Panda(tables=[refolded.tables.confidence,
+                         conf_change.tables.changes],
+                 operations=[Panda.merge(),
+                             Panda.filter("RMSD < 1.5"),
+                             Panda.sort("plddt",
+                                        ascending=False),
+                             Panda.head(3)],
+                 pool=refolded)
+    PyMOL(PyMOL.Load(top3),
+          PyMOL.ColorAF(),
+          PyMOL.Color("white",selection=backbones.tables.structures.fixed))
+    
+
+    
+
+
+    
+

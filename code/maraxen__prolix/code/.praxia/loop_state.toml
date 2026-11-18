@@ -1,0 +1,46 @@
+# .praxia/loop_state.toml — written by the autonomous-praxia-dev-loop skill
+
+[loop]
+version     = "1.0"
+task_id     = "260811_autonomous-loop"
+current_phase = "TRIAGE"
+last_subphase = ""
+last_artifact_path = ""
+iteration_count = 0
+last_activation = "2026-08-11T18:00:00Z"
+autonomy_level = "L2"
+fsm_id = "autoloop-260811_autonomous-loop"
+migrated_at = "2026-08-11T18:19:48.404763020+00:00"
+
+[loop.lock]
+token = ""
+expiry_ts = ""
+timeout_minutes = 45
+
+[loop.gates]
+spec_confirmed = false
+spec_path = ""
+sprint_approved = false
+sprint_plan_path = ""
+
+[loop.metrics]
+backlog_items_closed_per_iteration = 0
+consecutive_zero_progress_iterations = 0
+max_zero_progress = 3
+last_items_closed = 0
+remediate_attempt = 0
+
+[loop.selected]
+closed_epic_id = ""
+closed_epic_slug = ""
+audit_epic_id = ""
+audit_epic_slug = ""
+next_epic_id = ""
+
+[run]
+mode            = "hitl_semi_autonomous"
+human_available = false
+
+[loop.fingerprint]
+recent_tool_hashes = []
+stall_threshold = 3

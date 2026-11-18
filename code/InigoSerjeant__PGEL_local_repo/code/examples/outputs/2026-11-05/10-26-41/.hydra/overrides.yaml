@@ -1,0 +1,5 @@
+- inference.input_pdb=input_pdbs/5UDC_HLF_clean.pdb
+- inference.output_prefix=outputs/H103_114_train
+- contigmap.contigs=[102-102/H103-114/103-103/0 211-211/0 449-449]
+- inference.num_designs=1
+- inference.inversion_train=True

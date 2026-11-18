@@ -1,0 +1,381 @@
+# FreeBindCraft: BindCraft with Optional PyRosetta Bypass
+
+<p align="center">
+  <img src="https://github.com/cytokineking/FreeBindCraft/raw/HEAD/free-bindcraft.png" alt="FreeBindCraft" width="720" />
+</p>
+
+This repository contains a modified version of Martin Pacesa's BindCraft (v1.52). The primary change is the introduction of an **optional PyRosetta bypass mechanism**.
+
+For comprehensive details on the original BindCraft pipeline, features, advanced settings, and filter explanations, please refer to the **original BindCraft repository: [https://github.com/martinpacesa/BindCraft](https://github.com/martinpacesa/BindCraft)** and the [original preprint](https://www.biorxiv.org/content/10.1101/2024.09.30.615802). This fork is hosted at: [https://github.com/cytokineking/FreeBindCraft](https://github.com/cytokineking/FreeBindCraft).
+
+## Key Modification: PyRosetta Bypass Functionality
+
+The `--no-pyrosetta` flag, usable during both installation and runtime, enables the following behavior:
+
+*   **OpenMM Relaxation:** Structural relaxation uses an OpenMM-based protocol instead of PyRosetta's FastRelax. This includes structure preparation with PDBFixer, ramped backbone restraints, OBC2 implicit solvation, an additional short-range repulsive term to mitigate clashes, and short MD "shakes" for early stages. Integration with FASPR (Fast, Accurate, and Deterministic Protein Side-chain Packing) for side-chain repacking and further refinement. This function is GPU-accelerated and typically is 2-4x faster than the CPU-based FastRelax, depending on the platform. OpenMM and FASPR are both open-source.
+*   **Shape Complementarity (SC):** Replaced with an open-source implementation via `sc-rs` when available. See `sc-rs` project: [https://github.com/cytokineking/sc-rs](https://github.com/cytokineking/sc-rs). The results of sc-rs are nearly identical to the same calculations performed by PyRosetta.
+*   **SASA Calculations:** Surface area and derived metrics are computed using [FreeSASA](https://github.com/mittinatten/freesasa) or a Biopython Shrake–Rupley fallback. These values align closely with the PyRosetta-derived values.
+*   **Interface Residues and Alignment:** Uses Biopython-based routines for interface residue identification, RMSD, and PDB alignment.
+
+**Important Note:** Rosetta-specific metrics that lack open-source equivalents are not computed; placeholder values are used where needed for compatibility with default filters. Evaluate design quality accordingly.
+
+## ipSAE Scoring
+
+FreeBindCraft includes support for **ipSAE (interface predicted Structural Alignment Error)**, a metric for evaluating protein-protein interface quality based on AlphaFold's PAE matrix. This implementation is based on [Dunbrack et al. (2025)](https://www.biorxiv.org/content/10.1101/2025.02.10.637595v1).
+
+**What is ipSAE?**
+- ipSAE transforms interface PAE values using a PTM-style scoring function with adaptive normalization
+- Higher scores indicate better predicted interface quality (range 0–1)
+- Unlike i_pTM which uses a global d0, ipSAE uses per-residue d0 based on the number of interface contacts
+- ipSAE is computed for both trajectory statistics and final MPNN design statistics
+
+**Ranking by ipSAE:**
+By default, final designs are ranked by `i_pTM`. You can optionally rank by `ipSAE` instead:
+
+```bash
+python bindcraft.py --settings ... --rank-by ipSAE
+```
+
+The interactive CLI (both local and Docker) also prompts for ranking method selection.
+
+### Technical Overview & Rationale
+
+For the motivation behind the PyRosetta bypass, implementation details (OpenMM relax, FreeSASA/Biopython SASA, `sc-rs` shape complementarity), and empirical impact on filter decisions, see the in-depth technical overview:
+
+- `technical_overview/FreeBindCraft_Technical_Overview.md`
+
+## Installation
+
+### NVIDIA GPUs
+
+1.  Clone this modified repository:
+    ```bash
+    git clone https://github.com/cytokineking/FreeBindCraft [install_folder]
+    ```
+2.  Navigate into your install folder (`cd [install_folder]`) and run the installation script. Linux x86_64, Conda or Mamba, Git, curl, a C compiler, and NVIDIA driver **575.57.08 or newer** are required.
+
+    Conda supplies Python 3.12 and native tools. The [tested pip profile](https://github.com/cytokineking/FreeBindCraft/blob/HEAD/installation/linux-cuda12-requirements.txt) supplies JAX 0.11.2, NumPy 2.5.4, Flax 0.12.10, OpenMM 8.6.1, and their pinned CUDA 12.9 dependencies. A separately installed CUDA toolkit is not needed. ColabDesign and PDBFixer are pinned to tested commits.
+
+    Installation script options:
+    *   `--pkg_manager MANAGER`: Specify 'mamba' or 'conda' (default: 'conda').
+    *   `--env-name NAME`: Choose the Conda environment name (default: `BindCraft`). Use a new name when migrating an existing Python 3.10 environment.
+    *   `--no-pyrosetta`: **Use this flag to install without PyRosetta.**
+    *   `--skip-gpu-check`: Skip GPU execution checks only when building a container image without GPU access.
+    *   The legacy `--cuda` and `--fix-channels` options remain accepted. CUDA libraries now come from pip, and the installer selects conda-forge without editing your channel configuration.
+
+    **Example: PyRosetta-Free Installation**
+    ```bash
+    bash install_bindcraft.sh --no-pyrosetta
+    ```
+
+    **Example: Standard Installation (Includes PyRosetta)**
+    If you choose to install with PyRosetta, a license is required for commercial use.
+    ```bash
+    bash install_bindcraft.sh
+    ```
+
+The installer checks real JAX GPU gradients and an OpenMM CUDA calculation. Activation selects CUDA for JAX and OpenMM and clears `LD_LIBRARY_PATH` so an ambient toolkit cannot replace pip's CUDA libraries; deactivation restores your previous settings. Completed model weights are reused when rerunning installation. To check an installed environment again:
+
+```bash
+conda activate BindCraft
+python extras/check_linux_installation.py --no-pyrosetta
+```
+
+Omit `--no-pyrosetta` from that check for a full installation. Installing with `--no-pyrosetta` omits the optional package; it does not uninstall PyRosetta from an existing environment.
+
+You can also run BindCraft entirely inside a Docker container without a local installation. See the Containerized usage section below for details and an interactive wrapper.
+
+### Apple Silicon
+
+FreeBindCraft runs natively on Apple Silicon, with GPU optimizations enabled by default.
+
+```bash
+bash install_bindcraft.sh
+./run_apple_silicon.sh --settings settings_target/ubiquitin_apple_small.json \
+  --advanced settings_advanced/apple_silicon_ubiquitin_small.json --max-attempts 1
+```
+
+PyRosetta is included by default; use `--no-pyrosetta` for OpenMM/FASPR.
+See the [Apple Silicon guide](https://github.com/cytokineking/FreeBindCraft/blob/HEAD/apple_silicon/README.md) for setup and memory options,
+and the [M5 Max versus NVIDIA benchmarks](https://github.com/cytokineking/FreeBindCraft/blob/HEAD/apple_silicon/benchmarks/README.md).
+
+## Running BindCraft
+
+Activate the Conda environment:
+```bash
+conda activate BindCraft
+```
+
+Change to your BindCraft installation directory:
+```bash
+# cd /path/to/your/bindcraft/folder/
+```
+
+**To use the PyRosetta bypass at runtime, include the `--no-pyrosetta` flag:**
+```bash
+python -u ./bindcraft.py --settings './settings_target/your_target.json' --filters './settings_filters/default_filters.json' --advanced './settings_advanced/default_4stage_multimer.json' --no-pyrosetta
+```
+
+**To run with PyRosetta enabled (assuming it was installed):**
+```bash
+python -u ./bindcraft.py --settings './settings_target/your_target.json' --filters './settings_filters/default_filters.json' --advanced './settings_advanced/default_4stage_multimer.json'
+```
+
+**Note:** Even if you installed BindCraft *with* PyRosetta, you can still run in bypass mode by adding the `--no-pyrosetta` flag at runtime.
+
+For details on configuring target settings (`--settings`), filters (`--filters`), advanced parameters (`--advanced`), and other operational aspects of BindCraft, please consult the documentation in the [original BindCraft repository](https://github.com/martinpacesa/BindCraft).
+
+## Interactive CLI
+
+If you run BindCraft without `--settings` in a terminal (TTY) or pass `--interactive`, an interactive setup wizard guides you through configuration.
+
+- Quickstart (local):
+  ```bash
+  python bindcraft.py               # auto-detects TTY and enters interactive mode
+  # or
+  python bindcraft.py --interactive
+  ```
+- What it asks:
+  - Project/binder name, input PDB path (validated must exist), output directory (auto-created)
+  - Design type: Miniprotein (≥31 aa) or Peptide (8–30 aa)
+    - Peptides: default length 8–25; filters limited to `peptide_filters`, `peptide_relaxed_filters`, `no_filters`; advanced limited to peptide profiles
+    - Miniproteins: default length 65–150 (min ≥31); filters limited to `default_filters`, `relaxed_filters`, `no_filters`; advanced excludes peptide profiles
+  - Verbose logging, plots, animations, and whether to run with PyRosetta
+  - Ranking method for final designs: `i_pTM` (default) or `ipSAE`
+- Behavior:
+  - Generates a target settings JSON inside your chosen output directory and then runs the standard pipeline
+
+## Additional New CLI Flags 
+
+You can further control runtime behavior with these flags:
+
+- `--verbose`: Enable detailed timing/progress logs for BindCraft internals.
+- `--debug-pdbs`: Write intermediate PDBs from OpenMM relax (`.debug_deconcat.pdb`, `.debug_pdbfixer.pdb`, `.debug_post_initial_relax.pdb`, `.debug_post_faspr.pdb`)
+- `--no-plots`: Disable saving design trajectory plots (overrides advanced settings).
+- `--no-animations`: Disable saving trajectory animations (overrides advanced settings).
+- `--rank-by {i_pTM,ipSAE}`: Metric to rank final designs by (default: `i_pTM`). Use `ipSAE` to rank by interface predicted Structural Alignment Error instead.
+- `--max-attempts N`: Run at most N new trajectory attempts across all lengths, including rejected trajectories. The last attempt finishes its downstream processing, then accepted designs are ranked using `--rank-by`, even if the requested design count was not reached. This works with caching on or off, defaults to no attempt cap, and resets for each invocation when resuming.
+- `--attempts-per-length N`: With the trajectory cache enabled, try up to N trajectories at each selected length per visit (default: 5), including the first attempt.
+- `--accepted-per-length N`: With the trajectory cache enabled, move to the next length after a visit reaches N final-filter-accepted designs (default: 1), or its attempt limit.
+- `--seed N`: Seed NumPy's trajectory and model sampling for reproducible checks within a pinned runtime. OpenMM MD and different GPU backends need not be bitwise reproducible.
+
+Example:
+```bash
+python -u ./bindcraft.py \
+  --settings './settings_target/your_target.json' \
+  --filters './settings_filters/default_filters.json' \
+  --advanced './settings_advanced/default_4stage_multimer.json' \
+  --no-animations --no-plots --verbose --rank-by ipSAE
+```
+
+### Exact-length trajectory cache
+
+Add `--trajectory-cache` to reuse compiled design calculations on CUDA or Apple Silicon, inspired by [BindCraft2](https://github.com/PacesaLab/BindCraft2/blob/8c1a858fdc1bfc94c60846ff11a0d01c9aa44136/bindcraft/af2.py#L461-L469). Caching is **off by default**. You can also enable it with `"trajectory_cache": true` in the advanced JSON; `--no-trajectory-cache` overrides that setting for a single run.
+
+Use `--attempts-per-length N` to set the maximum number of attempts per selected length and visit. Use `--accepted-per-length N` to set how many accepted designs end that visit. For example, `--trajectory-cache --attempts-per-length 5 --accepted-per-length 3` moves on after three accepted designs or five attempts, whichever happens first. You can set both values to 5 to target five accepted designs within five attempts. Both values must be positive integers; `--max-attempts` remains a separate limit on all new trajectories in the run.
+
+With caching enabled:
+
+- The length range is divided into up to four bins. FreeBindCraft alternates between bins, running a block of trajectories at one exact length before moving on.
+- Each visit attempts at most the configured number of trajectories at its selected length, ending when the accepted-design target is reached. Only designs that pass the final filters count; earlier confidence checks do not. The configured MPNN output limit and overall design goal still apply.
+- The accepted-design target is checked after each trajectory completes. If a trajectory produces multiple accepted designs, all count and the visit can exceed its target; the existing per-trajectory MPNN limit still applies.
+- Each bin starts at its midpoint, then explores unvisited lengths furthest from previous visits. Sweeps continue until the design goal or a stopping limit is reached. For 65–200 with a goal of 20 designs, the block order begins **82 → 116 → 150 → 184 → 65 → 99 → 133 → 167**.
+- The first trajectory at a new length compiles; subsequent trajectories reuse those calculations with fresh seeds and optimizer state. Changing length releases the old runtime and clears JAX compilation caches. There is no padding or scheduling worker process.
+
+For example, with the default settings, a visit to length 82 advances to 116 after five unsuccessful attempts, or after a trajectory produces at least one final-filter-accepted design.
+
+Resume preserves bins, visited lengths and partial visits when campaign settings and accepted files are unchanged. If either limit changes, the current visit is evaluated against the new limits: raising a limit can continue a visit, while lowering one can end it immediately. Older checkpoints are migrated to the selected limits. With caching off, lengths are sampled independently as before, and these two options have no effect. Caching can increase peak memory during validation, and allocators may retain freed memory for reuse.
+
+**Design-only measurements at one repeated length:**
+
+| Backend | First call, off → on | Later calls, off → on | Five-call mean, off → on |
+|---|---:|---:|---:|
+| NVIDIA RTX 6000 Pro | 89.65 → 89.21 s (1.00×) | 89.15 → 11.96 s (7.46×) | 89.25 → 27.41 s (3.26×) |
+| NVIDIA RTX 5090 | 89.18 → 88.85 s (1.00×) | 88.68 → 13.68 s (6.48×) | 88.78 → 28.72 s (3.09×) |
+| NVIDIA L40S | 173.58 → 179.50 s (0.97×) | 174.32 → 24.59 s (7.09×) | 174.18 → 55.57 s (3.13×) |
+| Apple M5 Max | 91.16 → 93.18 s (0.98×) | 92.60 → 88.13 s (1.05×) | 92.31 → 89.14 s (1.04×) |
+
+Each result averages two opposite-order pairs of five-call blocks on ubiquitin with a 100-residue binder and one repeated seed. These are complete calls to the production three-stage design function with a **shortened 20/10/3-iteration schedule**, not the default four-stage schedule. The first call includes model setup and compilation; the later-call mean covers four calls per block. Timings include trajectory output but exclude relaxation, MPNN and validation. Outputs matched within each backend. CUDA used JAX 0.6.0 with autotuning disabled; Metal used JAX 0.11.2 and MetalJAX 0.11.9+fbc3. Persistent compilation caching was disabled. Results are workload-specific; the small Metal difference is not a general performance guarantee.
+
+## Containerized usage (Docker)
+
+Run FreeBindCraft in a GPU-enabled Docker container (build locally).
+
+### Prerequisites (on the host)
+
+- Linux x86_64 host with NVIDIA driver **575.57.08 or newer** (check with `nvidia-smi`).
+- Docker CE and NVIDIA Container Toolkit:
+  - Linux (Ubuntu):
+    1) Install Docker CE and restart the daemon.
+    2) `sudo apt-get install -y nvidia-container-toolkit`
+    3) `sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker`
+  - Validate GPU availability inside containers:
+    ```bash
+    docker run --rm --gpus all nvidia/cuda:12.9.1-base-ubuntu22.04 nvidia-smi
+    ```
+
+### Build the image from this repository
+
+Build without PyRosetta (default):
+```bash
+docker build -t freebindcraft:gpu .
+```
+
+The build downloads the model weights and installs the pinned pip CUDA 12.9
+profile. A GPU is needed only at runtime. Local environments, downloaded
+`params/`, and generated `runs/` are excluded from the build context.
+
+Check JAX gradients and OpenMM CUDA execution in the built image:
+```bash
+docker run --rm --gpus all freebindcraft:gpu \
+  python extras/check_linux_installation.py --no-pyrosetta
+```
+
+Build with PyRosetta:
+```bash
+docker build --build-arg WITH_PYROSETTA=true -t freebindcraft:pyrosetta .
+```
+
+Sanity test (OpenMM relax):
+```bash
+mkdir -p ~/bindcraft_out
+docker run --gpus all --rm -it \
+  --ulimit nofile=65536:65536 \
+  -v ~/bindcraft_out:/work/out \
+  freebindcraft:gpu \
+  python extras/test_openmm_relax.py example/PDL1.pdb /work/out/relax_test
+```
+
+ 
+
+### Running BindCraft in Docker (general guidance)
+
+Decide where your inputs and outputs live. Typical layout:
+- Host input PDB: `/path/on/host/your_target.pdb`
+- Host output dir: `/path/on/host/run_outputs`
+- Settings files: either use repo defaults inside the container or mount your own copies from the host
+
+Examples:
+1) Use repository defaults for settings (inside container), but mount outputs to host.
+```bash
+mkdir -p /path/on/host/run_outputs
+docker run --gpus all --rm -it \
+  --ulimit nofile=65536:65536 \
+  -v /path/on/host/run_outputs:/root/software/pdl1 \
+  freebindcraft:gpu \
+  python bindcraft.py \
+    --settings settings_target/PDL1.json \
+    --filters settings_filters/default_filters.json \
+    --advanced settings_advanced/default_4stage_multimer.json \
+    --no-pyrosetta
+```
+
+2) Mount a custom target settings JSON from the host (also mount your input PDB):
+```bash
+mkdir -p /path/on/host/run_outputs
+docker run --gpus all --rm -it \
+  --ulimit nofile=65536:65536 \
+  -v /path/on/host/run_outputs:/root/software/pdl1 \
+  -v /path/on/host/my_settings.json:/app/settings_target/my_settings.json:ro \
+  -v /path/on/host/your_target.pdb:/app/example/your_target.pdb:ro \
+  freebindcraft:gpu \
+  python bindcraft.py \
+    --settings /app/settings_target/my_settings.json \
+    --filters settings_filters/default_filters.json \
+    --advanced settings_advanced/default_4stage_multimer.json \
+    --no-pyrosetta
+```
+
+3) Mount custom filters/advanced settings from the host too:
+```bash
+docker run --gpus all --rm -it \
+  --ulimit nofile=65536:65536 \
+  -v /path/on/host/run_outputs:/root/software/pdl1 \
+  -v /path/on/host/my_settings.json:/app/settings_target/my_settings.json:ro \
+  -v /path/on/host/my_filters.json:/app/settings_filters/my_filters.json:ro \
+  -v /path/on/host/my_advanced.json:/app/settings_advanced/my_advanced.json:ro \
+  -v /path/on/host/your_target.pdb:/app/example/your_target.pdb:ro \
+  freebindcraft:gpu \
+  python bindcraft.py \
+    --settings /app/settings_target/my_settings.json \
+    --filters /app/settings_filters/my_filters.json \
+    --advanced /app/settings_advanced/my_advanced.json \
+    --no-pyrosetta
+```
+
+Notes:
+- Always mount your output directory to the path set as `design_path` in your target settings (e.g., `/root/software/pdl1`).
+- Always increase file descriptor limits with `--ulimit nofile=65536:65536`. The image’s entrypoint also attempts to raise the soft limit inside the container.
+
+### Interactive wrapper for Docker
+
+After you build an image locally, you can use the interactive Docker wrapper:
+
+```bash
+python docker_cli.py
+```
+
+This wizard:
+- Lists local Docker images and lets you choose one (defaults to `freebindcraft:gpu` if present, or enter another local image tag such as `freebindcraft:pyrosetta`)
+- Asks for a single GPU index to expose
+- Prompts for all inputs identical to the local interactive CLI (design type, validated PDB path, output directory auto-created, chains, hotspots, peptide/miniprotein-specific filters and advanced profiles, verbose/plots/animations, PyRosetta, ranking method)
+- Writes a target settings JSON into your chosen output directory
+- Launches `docker run --rm -it --gpus device=<idx>` with host paths mounted to identical locations in the container so your paths work unchanged
+
+On completion or Ctrl+C, the container exits and is auto-removed; outputs persist on the host via the mounted output directory.
+
+## Citations & External Tools
+
+- Shape Complementarity (SC): `sc-rs` — [https://github.com/cytokineking/sc-rs](https://github.com/cytokineking/sc-rs)
+- FreeSASA (SASA): [https://github.com/mittinatten/freesasa](https://github.com/mittinatten/freesasa)
+- FASPR (Side-chain Packing): [https://github.com/tommyhuangthu/FASPR](https://github.com/tommyhuangthu/FASPR)
+- Biopython: [https://biopython.org](https://biopython.org)
+- ipSAE (interface predicted Structural Alignment Error): [Dunbrack et al. 2025](https://www.biorxiv.org/content/10.1101/2025.02.10.637595v1)
+
+## Extras: Analysis and Utility Scripts
+
+This repository includes additional scripts and documents in `extras/` to assist with analysis and testing:
+
+- `extras/analyze_bindcraft_rejections.py`: Analyze MPNN rejections across runs and quantify which filters are most responsible; can estimate hypothetical rankings when Rosetta-only filters trigger.
+- `extras/bindcraft_rejection_analysis_spec.md`: Specification describing the rejection analysis outputs and methodology.
+- `extras/BUGFIX_FILE_DESCRIPTORS.md`: Notes on file descriptor fixes in high-throughput runs.
+- `extras/check_ulimit.sh`: Helper script to check system ulimit and suggest adjustments for many-parallel-file workloads.
+- `extras/compare_interface_metrics_all.py`: Compute interface metrics via PyRosetta (if available), FreeSASA, and Biopython across a folder of PDBs; outputs a combined CSV.
+- `extras/compare_pyrosetta_bypass_scores.py`: Side-by-side comparison of PyRosetta vs Biopython-only metrics for a folder of PDBs.
+- `extras/rescore_accepted_with_rosetta.py`: Rescore accepted (Ranked preferred) PDBs from a `--no-pyrosetta` run using PyRosetta, evaluate whether PyRosetta-driven filters would reject each design, and report failing filters. Supports dynamic filters (`default|relaxed|design|custom`), parallel workers, and an optional `--fast-relax` mode to run PyRosetta FastRelax prior to scoring.
+- `extras/test_openmm_relax.py`: Quick test harness for OpenMM and PyRosetta relax routines.
+
+See `extras/README.md` for detailed usage examples and options.
+
+## Contributing
+
+Pull requests are welcome.
+
+## Known Issues
+
+- OpenMM backend selection: The Linux installer and Docker image select the tested CUDA backend. The Apple Silicon profile uses OpenCL. Relaxation runs in a subprocess for isolation.
+- OpenCL JIT "log spam": You may see repeated lines such as "Failed to read file: /tmp/dep-76532a.d" emitted to stdout/stderr during OpenCL kernel builds.
+  - Recommend line buffering to keep logs responsive when filtering
+    - Combined output (preferred when piping/teeing):
+    ```bash
+    python -u ./bindcraft.py \
+      --settings ./settings_target/your_target.json \
+      --filters ./settings_filters/default_filters.json \
+      --advanced ./settings_advanced/default_4stage_multimer.json \
+      --no-pyrosetta \
+      |& stdbuf -oL -eL grep -v -E 'Failed to read file: .*/dep-[0-9a-fA-F]+\.d([[:space:]]*)?$' \
+      | stdbuf -oL tee -a ./output/your_target.log
+    ```
+    - Stderr-only (no further pipes):
+    ```bash
+    python -u ./bindcraft.py \
+      --settings ./settings_target/your_target.json \
+      --filters ./settings_filters/default_filters.json \
+      --advanced ./settings_advanced/default_4stage_multimer.json \
+      --no-pyrosetta \
+      2> >(stdbuf -oL -eL grep -v -E 'Failed to read file: .*/dep-[0-9a-fA-F]+\.d([[:space:]]*)?$' >&2)
+    ```
+    - Notes:
+      - `stdbuf` forces line buffering for both stdout and stderr, preventing pipeline buffering delays.
+      - Use POSIX character class `[[:space:]]` for portability.
+      - If preserving exit code across pipes matters, consider: `set -o pipefail`.

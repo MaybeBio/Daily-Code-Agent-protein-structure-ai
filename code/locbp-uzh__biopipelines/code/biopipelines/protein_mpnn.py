@@ -1,0 +1,634 @@
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+"""
+ProteinMPNN configuration for sequence design from protein structures.
+"""
+
+import os
+import json
+from typing import Dict, List, Any, Union, Tuple
+
+try:
+    from .base_config import BaseConfig, StandardizedOutput, TableInfo, _validate_freeform_string, resolve_table_reference
+    from .file_paths import Path
+    from .datastream import DataStream
+    from .combinatorics import generate_multiplied_ids, generate_multiplied_ids_pattern
+    from .chain_rows import (chain_row_ids, chains_arg,
+                             normalize_chains, positions_chain, validate_chains)
+    from .biopipelines_io import Resolve, TableReference
+except ImportError:
+    import sys
+    sys.path.append(os.path.dirname(__file__))
+    from base_config import BaseConfig, StandardizedOutput, TableInfo, _validate_freeform_string, resolve_table_reference
+    from file_paths import Path
+    from datastream import DataStream
+    from combinatorics import generate_multiplied_ids, generate_multiplied_ids_pattern
+    from chain_rows import (chain_row_ids, chains_arg,
+                            normalize_chains, positions_chain, validate_chains)
+    from biopipelines_io import Resolve, TableReference
+
+
+class ProteinMPNN(BaseConfig):
+    """
+    Configuration for ProteinMPNN sequence design.
+    """
+
+    TOOL_NAME = "ProteinMPNN"
+    TOOL_VERSION = "2.11"
+    # protein_mpnn_run.py is argparse and accepts far more flags than the wrapper types; an untyped kwarg becomes one more `--flag value`.
+    FORWARD_UNKNOWN_KWARGS = "argparse"
+    # `chain` and `chains` were one letter apart and meant different things, which is the
+    # Ligand code/codes mistake again. `chains` now answers both.
+    PARAMETER_ALIASES = {"chain": "chains"}
+    DEPRECATED_ALIASES = ("chain",)
+    ALIAS_CHANGES = {"chain": (
+        "chain= named the chain an unqualified selection belongs to and left every other chain "
+        "fused into the same sequence row; chains= also decides which chains become sequences "
+        "rows, so chain=\"B\" now emits chain B alone. On a multi-chain backbone pass every chain "
+        "to fold, e.g. chains=[\"A\", \"B\"], and qualify selections (\"B10-20\")."
+    )}
+    # Upstream calls this env "mlfold"; we share RFdiffusion's SE3nv to spare one.
+    ENV_NAME = "SE3nv"
+
+    @classmethod
+    def _install_script(cls, folders, env_manager="mamba", force_reinstall=False, **kwargs):
+        try:
+            from .config_manager import ConfigManager
+        except ImportError:
+            from config_manager import ConfigManager
+
+        repo_dir = folders.get("ProteinMPNN", "")
+        parent_dir = os.path.dirname(repo_dir)
+        biopipelines = folders.get("biopipelines", "")
+
+        pmpnn_env = cls._install_env(env_manager)
+        rfd_env   = ConfigManager().get_environment("RFdiffusion")
+
+        # Skip when the repo exists AND `import torch` works inside the
+        # configured env. The env must be present too — when ProteinMPNN
+        # is the first tool to bring up a shared SE3nv, neither side has
+        # created it yet.
+        # The torch import probe is the load-bearing check (env + package).
+        skip = "" if force_reinstall else f"""# Check if already installed
+if [ -d "{repo_dir}" ] \\
+   && {cls._env_run(pmpnn_env, env_manager)}python -c "import torch" >/dev/null 2>&1; then
+    echo "ProteinMPNN already installed, skipping. Use force_reinstall=True to reinstall."
+    touch "$INSTALL_SUCCESS"
+    exit 0
+fi
+"""
+        clone_block = f"""mkdir -p {parent_dir}
+cd {parent_dir}
+if [ ! -d "{repo_dir}" ]; then
+    git clone https://github.com/dauparas/ProteinMPNN.git
+fi"""
+
+        if rfd_env and pmpnn_env == rfd_env:
+            # Same conda/mamba environment as RFdiffusion: ProteinMPNN
+            # only needs PyTorch in there. If the env doesn't exist yet
+            # (e.g. user runs ProteinMPNN.install() before RFdiffusion's),
+            # create it from the BioPipelines spec; if it already exists
+            # (RFdiffusion got there first), reuse it as-is. Either way the
+            # repo gets cloned and the verification below confirms torch.
+            env_block = cls._env_install_block(pmpnn_env, env_manager, biopipelines)
+            shared_env_check = cls._env_exists_check(pmpnn_env, env_manager)
+            return f"""echo "=== Installing ProteinMPNN ==="
+{skip}{clone_block}
+
+# Bring up the shared '{pmpnn_env}' env if RFdiffusion hasn't already done so.
+if {shared_env_check}; then
+    echo "Shared env '{pmpnn_env}' already exists — reusing it."
+else
+    echo "Shared env '{pmpnn_env}' missing — creating it from the BioPipelines spec."
+    {env_block}
+    if [ $? -ne 0 ]; then
+        echo "ERROR: could not create shared env '{pmpnn_env}'."
+        exit 1
+    fi
+fi
+
+# Verify installation (repo cloned + torch importable in the shared env)
+if [ -f "{repo_dir}/protein_mpnn_run.py" ] \\
+   && {cls._env_run(pmpnn_env, env_manager)}python -c "import torch" >/dev/null 2>&1; then
+    touch "$INSTALL_SUCCESS"
+    echo "=== ProteinMPNN installation complete ==="
+else
+    echo "ERROR: ProteinMPNN verification failed (script missing or torch not importable)"
+    exit 1
+fi
+"""
+
+        # Dedicated environment
+        remove_block = cls._env_remove_block(pmpnn_env, env_manager) if force_reinstall else ""
+        return f"""echo "=== Installing ProteinMPNN ==="
+{skip}{clone_block}
+
+{remove_block}
+# Build from the env spec: hand-rolled conda calls broke non-conda managers.
+{cls._env_install_block(pmpnn_env, env_manager, biopipelines)}
+
+# Verify installation
+if [ -f "{repo_dir}/protein_mpnn_run.py" ] && {cls._env_run(pmpnn_env, env_manager)}python -c "import torch" >/dev/null 2>&1; then
+    touch "$INSTALL_SUCCESS"
+    echo "=== ProteinMPNN installation complete ==="
+else
+    echo "ERROR: ProteinMPNN verification failed (script missing or torch not importable)"
+    exit 1
+fi
+"""
+
+    # Lazy path descriptors — routed through the canonical sub-layout.
+    #   configuration/  — parsed_pdbs.jsonl, fixed_pos.jsonl, fixed_designed.csv,
+    #                     .input_structures.json (all config-time inputs).
+    #   execution/      — raw ProteinMPNN output; includes seqs/ (.fa files).
+    #   sequences/      — content-bearing stream: sequences.csv IS the content
+    #                     + map_table; sequences.fasta is its FASTA twin.
+    #   tables/         — standalone TableInfo CSVs (missing, proteinmpnn_results).
+    parsed_pdbs_jsonl = Path(lambda self: self.configuration_path("parsed_pdbs.jsonl"))
+    fixed_jsonl = Path(lambda self: self.configuration_path("fixed_pos.jsonl"))
+    fixed_args_json = Path(lambda self: self.configuration_path("fixed_pos_args.json"))
+    sele_csv = Path(lambda self: self.configuration_path("fixed_designed.csv"))
+    # ProteinMPNN's CLI creates seqs/<id>.fa inside --out_folder.
+    # Point --out_folder at execution/ so the raw .fa dumps live there.
+    pmpnn_out_folder = Path(lambda self: self.execution_folder)
+    seqs_folder = Path(lambda self: self.execution_path("seqs"))
+    main_table = Path(lambda self: self.table_path("proteinmpnn_results"))
+    queries_csv = Path(lambda self: self.stream_path("sequences", "sequences.csv"))
+    queries_fasta = Path(lambda self: self.stream_path("sequences", "sequences.fasta"))
+    designs_csv = Path(lambda self: self.stream_path("designs", "designs.csv"))
+    structures_json = Path(lambda self: self.configuration_path(".input_structures.json"))
+
+    missing_csv = Path(lambda self: self.table_path("missing"))
+
+    # Helper scripts
+    fixed_py = Path(lambda self: self.pipe_script_path("pipe_pmpnn_fixed_positions.py"))
+    table_py = Path(lambda self: self.pipe_script_path("pipe_pmpnn_table.py"))
+    fa_to_csv_fasta_py = Path(lambda self: self.pipe_script_path("pipe_fa_to_csv_fasta.py"))
+
+    # ProteinMPNN installation scripts
+    parse_py = Path(lambda self: os.path.join(self.folders["ProteinMPNN"], "helper_scripts", "parse_multiple_chains.py"))
+    pmpnn_py = Path(lambda self: os.path.join(self.folders["ProteinMPNN"], "protein_mpnn_run.py"))
+
+    def __init__(self,
+                 structures: Union[DataStream, StandardizedOutput],
+                 num_sequences: int = 1,
+                 fixed: Union[str, Tuple['TableInfo', str], Dict[str, Any]] = "",
+                 redesigned: Union[str, Tuple['TableInfo', str], Dict[str, Any]] = "",
+                 chains: Union[str, List[str], None] = None,
+                 sampling_temp: float = 0.1,
+                 model_name: str = "v_48_020",
+                 soluble_model: bool = False,
+                 remove_duplicates: bool = True,
+                 fill_gaps: str = "G",
+                 bias_AA_jsonl: str = "",
+                 omit_AA_jsonl: str = "",
+                 seed: int = 0,
+                 ca_noise_std: float = 0.0,
+                 **kwargs):
+        """
+        Initialize ProteinMPNN configuration.
+
+        Args:
+            structures: Input structures as DataStream or StandardizedOutput
+            num_sequences: Number of sequences to generate per structure
+            fixed: Fixed positions. Accepts:
+                   - PyMOL-style selection string: "10-20+30-40"
+                   - TableReference: table.column_name
+                   - {chain: selection}: which residues belong to which chain, e.g.
+                     {"A": "10-20", "B": rfd.tables.structures.designed}. Required on a
+                     multi-chain structure, where an unqualified selection is ambiguous
+                     and raises rather than being attached to a guessed chain.
+            redesigned: Designed positions. Same three forms as `fixed`.
+            chains: The chains this step is about. ProteinMPNN always writes every chain of
+                   the backbone, joined by "/" in one record, so this says which of them
+                   become `sequences` rows — and, because it names the chains in play, it is
+                   also the chain a chainless position selection (`fixed="10-20"`) attaches
+                   to. The retired `chain` parameter is a deprecated alias for it.
+                   - None (default): the backbone is expected to have one chain, and ids stay
+                     `<structure>_<n>`. A multi-chain backbone is a failure recorded in
+                     missing.csv naming the chains found, not a silently fused sequence.
+                   - "A" or ["A"]: only that chain, ids unchanged.
+                   - ["A", "B"]: one row per named chain, ids `<structure>_<n>_<chain>`.
+                   - "all": every chain, ids `<structure>_<n>[_<?>]` (lazy — the chain letters
+                     are only known once the backbone is read).
+                   A chainless position selection attaches to the single named chain, or to
+                   the structure's only chain when none is named. With several chains in
+                   play it attaches to the first named one, so qualify the selection
+                   ("A10-20") when that is not what you mean.
+                   Group the chain rows back into one complex with
+                   `Grouped(<this tool>)`; see the Grouped entry in the user manual.
+            sampling_temp: Sampling temperature for sequence generation
+            model_name: ProteinMPNN model variant
+            soluble_model: Use soluble protein model (default False; see SolubleMPNN)
+            remove_duplicates: Remove duplicate sequences from output (default True)
+            fill_gaps: Amino acid to replace X (unknown/gap residues) with (default "G" for glycine).
+                       Empty string means no filling (X is kept as-is).
+            bias_AA_jsonl: Path to a JSONL file biasing per-position amino-acid logits
+                       (upstream --bias_AA_jsonl). Empty string disables.
+            ca_noise_std: Backbone Cα Gaussian noise standard deviation injected during
+                       inference (upstream --backbone_noise). 0.0 disables (default).
+            omit_AA_jsonl: Path to a JSONL file omitting specific amino acids per position
+                       (upstream --omit_AA_jsonl). Empty string disables.
+            seed: Random seed for reproducible sampling (upstream --seed). 0 (default) lets
+                       ProteinMPNN choose its own seed.
+
+        Output:
+            Streams: sequences (.csv), designs (.csv), fasta (.fasta)
+            Tables:
+                sequences: id | design | structures.id | source_pdb | chain | sequence | score | seq_recovery | gaps
+                designs: id | structures.id | source_pdb | n_chains | score | seq_recovery
+                missing: id | removed_by | kind | cause
+        """
+        # Resolve input to DataStream. Keep the original object too: a DataStream carries
+        # no `tables`, so the upstream missing manifest can only be found on the
+        # StandardizedOutput it came from.
+        self.structures_input = structures
+        if isinstance(structures, StandardizedOutput):
+            self.structures_stream: DataStream = structures.streams.structures
+        elif isinstance(structures, DataStream):
+            self.structures_stream = structures
+        else:
+            raise ValueError(f"structures must be DataStream or StandardizedOutput, got {type(structures)}")
+
+        # Store parameters
+        self.num_sequences = num_sequences
+        self.fixed = resolve_table_reference(fixed, "fixed")
+        self.redesigned = resolve_table_reference(redesigned, "redesigned")
+        self.chains = normalize_chains(chains)
+        self.sampling_temp = sampling_temp
+        self.model_name = model_name
+        self.soluble_model = soluble_model
+        self.remove_duplicates = remove_duplicates
+        self.fill_gaps = fill_gaps
+        self.bias_AA_jsonl = bias_AA_jsonl
+        self.omit_AA_jsonl = omit_AA_jsonl
+        self.seed = seed
+        self.ca_noise_std = ca_noise_std
+
+        super().__init__(**kwargs)
+
+    def validate_params(self):
+        """Validate ProteinMPNN-specific parameters."""
+        if not self.structures_stream or len(self.structures_stream) == 0:
+            raise ValueError("structures parameter is required and must not be empty")
+
+        if self.num_sequences <= 0:
+            raise ValueError("num_sequences must be positive")
+
+        if self.sampling_temp <= 0:
+            raise ValueError("sampling_temp must be positive")
+
+        if self.ca_noise_std < 0:
+            raise ValueError("ca_noise_std must be non-negative")
+
+        if self.seed < 0:
+            raise ValueError("seed must be non-negative")
+
+        valid_models = ["v_48_002", "v_48_010", "v_48_020", "v_48_030"]
+        if self.model_name not in valid_models:
+            raise ValueError(f"model_name must be one of: {valid_models}")
+
+        validate_chains(self.chains)
+
+        _validate_freeform_string("fill_gaps", self.fill_gaps)
+        for name, selection in (("fixed", self.fixed), ("redesigned", self.redesigned)):
+            if isinstance(selection, str):
+                _validate_freeform_string(name, selection)
+            elif isinstance(selection, dict):
+                for chain, value in selection.items():
+                    if isinstance(value, str):
+                        _validate_freeform_string(f"{name}[{chain!r}]", value)
+
+    def configure_inputs(self, pipeline_folders: Dict[str, str]):
+        """Configure input structures."""
+        self.folders = pipeline_folders
+
+    def get_config_display(self) -> List[str]:
+        """Get ProteinMPNN configuration display lines."""
+        config_lines = super().get_config_display()
+        config_lines.extend([
+            f"NUM SEQUENCES PER TARGET: {self.num_sequences}",
+            f"FIXED: {self.fixed or 'None'}",
+            f"REDESIGNED: {self.redesigned or 'None'}",
+            f"CHAINS: {self.chains if self.chains else 'single (expected)'}",
+            f"SAMPLING T: {self.sampling_temp}",
+            f"MODEL: {self.model_name}",
+            f"SOLUBLE: {self.soluble_model}"
+        ])
+        return config_lines
+
+    def generate_script(self, script_path: str) -> str:
+        """Generate ProteinMPNN execution script."""
+        script_content = "#!/bin/bash\n"
+        script_content += "# ProteinMPNN execution script\n"
+        script_content += self.generate_completion_check_header()
+        script_content += self.activate_environment(name="biopipelines")
+        script_content += self._generate_script_prepare_inputs()
+        script_content += self.activate_environment()
+        script_content += self.extra_args_echo()
+        script_content += self._generate_script_run_proteinmpnn()
+        script_content += self.activate_environment(name="biopipelines")
+        script_content += self._generate_script_create_table()
+        script_content += self.generate_completion_check_footer()
+        return script_content
+
+    def _generate_script_prepare_inputs(self) -> str:
+        """Generate the input preparation part of the script."""
+
+        # Serialize DataStream to JSON file (proper way to pass ids + files to pipe_script)
+        self.structures_stream.save_json(self.structures_json)
+
+        fixed_param = self._selection_param(self.fixed)
+        designed_param = self._selection_param(self.redesigned)
+
+        with open(self.fixed_args_json, "w") as f:
+            json.dump({
+                "structures_json": str(self.structures_json),
+                "FIXED": fixed_param,
+                "DESIGNED": designed_param,
+                "FIXED_CHAIN": positions_chain(self.chains),
+                "fixed_jsonl_file": str(self.fixed_jsonl),
+                "sele_csv_file": str(self.sele_csv),
+            }, f, indent=2)
+
+        # parse_multiple_chains.py wants a folder — take the dirname of the first
+        # PRESENT file's id. valid_set skips filtered-out ids whose file is absent.
+        return f"""FIRST_ID={Resolve.stream_ids(self.structures_json, index=0, valid_set=True)}
+FIRST_FILE={Resolve.stream_item(self.structures_json, "$FIRST_ID")}
+INPUT_DIR=$(dirname "$FIRST_FILE")
+
+echo "Determining fixed positions"
+python {self.fixed_py} "{self.fixed_args_json}"
+
+"""
+
+    def _generate_script_run_proteinmpnn(self) -> str:
+        """Generate the ProteinMPNN execution part of the script.
+
+        Iterates per-PDB so a structure that triggers a Python exception inside
+        protein_mpnn_run.py (e.g. an unexpected chain in tied_featurize) does
+        not abort the rest of the batch. Each iteration filters the merged
+        parsed_pdbs.jsonl and fixed_pos.jsonl down to a single entry, runs the
+        model, and on failure records the id + error in missing.csv.
+        """
+        pmpnn_options = f"--num_seq_per_target {self.num_sequences}"
+        pmpnn_options += f" --sampling_temp {self.sampling_temp}"
+        pmpnn_options += f" --model_name {self.model_name}"
+
+        if self.soluble_model:
+            pmpnn_options += " --use_soluble_model"
+
+        if self.bias_AA_jsonl:
+            pmpnn_options += f" --bias_AA_jsonl {self.bias_AA_jsonl}"
+
+        if self.omit_AA_jsonl:
+            pmpnn_options += f" --omit_AA_jsonl {self.omit_AA_jsonl}"
+
+        if self.seed > 0:
+            pmpnn_options += f" --seed {self.seed}"
+
+        if self.ca_noise_std > 0:
+            pmpnn_options += f" --backbone_noise {self.ca_noise_std}"
+
+        per_pdb_dir = os.path.join(self.execution_folder, "per_pdb")
+
+        return f"""echo "Parsing multiple PDBs"
+python {self.parse_py} --input_path $INPUT_DIR --output_path {self.parsed_pdbs_jsonl}
+
+echo "Running model (per-PDB loop)"
+echo "Options: {pmpnn_options}"
+echo "Output folder: {self.output_folder}"
+echo "ProteinMPNN --out_folder (execution/): {self.pmpnn_out_folder}"
+
+mkdir -p "{per_pdb_dir}"
+# Seed missing.csv header now so partial failures still produce a readable file.
+if [ ! -f "{self.missing_csv}" ]; then
+    echo "id,removed_by,kind,cause" > "{self.missing_csv}"
+fi
+
+for struct_id in {Resolve.stream_ids(self.structures_json, valid_set=True)}; do
+    SUBSET_JSONL="{per_pdb_dir}/${{struct_id}}.jsonl"
+    SUBSET_FIXED="{per_pdb_dir}/${{struct_id}}_fixed.jsonl"
+    SUBSET_LOG="{per_pdb_dir}/${{struct_id}}.log"
+
+    python -c "
+import json, sys
+sid = sys.argv[1]
+with open(sys.argv[2]) as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        rec = json.loads(line)
+        if rec.get('name') == sid:
+            with open(sys.argv[3], 'w') as out:
+                out.write(json.dumps(rec) + '\\n')
+            break
+    else:
+        sys.exit(2)
+with open(sys.argv[4]) as f:
+    full_fixed = json.loads(f.read())
+sub = {{sid: full_fixed[sid]}} if sid in full_fixed else {{}}
+with open(sys.argv[5], 'w') as out:
+    out.write(json.dumps(sub))
+" "$struct_id" "{self.parsed_pdbs_jsonl}" "$SUBSET_JSONL" "{self.fixed_jsonl}" "$SUBSET_FIXED"
+
+    if [ ! -s "$SUBSET_JSONL" ]; then
+        echo "  [skip] $struct_id: not found in parsed_pdbs.jsonl"
+        echo "${{struct_id}},ProteinMPNN,failure,not_in_parsed_pdbs" >> "{self.missing_csv}"
+        continue
+    fi
+
+    echo "  [run]  $struct_id"
+    set +e
+    {self.container_prefix()}python {self.pmpnn_py} --jsonl_path "$SUBSET_JSONL" --fixed_positions_jsonl "$SUBSET_FIXED" --out_folder {self.pmpnn_out_folder} {pmpnn_options} {self.extra_args_bash()} > "$SUBSET_LOG" 2>&1
+    rc=$?
+    set -e
+    if [ $rc -ne 0 ]; then
+        # Capture last non-empty line of the log as the cause; sanitize commas.
+        CAUSE=$(grep -vE '^\\s*$' "$SUBSET_LOG" | tail -n1 | tr ',\\n' ' ')
+        echo "  [fail] $struct_id (exit $rc): $CAUSE"
+        echo "${{struct_id}},ProteinMPNN,failure,\\"$CAUSE\\"" >> "{self.missing_csv}"
+        cat "$SUBSET_LOG"
+    fi
+done
+
+"""
+
+    def _generate_script_create_table(self) -> str:
+        """Generate the table creation part of the script."""
+        duplicates_flag = " --duplicates" if not self.remove_duplicates else ""
+        fill_gaps_flag = f' --fill-gaps "{self.fill_gaps}"' if self.fill_gaps else ""
+        step_tool_name = os.path.basename(self.output_folder)
+
+        # Check for upstream missing table
+        upstream_missing_path = self._get_upstream_missing_table_path(
+            self.structures_input
+        )
+        upstream_missing_flag = f' --upstream-missing "{upstream_missing_path}"' if upstream_missing_path else ""
+        chains_flag = f' --chains "{chains_arg(self.chains)}"' if self.chains else ""
+
+        return f"""echo "Creating results table and queries files"
+python {self.table_py} {self.seqs_folder} {self.pipeline_name} "-" {self.main_table}
+
+echo "Creating queries CSV and FASTA from results table"
+python {self.fa_to_csv_fasta_py} {self.seqs_folder} {self.queries_csv} {self.queries_fasta} --ds-json "{self.structures_json}"{duplicates_flag}{fill_gaps_flag}{chains_flag} --designs-csv "{self.designs_csv}" --missing-csv "{self.missing_csv}" --step-tool-name "{step_tool_name}"{upstream_missing_flag}
+
+"""
+
+
+    @staticmethod
+    def _selection_param(selection):
+        """A selection as the pipe script's config expects it.
+
+        A dict stays a dict, one entry per chain; anything else collapses to the string
+        form, with "-" standing for "nothing selected".
+        """
+        if isinstance(selection, dict):
+            return {c: (str(v) if isinstance(v, TableReference) else v)
+                    for c, v in selection.items()}
+        if isinstance(selection, TableReference):
+            return str(selection)
+        return selection or "-"
+
+    def get_output_files(self) -> Dict[str, Any]:
+        """Get expected output files after ProteinMPNN execution."""
+        # One design per (structure, sample); the chain rows below hang off these.
+        design_ids = generate_multiplied_ids_pattern(
+            self.structures_stream.ids, f"<1..{self.num_sequences}>",
+            input_stream_name="structures"
+        )
+        sequence_ids = chain_row_ids(design_ids, self.chains)
+
+        # Content-bearing sequences stream: queries_csv lives under
+        # sequences/ and doubles as the map_table.
+        sequences = DataStream(
+            name="sequences",
+            ids=sequence_ids,
+            files=[],
+            map_table=self.queries_csv,
+            format="csv"
+        )
+
+        # The grouping key for the chain rows above: one row per design, whatever
+        # `chains` does to the sequences stream's cardinality.
+        designs = DataStream(
+            name="designs",
+            ids=design_ids,
+            files=[],
+            map_table=self.designs_csv,
+            format="csv"
+        )
+
+        # FASTA stream: shared single artifact with one record per designed
+        # sequence. The raw ProteinMPNN execution/seqs/<parent>.fa files are
+        # per-structure dumps and may contain multiple sequence records, so
+        # exposing them as per-ID files makes Panda copy whole multi-record
+        # files when filtering per sequence. The post-processed queries_fasta
+        # is the canonical stream artifact and can be sliced by record ID.
+        fasta = DataStream(
+            name="fasta",
+            ids=sequence_ids,
+            files=self.queries_fasta,
+            map_table=self.queries_csv,
+            format="fasta",
+            metadata={
+                "sequences_per_file": self.num_sequences,
+                "contains_original": False,
+                "source": "postprocessed_queries_fasta",
+            }
+        )
+
+        tables = {
+            "sequences": TableInfo(
+                name="sequences",
+                path=self.queries_csv,
+                columns=["id", "design", "structures.id", "source_pdb", "chain", "sequence",
+                         "score", "seq_recovery", "gaps"],
+                description="ProteinMPNN sequence results, one row per designed chain"
+            ),
+            "designs": TableInfo(
+                name="designs",
+                path=self.designs_csv,
+                columns=["id", "structures.id", "source_pdb", "n_chains", "score", "seq_recovery"],
+                description="One row per design, before the chain split"
+            ),
+            "missing": TableInfo(
+                name="missing",
+                path=self.missing_csv,
+                columns=["id", "removed_by", "kind", "cause"],
+                description="IDs removed (duplicates or upstream) with removal reason"
+            )
+        }
+
+        return {
+            "sequences": sequences,
+            "designs": designs,
+            "fasta": fasta,
+            "tables": tables,
+            "output_folder": self.output_folder
+        }
+
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize configuration."""
+        base_dict = super().to_dict()
+        base_dict.update({
+            "mpnn_params": {
+                "num_sequences": self.num_sequences,
+                "fixed": str(self.fixed) if isinstance(self.fixed, TableReference) else self.fixed,
+                "redesigned": (str(self.redesigned)
+                               if isinstance(self.redesigned, TableReference)
+                               else self.redesigned),
+                "chains": self.chains,
+                "sampling_temp": self.sampling_temp,
+                "model_name": self.model_name,
+                "soluble_model": self.soluble_model,
+                "remove_duplicates": self.remove_duplicates,
+                "bias_AA_jsonl": self.bias_AA_jsonl,
+                "omit_AA_jsonl": self.omit_AA_jsonl,
+                "seed": self.seed,
+                "ca_noise_std": self.ca_noise_std,
+            }
+        })
+        return base_dict
+
+
+class SolubleMPNN(ProteinMPNN):
+    """ProteinMPNN restricted to the soluble model. Shares ProteinMPNN's repo/env/identity."""
+
+    def __init__(self,
+                 structures: Union[DataStream, StandardizedOutput],
+                 num_sequences: int = 1,
+                 fixed: Union[str, Tuple['TableInfo', str]] = "",
+                 redesigned: Union[str, Tuple['TableInfo', str]] = "",
+                 chains: Union[str, List[str], None] = None,
+                 sampling_temp: float = 0.1,
+                 model_name: str = "v_48_020",
+                 remove_duplicates: bool = True,
+                 fill_gaps: str = "G",
+                 bias_AA_jsonl: str = "",
+                 omit_AA_jsonl: str = "",
+                 seed: int = 0,
+                 ca_noise_std: float = 0.0,
+                 **kwargs):
+        """ProteinMPNN with soluble_model locked to True. See ProteinMPNN for argument details."""
+        super().__init__(
+            structures=structures,
+            num_sequences=num_sequences,
+            fixed=fixed,
+            redesigned=redesigned,
+            chains=chains,
+            sampling_temp=sampling_temp,
+            model_name=model_name,
+            soluble_model=True,
+            remove_duplicates=remove_duplicates,
+            fill_gaps=fill_gaps,
+            bias_AA_jsonl=bias_AA_jsonl,
+            omit_AA_jsonl=omit_AA_jsonl,
+            seed=seed,
+            ca_noise_std=ca_noise_std,
+            **kwargs,
+        )

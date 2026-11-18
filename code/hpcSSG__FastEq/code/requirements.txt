@@ -1,0 +1,6 @@
+cuequivariance==0.8.0
+#cuequivariance-ops-torch-cu12==0.8.0
+setuptools
+ninja
+hatchling
+editables

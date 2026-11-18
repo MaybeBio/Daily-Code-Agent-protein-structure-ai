@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+"""
+Helper script for PoseChange - executed during execution time.
+
+Calculates ligand pose RMSD and distance metrics between reference
+and target structures using PyMOL.
+"""
+
+import argparse
+import json
+import os
+import sys
+import pandas as pd
+
+# Import unified I/O utilities
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from biopipelines.biopipelines_io import load_datastream, iterate_files
+from biopipelines.id_map_utils import get_mapped_ids
+
+
+def _ligand_rmsd(cmd, ref_sel, tgt_sel):
+    """RMSD between two poses of the same ligand, over a real atom correspondence.
+
+    Returns (rmsd, pairing) where pairing names the correspondence used.
+
+    PyMOL's rms_cur(matchmaker=-1) pairs atoms by selection order. Two files
+    written by different programs list the same molecule's atoms in different
+    orders, so that pairs atoms with the wrong partners -- harmless when the
+    poses are far apart, but it inflates the RMSD of exactly the near-native
+    poses worth trusting. Pair by atom name instead, and fall back to a
+    symmetry-aware graph match when the names do not correspond.
+    """
+    ref_names = []
+    tgt_names = []
+    cmd.iterate(ref_sel, 'names.append(name)', space={'names': ref_names})
+    cmd.iterate(tgt_sel, 'names.append(name)', space={'names': tgt_names})
+
+    if len(set(ref_names)) == len(ref_names) and set(ref_names) == set(tgt_names):
+        # A name-list selection cannot reorder anything -- PyMOL always returns
+        # atoms in object order -- so pair the coordinates here rather than
+        # asking rms_cur to do it.
+        import math
+        ref_xyz = dict(zip(ref_names, cmd.get_coords(ref_sel)))
+        tgt_xyz = dict(zip(tgt_names, cmd.get_coords(tgt_sel)))
+        sq = sum(sum((a - b) ** 2 for a, b in zip(ref_xyz[n], tgt_xyz[n]))
+                 for n in ref_names)
+        return math.sqrt(sq / len(ref_names)), 'atom-name'
+
+    rmsd = _symmetry_aware_rmsd(cmd, ref_sel, tgt_sel)
+    if rmsd is not None:
+        return rmsd, 'symmetry-aware'
+
+    raise ValueError(
+        "Cannot establish an atom correspondence between the two ligands: their "
+        "atom names differ and RDKit could not match them by graph. Positional "
+        "pairing would silently compare unrelated atoms.")
+
+
+def _symmetry_aware_rmsd(cmd, ref_sel, tgt_sel):
+    """Best RMSD over all symmetry-equivalent atom matchings, or None."""
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem, rdMolAlign
+    except ImportError:
+        return None
+
+    try:
+        ref = Chem.MolFromPDBBlock(cmd.get_pdbstr(ref_sel), removeHs=False,
+                                   sanitize=False)
+        tgt = Chem.MolFromPDBBlock(cmd.get_pdbstr(tgt_sel), removeHs=False,
+                                   sanitize=False)
+        if ref is None or tgt is None:
+            return None
+        # The poses are already superposed; GetBestRMS would re-fit them, so score
+        # the best matching in place instead.
+        return rdMolAlign.CalcRMS(tgt, ref)
+    except Exception:
+        return None
+
+
+def calculate_pose_change(cmd, reference_pdb, reference_ligand, target_pdb, target_id,
+                            ligand, reference_alignment, target_alignment,
+                            heavy_only=False):
+    """
+    Calculate pose distance metrics for a single target structure.
+
+    Args:
+        cmd: PyMOL command object (already initialized)
+        reference_pdb: Path to reference structure
+        reference_ligand: Ligand residue name in reference
+        target_pdb: Path to target structure
+        target_id: ID for target structure
+        ligand: Ligand residue name in target
+        reference_alignment: PyMOL selection for reference structure alignment
+        target_alignment: PyMOL selection for target structure alignment
+
+    Returns:
+        Dictionary with pose distance metrics
+    """
+    try:
+        # Load structures
+        cmd.load(reference_pdb, 'reference')
+        cmd.load(target_pdb, 'target')
+
+        # Check ligands exist
+        # Hydrogens are the first thing a format conversion drops (PDBQT keeps only
+        # polar ones), and a pose RMSD over them is noise regardless.
+        h_filter = ' and not elem H' if heavy_only else ''
+        ref_lig_count = cmd.count_atoms(f'reference and resn {reference_ligand}{h_filter}')
+        if ref_lig_count == 0:
+            raise ValueError(
+                f"Ligand '{reference_ligand}' not found in reference structure {reference_pdb}"
+            )
+
+        tgt_lig_count = cmd.count_atoms(f'target and resn {ligand}{h_filter}')
+        if tgt_lig_count == 0:
+            raise ValueError(
+                f"Ligand '{ligand}' not found in target structure {target_pdb}"
+            )
+
+        # rms_cur pairs atoms by selection order and needs equal counts. Given unequal
+        # ones it writes an error to stderr and returns 0.0 rather than raising, so an
+        # impossible comparison would be recorded as a perfect 0.000 A RMSD.
+        if ref_lig_count != tgt_lig_count:
+            raise ValueError(
+                f"Ligand atom counts differ: reference '{reference_ligand}' has "
+                f"{ref_lig_count}, target '{ligand}' has {tgt_lig_count}. "
+                f"rms_cur pairs atoms positionally and cannot compare different "
+                f"molecules — compare the same chemical species on both sides."
+            )
+
+        # Align structures using the specified selections (excluding ligands by default)
+        try:
+            ref_align_sel = f'reference and ({reference_alignment})'
+            tgt_align_sel = f'target and ({target_alignment})'
+            alignment_result = cmd.align(tgt_align_sel, ref_align_sel)
+            alignment_rmsd = alignment_result[0]  # RMSD after alignment
+
+        except Exception as e:
+            raise ValueError(f"Protein alignment failed: {e}")
+
+        # Calculate ligand RMSD after protein alignment
+        try:
+            # Select ligands
+            ref_ligand_sel = f'reference and resn {reference_ligand}{h_filter}'
+            tgt_ligand_sel = f'target and resn {ligand}{h_filter}'
+
+            ligand_rmsd, rmsd_pairing = _ligand_rmsd(
+                cmd, ref_ligand_sel, tgt_ligand_sel)
+
+            num_ligand_atoms = cmd.count_atoms(tgt_ligand_sel)
+
+        except Exception as e:
+            raise ValueError(f"Ligand RMSD calculation failed: {e}")
+
+        # Initialize result dictionary
+        result = {
+            'id': target_id,
+            'target_structure': os.path.basename(target_pdb),
+            'reference_structure': os.path.basename(reference_pdb),
+            'ligand_rmsd': round(ligand_rmsd, 3),
+            'rmsd_pairing': rmsd_pairing,
+            'alignment_rmsd': round(alignment_rmsd, 3),
+            'num_ligand_atoms': num_ligand_atoms,
+            'reference_alignment': reference_alignment,
+            'target_alignment': target_alignment
+        }
+
+        # Calculate centroid distance
+        try:
+            ref_center = cmd.centerofmass(ref_ligand_sel)
+            tgt_center = cmd.centerofmass(tgt_ligand_sel)
+
+            import math
+            centroid_dist = math.sqrt(
+                sum((r - t)**2 for r, t in zip(ref_center, tgt_center))
+            )
+            result['centroid_distance'] = round(centroid_dist, 3)
+
+        except Exception as e:
+            print(f"Warning: Centroid calculation failed for {target_id}: {e}")
+            result['centroid_distance'] = None
+
+        # Calculate orientation angle
+        try:
+            import numpy as np
+
+            ref_coords = cmd.get_coords(ref_ligand_sel)
+            tgt_coords = cmd.get_coords(tgt_ligand_sel)
+
+            if ref_coords is not None and tgt_coords is not None and len(ref_coords) >= 3:
+                def principal_axis(coords):
+                    centered = coords - coords.mean(axis=0)
+                    _, _, vt = np.linalg.svd(centered)
+                    return vt[0]
+
+                ref_axis = principal_axis(np.array(ref_coords))
+                tgt_axis = principal_axis(np.array(tgt_coords))
+
+                cos_angle = np.clip(np.abs(np.dot(ref_axis, tgt_axis)), -1.0, 1.0)
+                angle_deg = np.degrees(np.arccos(cos_angle))
+
+                result['orientation_angle'] = round(float(angle_deg), 2)
+                result['orientation_axis'] = f"{tgt_axis[0]:.3f},{tgt_axis[1]:.3f},{tgt_axis[2]:.3f}"
+            else:
+                result['orientation_angle'] = None
+                result['orientation_axis'] = None
+
+        except Exception as e:
+            print(f"Warning: Orientation calculation failed for {target_id}: {e}")
+            result['orientation_angle'] = None
+            result['orientation_axis'] = None
+
+        return result
+
+    finally:
+        # Clean up loaded structures for next iteration
+        cmd.delete('all')
+
+
+def main():
+    """Main entry point for pose distance analysis."""
+    parser = argparse.ArgumentParser(description='Calculate ligand pose distances')
+    parser.add_argument('--config', required=True, help='Path to JSON config file')
+    args = parser.parse_args()
+
+    # Load configuration
+    with open(args.config, 'r') as f:
+        config = json.load(f)
+
+    reference_pdb = config['reference_pdb']
+    reference_ligand = config['reference_ligand']
+    ligand = config['ligand']
+    reference_alignment = config['reference_alignment']
+    target_alignment = config['target_alignment']
+    output_csv = config['output_csv']
+    multi_reference = config.get('multi_reference', False)
+    heavy_only = config.get('heavy_only', False)
+
+    # Load sample structures DataStream using pipe_biopipelines_io
+    samples_ds = load_datastream(config['samples_json'])
+
+    # Per-structure reference: build an id -> reference_pdb map and match each
+    # sample to its own reference by id/provenance (like Contacts/DistanceSelector).
+    ref_map = {}
+    if multi_reference:
+        reference_ds = load_datastream(config['reference_json'])
+        for rid, rpath in iterate_files(reference_ds):
+            ref_map[rid] = rpath
+        print(f"Per-structure references: {len(ref_map)}")
+
+    # Initialize PyMOL once for all structures
+    try:
+        import pymol
+        from pymol import cmd
+    except ImportError:
+        print("Error: PyMOL is required for PoseChange")
+        print("Install with: conda install -c conda-forge pymol-open-source")
+        sys.exit(1)
+
+    print("Initializing PyMOL...")
+    pymol.finish_launching(['pymol', '-cq'])
+    print("PyMOL initialized")
+
+    print(f"Analyzing pose distances for {len(samples_ds.ids_expanded)} structures")
+    print(f"Reference: {os.path.basename(reference_pdb)}")
+    print(f"Reference ligand: {reference_ligand}")
+    print(f"Target ligand: {ligand}")
+    print(f"Reference alignment: {reference_alignment}")
+    print(f"Target alignment: {target_alignment}")
+
+    # Process each target structure using iterate_files for proper ID-file matching
+    results = []
+    failed = []
+    target_items = list(iterate_files(samples_ds))
+    total = len(target_items)
+
+    sample_ids = [tid for tid, _ in target_items]
+    sample_to_ref = {}
+    if multi_reference and ref_map:
+        map_paths = [p for p in (samples_ds.map_table,) if p]
+        sample_to_ref = get_mapped_ids(
+            source_ids=sample_ids, target_ids=list(ref_map.keys()),
+            unique=True, map_table_paths=map_paths or None,
+        )
+
+    for idx, (target_id, target_pdb) in enumerate(target_items, 1):
+        print(f"[{idx}/{total}] Processing {target_id}...", end=" ")
+        try:
+            ref_for_sample = reference_pdb
+            if multi_reference:
+                matched = sample_to_ref.get(target_id)
+                if matched is None or matched not in ref_map:
+                    print(f"SKIPPED: no matching reference for {target_id}")
+                    failed.append({'id': target_id, 'error': 'no matching reference'})
+                    continue
+                ref_for_sample = ref_map[matched]
+            result = calculate_pose_change(
+                cmd=cmd,
+                reference_pdb=ref_for_sample,
+                reference_ligand=reference_ligand,
+                target_pdb=target_pdb,
+                target_id=target_id,
+                ligand=ligand,
+                reference_alignment=reference_alignment,
+                target_alignment=target_alignment,
+                heavy_only=heavy_only,
+            )
+            results.append(result)
+            print(f"OK (RMSD: {result['ligand_rmsd']:.2f} A)")
+
+        except Exception as e:
+            print(f"FAILED: {e}")
+            failed.append({'id': target_id, 'error': str(e)})
+
+    # Save results to CSV
+    if results:
+        df = pd.DataFrame(results)
+        df.to_csv(output_csv, index=False)
+        print(f"Successfully analyzed {len(results)} structures")
+        print(f"Results saved to: {output_csv}")
+
+        # Print summary statistics
+        print(f"Ligand RMSD statistics:")
+        print(f"  Mean:   {df['ligand_rmsd'].mean():.3f} A")
+        print(f"  Median: {df['ligand_rmsd'].median():.3f} A")
+        print(f"  Min:    {df['ligand_rmsd'].min():.3f} A")
+        print(f"  Max:    {df['ligand_rmsd'].max():.3f} A")
+
+        if 'centroid_distance' in df.columns:
+            print(f"Centroid distance statistics:")
+            print(f"  Mean:   {df['centroid_distance'].mean():.3f} A")
+            print(f"  Median: {df['centroid_distance'].median():.3f} A")
+
+    else:
+        print("All structures failed analysis")
+        sys.exit(1)
+
+    if failed:
+        print(f"{len(failed)} structures failed:")
+        for item in failed:
+            print(f"  {item['id']}: {item['error']}")
+
+    # Clean up PyMOL at the very end
+    print("Shutting down PyMOL...")
+    cmd.quit()
+
+
+if __name__ == "__main__":
+    main()

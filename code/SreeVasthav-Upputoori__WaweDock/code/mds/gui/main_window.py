@@ -1,0 +1,1178 @@
+"""WaweDock main window.
+
+Layout
+------
+* Centre ............ 3D viewer (3Dmol.js via QtWebEngine)
+* Left dock ......... Compact Project Explorer; Selection & Cleanup on demand
+* Right docks ....... Docking Setup; Properties on demand
+* Bottom docks ...... Preparation Report | Log | Jobs (hidden until requested)
+* Workspaces ........ Prepare | Dock | Results & Analysis (shared viewer)
+* Menus/toolbars .... built from a shared ``ActionRegistry``
+
+Every dock and toolbar has a stable ``objectName``; Qt needs it to save and restore layouts.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import platform
+from pathlib import Path
+
+from PySide6 import __version__ as pyside_version
+from PySide6.QtCore import QSettings, QStandardPaths, QTimer, Qt, QUrl, qVersion
+from PySide6.QtGui import (QActionGroup, QCloseEvent, QDesktopServices, QDragEnterEvent, QDropEvent,
+                           QIcon, QKeySequence, QPixmap)
+from PySide6.QtWidgets import (QApplication, QDockWidget, QFileDialog, QInputDialog, QLabel,
+                               QMainWindow, QMenu, QMessageBox, QStyle, QTableWidget,
+                               QTableWidgetItem, QToolBar, QVBoxLayout, QDialog, QWidget)
+
+from mds import APP_NAME, __version__
+from mds.chem.workflow import LigandOutcome
+from mds.core.paths import assets_dir
+from mds.core.startup import default_log_dir
+from mds.gui.actions import ActionRegistry
+from mds.gui.controller import Controller
+from mds.gui.layouts import LAYOUT_VERSION, LayoutManager
+from mds.gui.panels.docking_panel import DockingPanel
+from mds.gui.panels.jobs_panel import JobsPanel
+from mds.gui.panels.log_panel import LogPanel
+from mds.gui.panels.project_explorer import ProjectExplorer
+from mds.gui.panels.properties_panel import PropertiesPanel
+from mds.gui.panels.selection_panel import SelectionPanel
+from mds.gui.panels.protein_health import ProteinHealthPanel
+from mds.gui.panels.results_panel import ReportPanel, ResultsPanel
+from mds.gui.panels.similarity_dialog import SimilarityDialog
+from mds.gui.status_bar import StudioStatusBar
+from mds.gui.theme import Theme, apply_theme
+from mds.gui.viewport import ViewportHost
+from mds.gui.workspaces import WorkspaceHost
+from mds.jobs import JobRunner
+from mds.jobs.diagnostics import JobSystemSelfTest
+from mds.project import Project
+from mds.render.pose_review import PoseReviewSession
+
+log = logging.getLogger("mds.gui")
+
+STRUCTURE_SUFFIXES = frozenset({".pdb", ".ent", ".cif", ".mmcif"})
+LIGAND_SUFFIXES = frozenset({".sdf", ".mol", ".mol2", ".smi", ".smiles", ".csv", ".txt"})
+
+SCIENTIFIC_NOTICE = (
+    "<p>Docking scores produced by this software are <b>predictions</b> from an empirical "
+    "scoring function (AutoDock Vina, reported in kcal/mol). They are not experimentally "
+    "measured binding affinities and are not evidence of biological activity.</p>"
+    "<p>Protein–ligand contacts shown are <b>calculated, distance-based candidates</b> and "
+    "must be distinguished from experimentally verified interactions.</p>"
+    "<p>Protonation states, tautomers, side-chain rebuilding and the chosen binding site are "
+    "assumptions that affect results; validate a target by redocking its co-crystal ligand.</p>"
+)
+
+
+def app_icon() -> QIcon:
+    return QIcon(str(assets_dir() / "binding-pocket.ico"))
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, settings: QSettings, log_dir: Path | None = None, *, use_viewer: bool = True) -> None:
+        super().__init__()
+        self.settings = settings
+        self.log_dir = log_dir
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(app_icon())
+        self.setObjectName("mainWindow")
+        self.resize(1500, 920)
+        self.setAcceptDrops(True)
+        self.setDockOptions(QMainWindow.DockOption.AllowTabbedDocks | QMainWindow.DockOption.AllowNestedDocks
+                            | QMainWindow.DockOption.AnimatedDocks)
+
+        self.job_runner = JobRunner(parent=self)
+        self.controller = Controller(self.job_runner, self)
+        self.actions_ = ActionRegistry(self)
+        self.viewer = None
+        self._pose_object = ""
+        self._receptor_objects: list[str] = []
+        self._source_object = ""
+        self._repair_preview_visibility = {}
+        self._repair_preview_name = "health: repair preview"
+        # Rebuilt-atom markers per object, so the overlay can be switched off
+        # again instead of being stuck on once a repair has been shown.
+        self._reconstructed: dict[str, list] = {}
+        self._reference_objects: list[str] = []
+        self._workspace_mode = 0
+        self._modeling_state = None
+        self._restoring_workspace = False
+        self._focus_state = None
+        self._similarity_dialog: SimilarityDialog | None = None
+
+        self._build_central(use_viewer)
+        self._pose_review = PoseReviewSession(self.viewer) if self.viewer is not None else None
+        self._build_status_bar()
+        self._build_docks()
+        self._build_actions()
+        self._build_menus()
+        self._build_toolbars()
+        self._connect_signals()
+
+        self.layouts = LayoutManager(self, settings)
+        self.layouts.capture_default()
+        self.layouts.restore_session()
+        self.set_theme(Theme(settings.value("appearance/theme", Theme.LIGHT.value)))
+        self.chemistry_notice=QLabel()
+        self.chemistry_notice.setTextFormat(Qt.TextFormat.PlainText)
+        self.chemistry_notice.setWordWrap(True)
+        self.chemistry_notice.setStyleSheet('background:#fff5d9;color:#754900;padding:6px;')
+        self.workspace.layout().insertWidget(1,self.chemistry_notice)
+        self.controller.chemistry_changed.connect(self._chemistry_availability)
+        self._chemistry_availability(self.controller.chemistry)
+        QTimer.singleShot(0,self.controller.check_chemistry)
+        log.info("%s %s started", APP_NAME, __version__)
+
+    def _chemistry_availability(self,status):
+        # Keep controls usable while the startup capability probe is running; the
+        # probe will disable them explicitly if the chemistry backend is unavailable.
+        available = status is None or status.available
+        if status is None:
+            text='Checking available ligand and docking tools...'
+        elif 'protein tools only' in status.reason:
+            text='Protein edition: ligand preparation and docking are not included.'
+        else:
+            text=('Ligand and docking tools are unavailable on this PC. Protein viewing, cleanup and health tools remain available.' if not available else '')
+        self.chemistry_notice.setText(text)
+        self.chemistry_notice.setVisible(bool(text))
+        self.chemistry_notice.setToolTip(status.reason if status is not None else '')
+        for key in ('file.import_ligands','build.from_smiles','prepare.protein','prepare.ligands',
+                    'docking.run','analyse.descriptors','analyse.similarity','analyse.interaction_diagram'):
+            action=self.actions_[key]
+            if action.property('chemistry_tip') is None: action.setProperty('chemistry_tip',action.toolTip())
+            action.setEnabled(available)
+            action.setToolTip(action.property('chemistry_tip') if available else text)
+        self.docking_panel.prep_rec_btn.setEnabled(available)
+        self.docking_panel.step_pages[1].setEnabled(available)
+        self.docking_panel.step_pages[3].setEnabled(available)
+        self.results_panel.setEnabled(available)
+
+    def _on_workspace_changed(self, index: int) -> None:
+        previous = self._workspace_mode
+        if index == 2:
+            if previous != 2 and not self._restoring_workspace:
+                self._modeling_state = self.saveState(LAYOUT_VERSION)
+            for dock in (self.dock_project, self.dock_docking, self.dock_selection, self.dock_properties, self.dock_health,
+                         self.dock_report, self.dock_log, self.dock_jobs):
+                dock.hide()
+        elif not self._restoring_workspace:
+            if previous == 2 and self._modeling_state is not None:
+                self.restoreState(self._modeling_state, LAYOUT_VERSION)
+            self._workspace_mode = index
+            current = self.docking_panel.current_step
+            if index == 0 and current not in (0, 1):
+                self.docking_panel.show_step(0)
+            elif index == 1 and current not in (2, 3, 4):
+                self.docking_panel.show_step(3)
+            if self._focus_state is None:
+                self.dock_project.show()
+                self.dock_docking.show()
+        self._workspace_mode = index
+
+    def _activate_docking_step(self, index: int) -> None:
+        if not self._restoring_workspace:
+            self.workspace.select(0 if index < 2 else 1)
+        if not self._restoring_workspace:
+            self.dock_docking.show()
+            self.dock_docking.raise_()
+
+    def _save_workspace_state(self, prefix: str) -> None:
+        self.settings.setValue(f"{prefix}/workspace", self.workspace.tabs.currentIndex())
+        self.settings.setValue(f"{prefix}/resultsSplit", self.workspace.splitter.saveState())
+        self.settings.setValue(f"{prefix}/analysisSplit", self.results_panel.splitter.saveState())
+        self.settings.setValue(f"{prefix}/workspaceVersion", LAYOUT_VERSION)
+        if self._modeling_state is not None:
+            self.settings.setValue(f"{prefix}/modelingState", self._modeling_state)
+        else:
+            self.settings.remove(f"{prefix}/modelingState")
+
+    def _restore_workspace_state(self, prefix: str) -> None:
+        if int(self.settings.value(f"{prefix}/workspaceVersion", 0)) != LAYOUT_VERSION:
+            return
+        index = max(0, min(2, int(self.settings.value(f"{prefix}/workspace", 0))))
+        self._restoring_workspace = True
+        try:
+            self._modeling_state = self.settings.value(f"{prefix}/modelingState")
+            if self.workspace.tabs.currentIndex() == index:
+                self._on_workspace_changed(index)
+            else:
+                self.workspace.select(index)
+            for key, splitter in (("resultsSplit", self.workspace.splitter),
+                                  ("analysisSplit", self.results_panel.splitter)):
+                state = self.settings.value(f"{prefix}/{key}")
+                if state is not None:
+                    splitter.restoreState(state)
+        finally:
+            self._restoring_workspace = False
+
+    def _reset_layout(self) -> None:
+        self.workspace.select(0)
+        self.layouts.reset()
+        self._modeling_state = None
+        self.workspace.splitter.setSizes([550, 850])
+
+    def _clear_pose(self) -> None:
+        if self._pose_object:
+            self._viewer_call("clear_residue_selection")
+            self._viewer_call("remove_object", self._pose_object)
+            self.project_explorer.remove_object(self._pose_object)
+            if self._pose_review is not None:
+                self._pose_review.has_pose = False
+            self._pose_object = ""
+
+    # ================================================================ build
+    def _build_central(self, use_viewer: bool) -> None:
+        self.viewport = ViewportHost()
+        self.workspace = WorkspaceHost(self.viewport)
+        self.setCentralWidget(self.workspace)
+        if not use_viewer:
+            return
+        try:
+            from mds.render.mol3d import Mol3DViewer
+            self.viewer = Mol3DViewer()
+            self.viewport.set_viewer(self.viewer)
+        except Exception as exc:  # noqa: BLE001 — QtWebEngine missing/blocked: run without 3D
+            log.error("3D viewer unavailable: %s", exc)
+
+    def _build_status_bar(self) -> None:
+        self.status = StudioStatusBar()
+        self.setStatusBar(self.status)
+
+    def _add_dock(self, widget: QWidget, title: str, name: str, area: Qt.DockWidgetArea) -> QDockWidget:
+        dock = QDockWidget(title, self)
+        dock.setObjectName(name)
+        dock.setWidget(widget)
+        self.addDockWidget(area, dock)
+        return dock
+
+    def _build_docks(self) -> None:
+        left, right, bottom = (Qt.DockWidgetArea.LeftDockWidgetArea, Qt.DockWidgetArea.RightDockWidgetArea,
+                               Qt.DockWidgetArea.BottomDockWidgetArea)
+        self.project_explorer = ProjectExplorer()
+        self.selection_panel = SelectionPanel(self.controller)
+        self.properties = PropertiesPanel()
+        self.docking_panel = DockingPanel(self.controller)
+        self.results_panel = ResultsPanel(self.controller)
+        self.report_panel = ReportPanel(self.controller)
+        self.log_panel = LogPanel()
+        self.jobs_panel = JobsPanel(self.job_runner)
+
+        self.dock_project = self._add_dock(self.project_explorer, "Project Explorer", "dockProject", left)
+        self.dock_selection = self._add_dock(self.selection_panel, "Selection & Cleanup", "dockSelection", left)
+        self.dock_docking = self._add_dock(self.docking_panel, "Docking Setup", "dockDocking", right)
+        self.health_panel = ProteinHealthPanel(self.controller)
+        self.dock_health = self._add_dock(self.health_panel, "Protein Health & Repair", "dockProteinHealth", right)
+        # Keep diagnostic controls readable when this dock is first opened.
+        self.dock_health.setMinimumWidth(360)
+        self.dock_properties = self._add_dock(self.properties, "Properties", "dockProperties", right)
+        self.workspace.set_results(self.results_panel)
+        self.dock_report = self._add_dock(self.report_panel, "Preparation Report", "dockReport", bottom)
+        self.dock_log = self._add_dock(self.log_panel, "Log", "dockLog", bottom)
+        self.dock_jobs = self._add_dock(self.jobs_panel, "Jobs", "dockJobs", bottom)
+
+        self.tabifyDockWidget(self.dock_docking, self.dock_health)
+        self.tabifyDockWidget(self.dock_docking, self.dock_properties)
+        for a, b in ((self.dock_report, self.dock_log), (self.dock_log, self.dock_jobs)):
+            self.tabifyDockWidget(a, b)
+        self.dock_docking.raise_()
+        self.tabifyDockWidget(self.dock_project, self.dock_selection)
+        self.dock_project.raise_()
+        for dock in (self.dock_selection, self.dock_properties, self.dock_health,
+                     self.dock_report, self.dock_log, self.dock_jobs):
+            dock.hide()
+        self.resizeDocks([self.dock_project, self.dock_docking], [220, 340], Qt.Orientation.Horizontal)
+        logging.getLogger("mds").addHandler(self.log_panel.handler)
+
+    def _icon(self, pixmap: QStyle.StandardPixmap) -> QIcon:
+        return self.style().standardIcon(pixmap)
+
+    def _build_actions(self) -> None:
+        a, sp, c = self.actions_, QStyle.StandardPixmap, self.controller
+        sk = QKeySequence.StandardKey
+        # File
+        a.add("file.new", "&New Project…", slot=self._new_project, shortcut=sk.New, icon=self._icon(sp.SP_FileIcon))
+        a.add("file.open", "&Open Project…", slot=self._open_project, shortcut=sk.Open,
+              icon=self._icon(sp.SP_DialogOpenButton))
+        a.add("file.save", "&Save Project", slot=self._save_project, shortcut=sk.Save,
+              icon=self._icon(sp.SP_DialogSaveButton))
+        a.add("file.save_as", "Save Project &As (copy)…", slot=self._save_project_as, shortcut=sk.SaveAs)
+        a.add("file.archive", "Archive Project (zip)…", slot=self._archive_project)
+        a.add("file.open_structure", "Open &Structure…", slot=self._open_structure, shortcut="Ctrl+Shift+O",
+              icon=self._icon(sp.SP_DirOpenIcon), tip="Open a PDB or mmCIF protein structure")
+        a.add("file.fetch_pdb", "Fetch from &PDB…", slot=self._fetch_pdb, shortcut="Ctrl+Shift+P",
+              icon=self._icon(sp.SP_ArrowDown), tip="Download a structure from the RCSB Protein Data Bank")
+        a.add("file.import_ligands", "&Import Ligands…", slot=lambda: self.docking_panel._import_file(), shortcut="Ctrl+I")
+        a.add("file.export_image", "Export &Image…", slot=self._export_image)
+        a.add("file.exit", "E&xit", slot=self.close, shortcut=sk.Quit)
+        # Edit
+        a.add("edit.undo", "Undo Structure Edit", slot=c.undo_structure_edit, shortcut=sk.Undo)
+        a.add("edit.redo", "Redo Structure Edit", slot=c.redo_structure_edit, shortcut=sk.Redo)
+        a.add("edit.delete", "Delete Selected Atoms", slot=c.delete_selected_residues)
+        a["edit.undo"].setEnabled(False)
+        a["edit.redo"].setEnabled(False)
+        a.add("edit.select_around", "Show Residues Around Ligand…", slot=self._select_around)
+        a.add("edit.clear_selection", "Clear Residue Display", slot=self._clear_around)
+        # View
+        a.add("view.fullscreen", "&Full Screen", slot=self._toggle_fullscreen, shortcut=sk.FullScreen, checkable=True)
+        a.add("view.theme.light", "&Light", slot=lambda on: on and self.set_theme(Theme.LIGHT), checkable=True)
+        a.add("view.theme.dark", "&Dark", slot=lambda on: on and self.set_theme(Theme.DARK), checkable=True)
+        a.add("view.theme.toggle", "Toggle Theme", slot=self._toggle_theme, shortcut="Ctrl+Shift+T")
+        a.add("view.reset_camera", "Reset &Camera", slot=lambda: self._viewer_call("zoom_to", None), shortcut="Home")
+        a.add("view.label_residues", "Label Protein Residues", slot=lambda on: self._viewer_call("label_residues", on),
+              checkable=True)
+        a.add("view.measure.distance", "Measure &Distance", slot=lambda: self._measure("distance"))
+        a.add("view.measure.angle", "Measure &Angle", slot=lambda: self._measure("angle"))
+        a.add("view.measure.dihedral", "Measure D&ihedral", slot=lambda: self._measure("dihedral"))
+        a.add("view.measure.off", "Stop Measuring", slot=lambda: self._measure("none"))
+        a.add("view.measure.clear", "Clear Measurements", slot=lambda: self._viewer_call("clear_measurements"))
+        a.add("view.exit_fullscreen", "Exit Molecular Full Screen",
+              slot=lambda: a["view.fullscreen"].setChecked(False), shortcut="Escape")
+        self.addAction(a["view.exit_fullscreen"])
+        # Build
+        a.add("build.from_smiles", "Ligand from &SMILES…", slot=lambda: self.docking_panel._add_smiles())
+        # Prepare
+        a.add("prepare.protein", "Prepare &Protein", slot=lambda: self._run_docking_step(0, self.docking_panel._prepare_receptor),
+              tip="Receptor preparation workflow")
+        a.add("prepare.ligands", "Prepare &Ligands", slot=lambda: self._run_docking_step(1, self.docking_panel._prepare_ligands),
+              tip="Ligand preparation workflow")
+        # Docking
+        a.add("docking.box", "Define Docking &Box", slot=self._focus_site)
+        a.add("docking.run", "&Run Docking (AutoDock Vina)", slot=lambda: self._run_docking_step(3, self.docking_panel._run), shortcut="F5")
+        a.add("docking.cancel", "&Cancel Docking", slot=c.cancel_docking)
+        a.add("docking.screen", "&Virtual Screening queue / resume…", planned_phase=9,
+              tip="Importing several ligands already docks them as a batch")
+        # Analyse
+        a.add("analyse.results", "Docking &Results", slot=lambda: self.workspace.select(2))
+        a.add("analyse.descriptors", "Ligand &Descriptors / Drug-likeness…", slot=self._show_descriptors)
+        a.add("analyse.similarity", "&Similarity && Clustering…", slot=self._show_similarity,
+              tip="Tanimoto/Morgan fingerprint similarity and clustering of the prepared ligands")
+        a.add("analyse.interaction_diagram", "2D Interaction &Diagram", slot=self._show_interactions,
+              tip="Protein-ligand interaction fingerprint (ProLIF) for the selected pose")
+        # Tools
+        a.add("tools.selftest", "Run Job System &Self-Test", slot=self._run_self_test)
+        a.add("tools.cancel_all", "&Cancel All Jobs", slot=self.job_runner.cancel_all)
+        a.add("tools.log_folder", "Open &Log Folder", slot=self._open_log_folder)
+        a.add("tools.project_folder", "Open &Project Folder", slot=self._open_project_folder)
+        # Window
+        a.add("window.save_layout", "&Save Layout As…", slot=self._save_named_layout)
+        a.add("window.reset_layout", "&Reset Layout", slot=self._reset_layout)
+        # Help
+        a.add("help.notice", "&Scientific Interpretation Notice", slot=self._show_scientific_notice)
+        a.add("help.about", "&About WaweDock", slot=self._show_about)
+
+    def _build_menus(self) -> None:
+        a, mb = self.actions_, self.menuBar()
+
+        def menu(title: str, keys: list[str | None]) -> QMenu:
+            m = mb.addMenu(title)
+            for k in keys:
+                m.addSeparator() if k is None else m.addAction(a[k])
+            return m
+
+        menu("&File", ["file.new", "file.open", "file.save", "file.save_as", "file.archive", None,
+                       "file.open_structure", "file.fetch_pdb", "file.import_ligands", "file.export_image", None,
+                       "file.exit"])
+        menu("&Edit", ["edit.undo", "edit.redo", "edit.delete", None,
+                       "edit.select_around", "edit.clear_selection"])
+        m = mb.addMenu("&View")
+        theme_menu = m.addMenu("&Theme")
+        group = QActionGroup(self)
+        for key in ("view.theme.light", "view.theme.dark"):
+            group.addAction(a[key])
+            theme_menu.addAction(a[key])
+        theme_menu.addSeparator()
+        theme_menu.addAction(a["view.theme.toggle"])
+        self.toolbars_menu = m.addMenu("Tool&bars")
+        m.addSeparator()
+        m.addAction(a["view.reset_camera"])
+        m.addAction(a["view.label_residues"])
+        meas = m.addMenu("&Measure")
+        for k in ("view.measure.distance", "view.measure.angle", "view.measure.dihedral", "view.measure.off",
+                  "view.measure.clear"):
+            meas.addAction(a[k])
+        m.addSeparator()
+        m.addAction(a["view.fullscreen"])
+        menu("&Build", ["build.from_smiles"])
+        menu("&Prepare", ["prepare.protein", "prepare.ligands"])
+        menu("&Docking", ["docking.box", "docking.run", "docking.cancel", None, "docking.screen"])
+        menu("&Analyse", ["analyse.results", "analyse.descriptors", "analyse.interaction_diagram",
+                          "analyse.similarity"])
+        m = menu("&Tools", ["tools.project_folder", "tools.log_folder", None, "tools.cancel_all"])
+        m.addMenu("&Diagnostics").addAction(a["tools.selftest"])
+        m = mb.addMenu("&Window")
+        panels = m.addMenu("&Panels")
+        for dock in (self.dock_project, self.dock_docking, self.dock_properties,
+                     self.dock_selection, self.dock_report, self.dock_log,
+                     self.dock_jobs, self.dock_health):
+            panels.addAction(dock.toggleViewAction())
+        m.addSeparator()
+        m.addAction(a["window.save_layout"])
+        self.restore_layout_menu = m.addMenu("Restore &Layout")
+        self.delete_layout_menu = m.addMenu("&Delete Layout")
+        self.restore_layout_menu.aboutToShow.connect(
+            lambda: self._fill_layout_menu(self.restore_layout_menu, self.layouts.restore_named))
+        self.delete_layout_menu.aboutToShow.connect(
+            lambda: self._fill_layout_menu(self.delete_layout_menu, self.layouts.delete_named))
+        m.addAction(a["window.reset_layout"])
+        menu("&Help", ["help.notice", None, "help.about"])
+
+    def _build_toolbars(self) -> None:
+        a, sp = self.actions_, QStyle.StandardPixmap
+        icons = {"docking.box": sp.SP_FileDialogDetailedView,
+                 "docking.run": sp.SP_MediaPlay, "docking.cancel": sp.SP_MediaStop,
+                 "view.reset_camera": sp.SP_BrowserReload,
+                 "view.fullscreen": sp.SP_TitleBarMaxButton}
+        for key, icon in icons.items():
+            a[key].setIcon(self._icon(icon))
+        tb = QToolBar("Workspace", self)
+        tb.setObjectName("toolbarWorkspace")
+        tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        for keys in (("file.open", "file.save", "file.open_structure", "file.fetch_pdb"),
+                     ("docking.box", "docking.run", "docking.cancel"),
+                     ("view.reset_camera", "view.fullscreen")):
+            if tb.actions():
+                tb.addSeparator()
+            for key in keys:
+                tb.addAction(a[key])
+        self.addToolBar(tb)
+        self.toolbars_menu.addAction(tb.toggleViewAction())
+
+    def _connect_signals(self) -> None:
+        c, ex = self.controller, self.project_explorer
+        self.workspace.workspace_changed.connect(self._on_workspace_changed)
+        self.docking_panel.step_activated.connect(self._activate_docking_step)
+        self.docking_panel.results_requested.connect(self.actions_["analyse.results"].trigger)
+        self.docking_panel.protein_health_requested.connect(self._show_protein_health)
+        self.health_panel.issue_requested.connect(self._focus_health_issue)
+        self.health_panel.highlights_changed.connect(self._health_highlights)
+        self.health_panel.rebuilt_highlights_changed.connect(self._rebuilt_highlights)
+        self.health_panel.comparison_requested.connect(self._repair_comparison)
+        self.dock_health.visibilityChanged.connect(self._health_visibility)
+        ex.item_selected.connect(self._on_item_selected)
+        ex.visibility_changed.connect(lambda n, v: self._viewer_call("set_visible", n, v))
+        ex.representation_requested.connect(lambda n, r: self._viewer_call("set_representation", n, r))
+        ex.color_requested.connect(lambda n, s: self._viewer_call("set_color_scheme", n, s))
+        ex.zoom_requested.connect(lambda n: self._viewer_call("zoom_to", n))
+        ex.remove_requested.connect(self._remove_object)
+        ex.reference_requested.connect(self._use_as_reference)
+        self.job_runner.active_count_changed.connect(self.status.set_active_jobs)
+        self.job_runner.job_progress.connect(lambda _i, pct, _m: self.status.set_progress(pct))
+        c.message.connect(lambda m: self.status.showMessage(m, 8000))
+        c.error.connect(self._show_error)
+        c.project_changed.connect(self._update_title)
+        c.structure_loaded.connect(self._on_structure_loaded)
+        c.structure_edited.connect(self._on_structure_edited)
+        c.receptor_prepared.connect(self._on_receptor_prepared)
+        c.ligands_prepared.connect(self._on_ligands_prepared)
+        c.box_changed.connect(self._on_box_changed)
+        c.reference_changed.connect(lambda _name: self._on_box_changed(c.box))
+        c.docking_finished.connect(self._on_docking_finished)
+        c.docking_started.connect(self._sync_docking_actions)
+        c.docking_finished.connect(self._sync_docking_actions)
+        self.job_runner.job_failed.connect(self._sync_docking_actions)
+        self.job_runner.job_cancelled.connect(self._sync_docking_actions)
+        c.selection_expand_requested.connect(lambda: self._viewer_call("expand_selection_to_chain"))
+        c.selection_invert_requested.connect(lambda: self._viewer_call("invert_selection"))
+        c.selection_mode_requested.connect(lambda mode: self._viewer_call("set_selection_mode", mode))
+        c.selection_radius_requested.connect(lambda radius: self._viewer_call("select_within_radius", radius))
+        c.edit_history_changed.connect(self._on_edit_history)
+        c.editing_view_requested.connect(self._show_editing_structure)
+        c.selection_cleared.connect(lambda: self._viewer_call("clear_selection"))
+        self.results_panel.pose_selected.connect(self._show_pose)
+        self.results_panel.pose_cleared.connect(self._clear_pose)
+        self.results_panel.review_bar.settings_changed.connect(self._apply_pose_review)
+        self.results_panel.review_bar.fit_requested.connect(self._fit_pose_review)
+        self.results_panel.pharmacophore_panel.display_requested.connect(self._show_pharmacophore)
+        if self.viewer is not None:
+            self.viewer.visibility_changed.connect(self._review_visibility_changed)
+            self.viewer.pose_reference_requested.connect(self._use_as_reference)
+            self.viewer.atom_info.connect(self.status.set_selection)
+            self.viewer.measurement.connect(lambda m: self.status.showMessage(m, 15000))
+            self.viewer.selection_changed.connect(c.set_selection)
+            self.viewer.edit_requested.connect(self._on_viewer_edit)
+            self.viewer.health_inspect_requested.connect(self._inspect_health_selection)
+            self.viewer.health_repair_requested.connect(self._repair_health_selection)
+        self._sync_docking_actions()
+
+    def _show_protein_health(self) -> None:
+        self.dock_health.show()
+        self.dock_health.raise_()
+
+    def _inspect_health_selection(self) -> None:
+        self._show_protein_health()
+        name = self.controller.source_pdb.stem if self.controller.source_pdb else ""
+        self.health_panel.inspect_selection(self.controller.selection.get(name, []))
+
+    def _repair_health_selection(self) -> None:
+        self._show_protein_health()
+        self.health_panel.repair_scope.setCurrentIndex(1)
+        self.health_panel.propose()
+
+    def _health_visibility(self, visible) -> None:
+        if not visible and self._repair_preview_visibility:
+            self.health_panel.comparison.setCurrentIndex(0)
+            self._repair_comparison('clear')
+
+    def _repair_comparison(self, mode) -> None:
+        if not self.viewer: return
+        self.viewer.remove_object(self._repair_preview_name)
+        if mode=='clear':
+            for name,visible in self._repair_preview_visibility.items():
+                self.project_explorer.set_visible(name,visible)
+                self.viewer.set_visible(name,visible)
+            self._repair_preview_visibility.clear()
+            return
+        result=self.health_panel.repair_result
+        if result is None: return
+        if mode=='after' and not self._repair_preview_visibility:
+            names=[self._source_object,*self._receptor_objects]
+            self._repair_preview_visibility={name:self.project_explorer.is_visible(name) for name in names if name}
+        if not self._repair_preview_visibility: return
+        for name in self._repair_preview_visibility:
+            self.project_explorer.set_visible(name,False)
+            self.viewer.set_visible(name,False)
+        if mode=='before':
+            # The comparison is against the exact source being repaired, even if
+            # a prepared receptor had been visible when review was opened.
+            self.project_explorer.set_visible(self._source_object,True)
+            self.viewer.set_visible(self._source_object,True)
+            return
+        import gemmi
+        st=gemmi.read_structure(result.candidate)
+        fmt='cif' if Path(result.candidate).suffix.lower() in ('.cif','.mmcif') else 'pdb'
+        text=st.make_mmcif_document().as_string() if fmt=='cif' else st.make_pdb_string()
+        self.viewer.add_object(self._repair_preview_name,text,fmt,'protein',None,True)
+        self.viewer.copy_appearance(self._source_object,self._repair_preview_name)
+        self._set_reconstructed(self._repair_preview_name,[a['atom_index'] for a in result.added+result.inherited])
+
+    def _set_reconstructed(self, name: str, indices) -> None:
+        """Remember an object's rebuilt atoms and draw them if the toggle is on."""
+        self._reconstructed[name] = list(indices)
+        if self.viewer:
+            self.viewer.highlight_reconstructed(name, self._reconstructed[name] if self._show_rebuilt() else [])
+
+    def _show_rebuilt(self) -> bool:
+        return self.health_panel.rebuilt_highlights.isChecked()
+
+    def _rebuilt_highlights(self, on: bool) -> None:
+        if not self.viewer:
+            return
+        for name, indices in self._reconstructed.items():
+            self.viewer.highlight_reconstructed(name, indices if on else [])
+
+    def _health_highlights(self, report) -> None:
+        if self.viewer:
+            self.viewer.set_health_issues(self._source_object, report.issues if report else [])
+
+    def _focus_health_issue(self, issue) -> None:
+        if not issue.atoms or not self.controller.source_pdb or not self.viewer:
+            return
+        self._show_editing_structure()
+        self.viewer.set_selection({self._source_object: issue.atoms})
+        self.viewer._call("focusSelection")
+
+    def _sync_docking_actions(self, *_args) -> None:
+        running = self.controller.docking_running
+        self.actions_["docking.run"].setEnabled(not running)
+        self.actions_["docking.cancel"].setEnabled(running)
+
+    def _on_edit_history(self, undo: bool, redo: bool) -> None:
+        self.actions_["edit.undo"].setEnabled(undo)
+        self.actions_["edit.redo"].setEnabled(redo)
+
+    def _on_viewer_edit(self, action: str) -> None:
+        handlers = {"delete": self.controller.delete_selected_residues,
+                    "undo": self.controller.undo_structure_edit,
+                    "redo": self.controller.redo_structure_edit}
+        if action in handlers:
+            handlers[action]()
+
+    def _show_editing_structure(self) -> None:
+        if self.controller.source_pdb is None:
+            return
+        for name in self._receptor_objects:
+            self.project_explorer.set_visible(name, False)
+            self._viewer_call("set_visible", name, False)
+        source = self.controller.source_pdb.stem
+        self.project_explorer.set_visible(source, True)
+        self._viewer_call("set_visible", source, True)
+        self._viewer_call("set_measure_mode", "none")
+
+    # ============================================================ viewer glue
+    def _viewer_call(self, method: str, *args) -> None:
+        if self.viewer is None:
+            self.status.showMessage("3D viewer is unavailable in this session", 5000)
+            return
+        getattr(self.viewer, method)(*args)
+
+    def _object_props(self, **kw) -> dict:
+        return {k: v for k, v in kw.items()}
+
+    def _on_structure_loaded(self, name: str, path: str, *, preserve_view: bool = False,
+                             previous_name: str | None = None) -> None:
+        import gemmi
+        from mds.chem.edit import atom_records
+        if self._source_object and self._source_object != name:
+            if previous_name is None:
+                self._viewer_call("remove_object", self._source_object)
+            self.project_explorer.remove_object(self._source_object)
+        if not preserve_view:
+            for overlay in self._receptor_objects:
+                self._viewer_call("remove_object", overlay)
+                self.project_explorer.remove_object(overlay)
+            self._receptor_objects.clear()
+            self._reference_objects.clear()
+            self.results_panel.review_bar.set_references([])
+        self._source_object = name
+        st = gemmi.read_structure(path)
+        # One canonical representation for PDB and mmCIF. Keep every model, chain,
+        # hydrogen, alternate location, water and hetero group on import.
+        fmt = "cif" if Path(path).suffix.lower() in (".cif", ".mmcif") else "pdb"
+        text = st.make_mmcif_document().as_string() if fmt == "cif" else st.make_pdb_string()
+        if self.viewer:
+            if previous_name is not None:
+                self.viewer.replace_structure(previous_name, name, text, fmt, atom_records(st))
+            else:
+                self.viewer.add_object(name, text, fmt, "protein", atom_records(st), preserve_view)
+        if self.viewer:
+            from mds.chem.repair import reconstructed_atom_indices
+            reconstructed=reconstructed_atom_indices(Path(path),atom_records(st))
+            if reconstructed: self._set_reconstructed(name,reconstructed)
+        h = self.controller.hetero
+        waters = sum(1 for x in h if x.kind == "water")
+        ligs = [x.label for x in h if x.kind == "ligand"]
+        self.project_explorer.upsert_object("Proteins", name, {
+            "Type": "Protein structure (as imported)", "File": Path(path).name,
+            "Waters": waters, "Hetero groups": ", ".join(ligs) or "none"}, kind="protein")
+        self.dock_docking.raise_()
+        self._refresh_review_references()
+        self._apply_pose_review()
+
+    def _on_structure_edited(self, name: str, path: str) -> None:
+        """Reload the loaded protein after a delete-selection / keep-only edit."""
+        if self.viewer and not self.project_explorer.is_visible(name):
+            active = next((n for n in self._receptor_objects
+                           if self.project_explorer.kind_of(n) == "protein" and
+                           self.project_explorer.is_visible(n)), None)
+            if active:
+                self.viewer.copy_appearance(active, name)
+        self.project_explorer.remove_object(name)
+        # Drop any 'prepared' object we had for the pre-edit structure: it is now stale.
+        for prepared_name in self._receptor_objects:
+            if self.viewer:
+                self.viewer.remove_object(prepared_name)
+            self.project_explorer.remove_object(prepared_name)
+        self._receptor_objects.clear()
+        self._viewer_call("clear_measurements")
+        self._viewer_call("clear_residue_selection")
+        self._on_structure_loaded(Path(path).stem, path, preserve_view=True, previous_name=name)
+        self.dock_selection.show()
+        self.dock_selection.raise_()
+
+    def _on_receptor_prepared(self, result) -> None:
+        raw = self.controller.source_pdb.stem if self.controller.source_pdb else "receptor"
+        name = f"{raw} (prepared)"
+        self._receptor_objects.append(name)
+        if self.viewer:
+            self.viewer.add_object(name, result.prepared_pdb.read_text(), "pdb", "protein")
+        self.project_explorer.upsert_object("Proteins", name, {
+            "Type": "Prepared receptor (hydrogens added)", "Atoms": result.n_atoms,
+            "PDBQT": result.pdbqt.name, "Warnings": len(result.report.warnings)}, kind="protein")
+        if self.project_explorer.find(raw):
+            self.project_explorer.set_visible(raw, False)
+            self._viewer_call("set_visible", raw, False)
+        for h in result.hetero:
+            if h.kind == "ligand" and h.extracted_to and self.viewer:
+                label = f"{h.label} (crystal)"
+                self._receptor_objects.append(label)
+                if label not in self._reference_objects:
+                    self._reference_objects.append(label)
+                self.viewer.add_object(label, h.extracted_to.read_text(), "pdb", "ligand")
+                self.project_explorer.upsert_object("Ligands", label, {
+                    "Type": "Co-crystal ligand (extracted)", "Atoms": h.atoms}, kind="ligand")
+        self._refresh_review_references()
+        self._apply_pose_review()
+        if self.controller.box:
+            self._on_box_changed(self.controller.box)
+
+    def _on_ligands_prepared(self, outcome) -> None:
+        from rdkit import Chem
+        for lig in outcome.prepared:
+            props = {"Type": "Prepared ligand", "SMILES": lig.smiles, **lig.properties}
+            self.project_explorer.upsert_object("Ligands", lig.name, props, visible=False, kind="ligand")
+            if self.viewer:
+                self.viewer.add_object(lig.name, Chem.MolToMolBlock(lig.mol), "sdf", "ligand")
+                self.viewer.set_visible(lig.name, False)
+        if self.controller.box is not None:
+            self._on_box_changed(self.controller.box)
+
+    def _on_box_changed(self, box) -> None:
+        if box is None:
+            self._viewer_call("clear_box")
+            self.project_explorer.remove_object("Docking box")
+            return
+        report = self.controller.validate_box()
+        if (len(box.center) != 3 or len(box.size) != 3 or
+                any(not math.isfinite(value) for value in (*box.center,*box.size)) or
+                any(value <= 0 for value in box.size)):
+            self._viewer_call("clear_box")
+            return
+        status = "error" if report.errors else "warning" if report.warnings else "ok"
+        self._viewer_call("show_box", box.center, box.size, status)
+        self.project_explorer.upsert_object("Docking Boxes", "Docking box", {
+            "Type": "AutoDock Vina search space", **{k: f"{v:.2f}" for k, v in box.as_dict().items()},
+            "Volume (Å³)": f"{box.volume:,.0f}"}, kind="box")
+
+    def _on_docking_finished(self, outcomes: list[LigandOutcome]) -> None:
+        # ResultsPanel can select the first pose before this slot runs.
+        for name in self.project_explorer.object_names("Docking Poses"):
+            if name != self._pose_object:
+                self.project_explorer.remove_object(name)
+        for o in outcomes:
+            self.project_explorer.upsert_object("Docking Poses", f"{o.name}: {o.status}", {
+                "Type": "Docking outcome", "Status": o.status, "Message": o.message,
+                "Best score (kcal/mol)": o.best_score if o.best_score is not None else "-",
+                "Poses": len(o.poses)}, visible=False, kind="result")
+        if self._focus_state is None:
+            self.workspace.select(2)
+
+    def _use_as_reference(self, name: str) -> None:
+        """Offer any ligand object as the pose-review reference, then lock it."""
+        if self._pose_review is not None and name == self._pose_review.pose_name:
+            self.status.showMessage("The current docking pose cannot be its own reference.", 8000)
+            return
+        if self.project_explorer.find(name) is None:
+            return
+        if name not in self._reference_objects:
+            self._reference_objects.append(name)
+        self._refresh_review_references()
+        if self.workspace.tabs.currentIndex() != 2:
+            self.workspace.select(2)
+        if self.results_panel.review_bar.select_reference(name):
+            self.status.showMessage(f"{name} locked as the pose-review reference.", 8000)
+        self._apply_pose_review()
+
+    def _show_pharmacophore(self, pharmacophore, show: bool) -> None:
+        """Draw or clear the pharmacophore spheres; display only, never a project object."""
+        if self.viewer is None:
+            return
+        if show and pharmacophore is not None and pharmacophore.features:
+            self.viewer.show_pharmacophore(pharmacophore.features)
+        else:
+            self.viewer.clear_pharmacophore()
+
+    def _refresh_review_references(self) -> None:
+        self._reference_objects = [name for name in self._reference_objects if self.project_explorer.find(name) is not None]
+        self.results_panel.review_bar.set_references(self._reference_objects)
+
+    def _apply_pose_review(self) -> None:
+        if self._pose_review is None:
+            return
+        explorer = self.project_explorer
+        bar = self.results_panel.review_bar
+        proteins = {name:explorer.is_visible(name) for name in explorer.all_object_names(("protein",))}
+        references = {name:explorer.is_visible(name) for name in self._reference_objects if explorer.find(name) is not None}
+        self._pose_review.apply(proteins,references,bar.reference.currentText(),
+                                locked=bar.lock_reference.isChecked(), hide_protein=bar.hide_protein.isChecked())
+
+    def _review_visibility_changed(self, name: str, visible: bool) -> None:
+        actual = self._pose_review.requested_visibility(name,visible) if self._pose_review else visible
+        if actual != visible:
+            self.viewer.set_visible(name,actual)
+            return
+        self.project_explorer.set_visible(name,visible)
+
+    def _fit_pose_review(self) -> None:
+        if self._pose_review is not None:
+            self._pose_review.fit_view()
+
+    def _show_pose(self, outcome: LigandOutcome, pose_index: int) -> None:
+        from rdkit import Chem
+        if self._pose_review is None:
+            return
+        self._pose_review.show_pose(Chem.MolToMolBlock(outcome.mols[pose_index]),
+                                   keep_camera=self.results_panel.review_bar.keep_camera.isChecked())
+        name = self._pose_review.pose_name
+        self._pose_object = name
+        pose = outcome.poses[pose_index]
+        self.project_explorer.upsert_object("Docking Poses",name,{
+            "Type":"Docked pose", "Ligand":outcome.name, "Pose":pose.rank,
+            "Score (kcal/mol, predicted)":pose.score},kind="ligand")
+        rec = next((n for n in self.project_explorer.object_names("Proteins")
+                    if n.endswith("(prepared)") and self.project_explorer.is_visible(n)),None)
+        if rec:
+            self.viewer.show_residues_around(name,4.5,rec)
+        self._apply_pose_review()
+        self.status.showMessage(f"{outcome.name} pose #{pose.rank}: score {pose.score:.2f} kcal/mol (predicted)",10000)
+
+    def _remove_object(self, name: str) -> None:
+        self._viewer_call("remove_object", name)
+        self.project_explorer.remove_object(name)
+        if name == self._pose_object:
+            self._pose_object = ""
+            if self._pose_review is not None:
+                self._pose_review.has_pose = False
+        if name in self._reference_objects:
+            self._refresh_review_references()
+
+    # ================================================================ slots
+    def current_theme(self) -> Theme:
+        return Theme(self.settings.value("appearance/theme", Theme.LIGHT.value))
+
+    def set_theme(self, theme: Theme) -> None:
+        app = QApplication.instance()
+        if app is not None:
+            apply_theme(app, theme)
+        self.settings.setValue("appearance/theme", theme.value)
+        self.actions_[f"view.theme.{theme.value}"].setChecked(True)
+
+    def _toggle_theme(self) -> None:
+        self.set_theme(Theme.LIGHT if self.current_theme() is Theme.DARK else Theme.DARK)
+
+    def _toggle_fullscreen(self, on: bool) -> None:
+        if on and self._focus_state is None:
+            self._focus_state = (self.saveState(), self.isMaximized())
+            for widget in self.findChildren(QDockWidget) + self.findChildren(QToolBar):
+                widget.hide()
+            self.workspace.set_focus_mode(True)
+            self.menuBar().hide()
+            self.statusBar().hide()
+            self.showFullScreen()
+        elif not on and self._focus_state is not None:
+            state, maximized = self._focus_state
+            self._focus_state = None
+            self.showMaximized() if maximized else self.showNormal()
+            self.restoreState(state)
+            self.workspace.set_focus_mode(False)
+            self.menuBar().show()
+            self.statusBar().show()
+
+    def _on_item_selected(self, title: str, props: dict) -> None:
+        self.properties.show_properties(title, props)
+        if props:
+            self.dock_properties.raise_()
+        self.status.set_selection(title)
+
+    def _show_error(self, title: str, text: str) -> None:
+        log.error("%s: %s", title, text)
+        # Non-blocking (window-modal, returns immediately) so background jobs keep reporting.
+        box = QMessageBox(QMessageBox.Icon.Warning, title, text, QMessageBox.StandardButton.Ok, self)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.open()
+
+    def _update_title(self) -> None:
+        p = self.controller.project
+        self.setWindowTitle(f"{p.name} — {APP_NAME}" if p else APP_NAME)
+
+    # ---- file actions
+    def _start_dir(self) -> str:
+        return self.settings.value("paths/last_dir", QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DocumentsLocation))
+
+    def _remember_dir(self, path: str) -> None:
+        self.settings.setValue("paths/last_dir", str(Path(path).parent))
+
+    def _open_structure(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Open structure", self._start_dir(),
+                                              "Protein structures (*.pdb *.ent *.cif *.mmcif)")
+        if path:
+            self._remember_dir(path)
+            self.controller.load_structure(Path(path))
+
+    def _fetch_pdb(self) -> None:
+        pdb_id, ok = QInputDialog.getText(self, "Fetch from RCSB PDB", "4-character PDB ID (e.g. 1HSG):")
+        if ok and pdb_id.strip():
+            self.controller.fetch_pdb(pdb_id)
+
+    def _new_project(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose an empty folder for the new project", self._start_dir())
+        if not path:
+            return
+        root = Path(path)
+        if (root / "project.json").exists():
+            QMessageBox.warning(self, "New Project", "That folder already contains a project; use Open Project.")
+            return
+        if not self._confirm_project_switch("create a new project"):
+            return
+        self._reset_workspace()
+        self.controller.new_project(root)
+        self.status.showMessage(f"Project created: {root}", 6000)
+
+    def _open_project(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Open project folder", self._start_dir())
+        if not path:
+            return
+        try:
+            project = Project.open(Path(path))
+        except (FileNotFoundError, ValueError) as exc:
+            QMessageBox.warning(self, "Open Project", str(exc))
+            return
+        if not self._confirm_project_switch("open another project"):
+            return
+        self._reset_workspace()
+        self.controller.set_project(project)
+        self.controller.load_project_state()
+        self.docking_panel.apply_params(self.controller.params)
+        self.status.showMessage(f"Opened {project.name}", 6000)
+
+    def _reset_workspace(self) -> None:
+        if self._pose_review is not None:
+            self._pose_review.clear()
+        self._reference_objects.clear()
+        self.results_panel.review_bar.set_references([])
+        self.results_panel.review_bar.hide_protein.setChecked(False)
+        self._receptor_objects.clear()
+        self._source_object = ""
+        for cat in ("Proteins", "Ligands", "Docking Boxes", "Docking Poses"):
+            for name in self.project_explorer.object_names(cat):
+                self._viewer_call("remove_object", name)
+            self.project_explorer.clear_category(cat)
+        self._viewer_call("clear_box")
+        if self._pose_object:
+            self._viewer_call("remove_object", self._pose_object)
+            self._pose_object = ""
+        self.results_panel.show_outcomes([])
+        self.controller.reset_state()
+
+    def _save_project(self) -> None:
+        self.controller.ensure_project()
+        self.controller.save_project()
+        self.status.showMessage(f"Project saved: {self.controller.project.root}", 5000)
+
+    def _confirm_project_switch(self, operation: str) -> bool:
+        if self.controller.project is None:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Current Project",
+            f"Save the current project before you {operation}?",
+            QMessageBox.StandardButton.Save
+            | QMessageBox.StandardButton.Discard
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Save,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            return False
+        if answer == QMessageBox.StandardButton.Save:
+            try:
+                self.controller.save_project()
+            except OSError as exc:
+                QMessageBox.warning(self, "Save Project", f"Could not save the current project: {exc}")
+                return False
+        return True
+
+    def _save_project_as(self) -> None:
+        if self.controller.project is None:
+            return
+        path = QFileDialog.getExistingDirectory(self, "Choose an empty folder for the copy", self._start_dir())
+        if path:
+            try:
+                self.controller.save_project()
+                copy = self.controller.project.duplicate(Path(path))
+            except FileExistsError as exc:
+                QMessageBox.warning(self, "Save As", str(exc))
+                return
+            self._reset_workspace()
+            self.controller.set_project(copy)
+            self.controller.load_project_state()
+            self.docking_panel.apply_params(self.controller.params)
+            self.status.showMessage(f"Saved project copy: {copy.root}", 6000)
+
+    def _archive_project(self) -> None:
+        if self.controller.project is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Archive project", f"{self.controller.project.name}.zip",
+                                              "Zip archive (*.zip)")
+        if path:
+            self.controller.save_project()
+            self.status.showMessage(f"Archive written: {self.controller.project.archive(Path(path))}", 8000)
+
+    def _export_image(self) -> None:
+        if self.viewer is None:
+            return
+        project = self.controller.ensure_project()
+        path, _ = QFileDialog.getSaveFileName(self, "Export image (3x resolution)",
+                                              str(project.root / "exports" / "view.png"), "PNG image (*.png)")
+        if path:
+            self.viewer.export_image(path, 3)
+            self.status.showMessage(f"Image written to {path}", 6000)
+
+    # ---- viewer actions
+    def _measure(self, mode: str) -> None:
+        self._viewer_call("set_measure_mode", mode)
+
+    def _select_around(self) -> None:
+        ligs = self.project_explorer.object_names("Ligands")
+        prots = [n for n in self.project_explorer.object_names("Proteins")]
+        if not ligs or not prots:
+            QMessageBox.information(self, "Residues around ligand", "Load a protein and a ligand first.")
+            return
+        lig, ok = QInputDialog.getItem(self, "Residues around ligand", "Ligand:", ligs, 0, False)
+        if not ok:
+            return
+        prot = next((p for p in prots if p.endswith("(prepared)")), prots[0])
+        cutoff, ok = QInputDialog.getDouble(self, "Residues around ligand", "Distance cutoff (Å):", 4.5, 1.0, 12.0, 1)
+        if ok:
+            self.project_explorer.set_visible(lig, True)
+            self._viewer_call("set_visible", lig, True)
+            self._viewer_call("show_residues_around", lig, cutoff, prot)
+
+    def _clear_around(self) -> None:
+        self._viewer_call("clear_residue_selection")
+
+    def _focus_site(self) -> None:
+        self.docking_panel.show_step(2)
+        self._show_docking_dock()
+        self.dock_docking.raise_()
+        self.docking_panel.site_method.setFocus()
+
+    def _run_docking_step(self, step: int, action) -> None:
+        self.workspace.select(0 if step < 2 else 1)
+        self._show_docking_dock()
+        self.dock_docking.raise_()
+        self.docking_panel.show_step(step)
+        action()
+
+    def _show_docking_dock(self) -> None:
+        if self.dock_docking.isHidden():
+            self.dock_docking.toggleViewAction().trigger()
+        self.dock_docking.setVisible(True)
+
+    # ---- analysis
+    def _show_descriptors(self) -> None:
+        prepared = self.controller.prepared
+        if not prepared:
+            QMessageBox.information(self, "Ligand descriptors", "Prepare ligands first.")
+            return
+        cols = ["Name", "MW", "LogP", "TPSA", "HBD", "HBA", "RotB", "Ro5_violations", "Lipinski_pass",
+                "Veber_pass", "FormalCharge", "Torsions(Vina)"]
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Ligand descriptors and drug-likeness filters")
+        table = QTableWidget(len(prepared), len(cols))
+        table.setHorizontalHeaderLabels(cols)
+        for r, lig in enumerate(prepared):
+            for cidx, col in enumerate(cols):
+                value = lig.name if col == "Name" else lig.properties.get(col, "")
+                table.setItem(r, cidx, QTableWidgetItem(str(value)))
+        table.resizeColumnsToContents()
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(table)
+        lay.addWidget(QLabel("<small>Lipinski/Veber are empirical rules of thumb for oral drug-likeness, "
+                             "not predictions of activity.</small>"))
+        dlg.resize(980, 340)
+        dlg.exec()
+
+    def _show_interactions(self) -> None:
+        if not self.controller.outcomes:
+            QMessageBox.information(self, "Interaction diagram", "Run a docking calculation first, "
+                                    "then select a pose in the Results panel.")
+            return
+        self.workspace.select(2)
+        self.results_panel.analysis_tabs.setCurrentWidget(self.results_panel.interactions_panel)
+        self.results_panel.interactions_panel._analyse()
+
+    def _show_similarity(self) -> None:
+        if len(self.controller.prepared) < 2:
+            QMessageBox.information(self, "Similarity & Clustering",
+                                    "Prepare at least two ligands first.")
+            return
+        if self._similarity_dialog is None:
+            self._similarity_dialog = SimilarityDialog(self.controller, self)
+        self._similarity_dialog.show()
+        self._similarity_dialog.raise_()
+        self._similarity_dialog.activateWindow()
+
+    # ---- misc
+    def _run_self_test(self) -> None:
+        self.job_runner.submit(JobSystemSelfTest())
+        self.dock_jobs.show()
+        self.dock_jobs.raise_()
+
+    def _open_log_folder(self) -> None:
+        if self.log_dir is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.log_dir)))
+
+    def _open_project_folder(self) -> None:
+        if self.controller.project:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.controller.project.root)))
+
+    def _save_named_layout(self) -> None:
+        name, ok = QInputDialog.getText(self, "Save Layout", "Layout name:")
+        name = name.strip().replace("/", "-")
+        if ok and name:
+            self.layouts.save_named(name)
+
+    def _fill_layout_menu(self, menu: QMenu, handler) -> None:
+        menu.clear()
+        names = self.layouts.names()
+        if not names:
+            menu.addAction("(no saved layouts)").setEnabled(False)
+        for name in names:
+            menu.addAction(name, lambda n=name: handler(n))
+
+    def _show_scientific_notice(self) -> None:
+        QMessageBox.information(self, "Scientific Interpretation Notice", SCIENTIFIC_NOTICE)
+
+    def _show_about(self) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle(f"About {APP_NAME}")
+        box.setIconPixmap(QPixmap(str(assets_dir() / "wavedock.png")).scaledToWidth(96, Qt.TransformationMode.SmoothTransformation))
+        box.setText(f"<h3>{APP_NAME} {__version__}</h3><p>Open-source molecular docking workbench: structure "
+                    "preparation, AutoDock Vina docking, 3D visualisation and result analysis.</p>"
+                    f"<p>Python {platform.python_version()} · Qt {qVersion()} · PySide6 {pyside_version}</p>"
+                    "<p><small>AutoDock Vina (Apache-2.0), RDKit (BSD), Meeko (LGPL), Gemmi (MPL-2.0), "
+                    "PDB2PQR/PROPKA, ProLIF (Apache-2.0), 3Dmol.js (BSD-3).<br>"
+                    "Interaction analysis additionally needs Open Babel (GPL-2.0), installed "
+                    "separately — it is not included in this program.</small></p>" + SCIENTIFIC_NOTICE)
+        box.exec()
+
+    # ======================================================= drag & drop
+    @staticmethod
+    def _paths(event: QDragEnterEvent | QDropEvent) -> list[Path]:
+        if not event.mimeData().hasUrls():
+            return []
+        paths = [Path(u.toLocalFile()) for u in event.mimeData().urls() if u.isLocalFile()]
+        return [p for p in paths if p.suffix.lower() in STRUCTURE_SUFFIXES | LIGAND_SUFFIXES]
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        event.acceptProposedAction() if self._paths(event) else event.ignore()
+
+    def open_files(self, paths: list[Path]) -> None:
+        """Open files from Explorer, command-line arguments, or drag and drop."""
+        for p in paths:
+            p = Path(p)
+            if not p.is_file():
+                self.controller.error.emit("Cannot open file", f"File not found: {p}")
+            elif p.suffix.lower() in STRUCTURE_SUFFIXES:
+                self.controller.load_structure(p)
+            elif p.suffix.lower() in LIGAND_SUFFIXES:
+                self.controller.import_ligand_file(p)
+            else:
+                self.controller.error.emit("Cannot open file", f"Unsupported file type: {p.suffix}")
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        self.open_files(self._paths(event))
+        event.acceptProposedAction()
+
+    # ============================================================ close
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        active = self.job_runner.active_count()
+        if active:
+            answer = QMessageBox.question(self, "Jobs Running",
+                                          f"{active} background job(s) are still running. Cancel them and exit?")
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.job_runner.cancel_all()
+            self.job_runner.wait_for_done(8000)
+        self.actions_["view.fullscreen"].setChecked(False)
+        self.controller.save_project()
+        self.layouts.save_session()
+        self.settings.sync()
+        logging.getLogger("mds").removeHandler(self.log_panel.handler)
+        log.info("%s closed", APP_NAME)
+        event.accept()

@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/pimd-core",
+    "crates/pimd-potentials",
+    "crates/pimd-integrators",
+    "crates/pimd-estimators",
+    "crates/pimd-socket",
+    "crates/pimd-torch",
+    "crates/pimd-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+
+[workspace.dependencies]
+pimd-core = { path = "crates/pimd-core" }
+pimd-potentials = { path = "crates/pimd-potentials" }
+pimd-integrators = { path = "crates/pimd-integrators" }
+pimd-estimators = { path = "crates/pimd-estimators" }
+pimd-socket = { path = "crates/pimd-socket" }
+pimd-torch = { path = "crates/pimd-torch" }
+thiserror = "2"
+rand = "0.10"
+rand_chacha = "0.10"
+rand_distr = "0.6"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+rustfft = { version = "6.4", default-features = false }
+# In-process TorchScript backend, pimd-torch only (MILESTONE_6 decision 4).
+tch = "0.26"

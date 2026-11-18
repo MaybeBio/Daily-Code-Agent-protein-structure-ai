@@ -1,0 +1,320 @@
+"""Regression test for debt 802: NL support for stacked/vmapped multi-bundle inference.
+
+Phase 6 steps 4-5 (2026-07-18) wired ``EnsemblePlan.run(use_neighbor_list=True)``
+into ``_run_single_inference`` only -- it raised if ``len(bundles) != 1``. This left
+a real gap: the vmapped multi-bundle dispatch path (``_run_stacked_dispatch``), the
+one B1's heterogeneous-batching thesis actually needs, had no NL support at all.
+
+The core engineering obstacle: ``jax_md``'s ``neighbor_fn.allocate()`` is host-only
+(it inspects concrete positions to size the cell list) and cannot run on a traced
+position array, so it cannot be called *inside* a vmapped function body. Two
+independent ``.allocate()`` calls on different position arrays also produce
+*different* capacities and non-matching pytree metadata (fresh Python closures per
+call) even at identical box/cutoff/N, so their results are not directly stackable.
+
+Fix: allocate one shared "seed" ``NeighborList`` host-side (once, before any
+vmapping), then derive each bundle's own ``NeighborList`` via ``seed.update(bundle_positions)``
+rather than independent ``.allocate()`` calls -- ``.update()`` inherits `self`'s static
+metadata (capacity, cell-list closures), so every bundle's result shares identical
+pytree structure with the seed and with each other, making them directly stackable
+via ``jax.tree.map(jnp.stack)`` and safe to slice per-replica under ``jax.vmap``.
+
+See ``EnsemblePlan._build_stacked_neighbor_seed``/``_reallocate_stacked_neighbor_seed``
+(ensemble_plan.py) and ``.praxia/docs/decisions/260717_b1-connect-existing-engines-scope.md``.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from pathlib import Path
+
+import jax
+import jax.numpy as jnp
+import pytest
+
+jax.config.update("jax_enable_x64", True)
+
+pytestmark = pytest.mark.slow
+
+DATA_DIR = Path(__file__).resolve().parents[2] / "data" / "pdb"
+
+PME_ALPHA = 0.34
+CUTOFF = 9.0
+
+
+def _ff_path() -> Path:
+    import proxide
+
+    return Path(proxide.__file__).parent / "assets" / "protein.ff19SB.xml"
+
+
+def _load_vacuum_boxed_1vii_pair():
+    """Two stack-compatible periodic bundles: real 1VII, and a jittered copy.
+
+    A jittered copy (not a second protein) keeps this test fast -- the
+    engineering risk under test (do two independently-derived
+    ``jax_md.NeighborList``s stack and vmap correctly) is identical whether
+    the two bundles share a protein identity or not; the code has no
+    awareness of "protein identity," only array shapes/masks. Genuine
+    cross-protein compile-sharing with NL enabled is a separate, unmeasured
+    performance question (needs a full solvated benchmark) -- see the
+    decision doc's "Phase 6 step 7" section.
+    """
+    from proxide import CoordFormat, OutputSpec, parse_structure
+
+    pdb_path = DATA_DIR / "1VII.pdb"
+    if not pdb_path.is_file():
+        pytest.skip(f"Missing test PDB: {pdb_path}")
+
+    spec = OutputSpec(
+        parameterize_md=True, force_field=str(_ff_path()), coord_format=CoordFormat.Full
+    )
+    protein = parse_structure(str(pdb_path), spec)
+
+    coords = jnp.asarray(protein.coordinates, dtype=jnp.float64)
+    lo = jnp.min(coords, axis=0)
+    hi = jnp.max(coords, axis=0)
+    box = jnp.maximum(hi - lo + 24.0, jnp.array([32.0, 32.0, 32.0], dtype=jnp.float64))
+    shift = box * 0.5 - (lo + hi) * 0.5
+    r = coords + shift
+
+    class _Proxy:
+        def __getattr__(self, name):
+            if name == "positions":
+                return r
+            if name == "pme_alpha":
+                return PME_ALPHA
+            if name == "nonbonded_cutoff":
+                return CUTOFF
+            if name == "box_size":
+                return box
+            return getattr(protein, name)
+
+    from prolix.physics import neighbor_list as nl
+    from prolix.physics.system import make_bundle_from_system
+
+    excl_spec = nl.ExclusionSpec.from_protein(protein)
+    bundle_a = make_bundle_from_system(
+        _Proxy(), boundary_condition="periodic", exclusion_spec=excl_spec
+    )
+
+    key = jax.random.PRNGKey(7)
+    jitter = jax.random.normal(key, bundle_a.positions.shape) * 0.05
+    jittered = jnp.where(bundle_a.atom_mask[:, None], bundle_a.positions + jitter, bundle_a.positions)
+    bundle_b = dataclasses.replace(bundle_a, positions=jittered)
+    return bundle_a, bundle_b
+
+
+@pytest.mark.slow
+def test_single_bundle_nl_init_first_force_receives_neighbor(monkeypatch):
+    """Init and stepping must share the NL backend (DHFR jobs 20520003 / 20528981).
+
+    EnsemblePlan allocated the neighbor list *after* settle_langevin init_fn,
+    so the first force was dense O(N²) even when use_neighbor_list=True.
+    """
+    import prolix.api.bundle_md as bundle_md
+    from prolix.api.ensemble_plan import EnsemblePlan
+
+    calls: list[bool] = []
+    orig = bundle_md.single_padded_energy
+
+    def _spy(sys, displacement_fn, implicit_solvent=True, *args, **kwargs):
+        calls.append(kwargs.get("neighbor") is not None)
+        return orig(sys, displacement_fn, implicit_solvent, *args, **kwargs)
+
+    monkeypatch.setattr(bundle_md, "single_padded_energy", _spy)
+
+    bundle_a, _bundle_b = _load_vacuum_boxed_1vii_pair()
+    plan = EnsemblePlan.from_bundle(bundle_a)
+    trajs = plan.run(
+        n_steps=20,
+        dt=0.5,
+        kT=0.6,
+        seed=0,
+        run_mode="inference",
+        use_neighbor_list=True,
+        nl_update_every=5,
+    )
+    traj = trajs[0] if isinstance(trajs, list) else trajs
+    assert bool(jnp.all(jnp.isfinite(traj.positions)))
+    assert calls, "expected single_padded_energy to run during NL init+step"
+    assert calls[0], (
+        "first force must receive neighbor=; leftover dense init OOMs DHFR"
+    )
+    assert all(calls), f"every energy eval must use NL, got neighbor-present flags {calls}"
+
+
+@pytest.mark.slow
+def test_stacked_use_neighbor_list_matches_shape_and_is_finite():
+    """EnsemblePlan.run(use_neighbor_list=True) over 2 bundles: real vmapped dispatch."""
+    from prolix.api.ensemble_plan import EnsemblePlan
+
+    bundle_a, bundle_b = _load_vacuum_boxed_1vii_pair()
+    plan = EnsemblePlan.from_bundles([bundle_a, bundle_b])
+
+    trajs = plan.run(
+        n_steps=6, dt=0.5, kT=0.6, seed=0, run_mode="inference",
+        use_neighbor_list=True, nl_update_every=2,
+    )
+    assert isinstance(trajs, list) and len(trajs) == 2
+    for traj in trajs:
+        assert bool(jnp.all(jnp.isfinite(traj.positions))), "non-finite positions in stacked NL run"
+
+
+@pytest.mark.slow
+def test_stacked_dense_path_unaffected_by_nl_support():
+    """use_neighbor_list=False (default) on a multi-bundle plan is untouched by debt 802."""
+    from prolix.api.ensemble_plan import EnsemblePlan
+
+    bundle_a, bundle_b = _load_vacuum_boxed_1vii_pair()
+    plan = EnsemblePlan.from_bundles([bundle_a, bundle_b])
+
+    trajs = plan.run(
+        n_steps=6, dt=0.5, kT=0.6, seed=0, run_mode="inference",
+        use_neighbor_list=False, use_flash_forces=False,
+    )
+    assert isinstance(trajs, list) and len(trajs) == 2
+    for traj in trajs:
+        assert bool(jnp.all(jnp.isfinite(traj.positions)))
+
+
+@pytest.mark.slow
+def test_stacked_neighbor_seed_helper_produces_stackable_identical_metadata():
+    """Direct unit test of the seed.update() pattern the whole feature depends on."""
+    from prolix.api.ensemble_plan import EnsemblePlan
+
+    bundle_a, bundle_b = _load_vacuum_boxed_1vii_pair()
+    from prolix.api.bundle_stack import integration_prefix_for_bundles
+
+    integration_prefix = integration_prefix_for_bundles([bundle_a, bundle_b])
+    stacked_neighbor, neighbor_fn = EnsemblePlan._build_stacked_neighbor_seed(
+        [bundle_a, bundle_b], integration_prefix
+    )
+    assert stacked_neighbor.idx.shape[0] == 2
+    assert not bool(jnp.any(stacked_neighbor.did_buffer_overflow))
+
+    # vmapped .update() must agree with a fresh per-replica call to seed.update()
+    def per_replica_update(nbr_slice, pos):
+        return nbr_slice.update(pos)
+
+    positions = jnp.stack([bundle_a.positions, bundle_b.positions])
+    updated = jax.vmap(per_replica_update)(stacked_neighbor, positions)
+    assert updated.idx.shape == stacked_neighbor.idx.shape
+
+
+@pytest.mark.slow
+def test_stacked_use_neighbor_list_overflow_then_reallocate_recovers():
+    """A deliberately undersized seed capacity triggers overflow, then a clean retry."""
+    import prolix.physics.neighbor_list as nl_mod
+    from prolix.api.ensemble_plan import EnsemblePlan
+
+    bundle_a, bundle_b = _load_vacuum_boxed_1vii_pair()
+    plan = EnsemblePlan.from_bundles([bundle_a, bundle_b])
+
+    _orig_make = nl_mod.make_neighbor_list_fn
+
+    def _tiny_capacity(displacement_fn, box_size, cutoff, **kwargs):
+        kwargs["capacity_multiplier"] = 0.5
+        return _orig_make(displacement_fn, box_size, cutoff, **kwargs)
+
+    nl_mod.make_neighbor_list_fn = _tiny_capacity
+    try:
+        trajs = plan.run(
+            n_steps=10, dt=0.5, kT=0.6, seed=4, run_mode="inference",
+            use_neighbor_list=True, nl_update_every=2,
+        )
+    finally:
+        nl_mod.make_neighbor_list_fn = _orig_make
+
+    for traj in trajs:
+        assert bool(jnp.all(jnp.isfinite(traj.positions))), (
+            "overflow-then-reallocate did not recover cleanly"
+        )
+
+
+@pytest.mark.slow
+def test_single_bundle_nl_capacity_meets_recommendation():
+    """The single-bundle path must size NL capacity by ``compute_nl_capacity`` too.
+
+    Regression for the DHFR overflow (job 21835473). ``_run_single_inference``
+    used to take jax_md's data-dependent ``allocate()`` sizing and never consult
+    ``compute_nl_capacity``, while the stacked path at
+    ``_build_stacked_neighbor_seed`` did. At 23,558 atoms that came out ~30%
+    under the recommendation and overflowed mid-scan -- and the resulting error
+    told the reader to raise a ``safety_factor`` that the failing path never
+    read. Both sites now go through ``_nl_target_capacity``.
+    """
+    import prolix.physics.neighbor_list as nl_mod
+    from prolix.api.bundle_md import _host_float
+    from prolix.api.ensemble_plan import EnsemblePlan
+
+    bundle_a, _bundle_b = _load_vacuum_boxed_1vii_pair()
+    plan = EnsemblePlan.from_bundle(bundle_a)
+    trajs = plan.run(
+        n_steps=10, dt=0.5, kT=0.6, seed=0, run_mode="inference",
+        use_neighbor_list=True, nl_update_every=5,
+    )
+    traj = trajs[0] if isinstance(trajs, list) else trajs
+
+    recommended = nl_mod.compute_nl_capacity(
+        int(bundle_a.positions.shape[0]),
+        jnp.diag(bundle_a.box),
+        _host_float(bundle_a.cutoff_distance, 9.0),
+        dr_threshold=0.5,
+    )
+    allocated = traj.observable_values["_nl_capacity"]
+    assert allocated >= recommended, (
+        f"single-bundle NL allocated capacity {allocated} is below "
+        f"compute_nl_capacity's recommendation {recommended} -- the capacity "
+        "pre-planning block in _run_single_inference is not running"
+    )
+    assert traj.observable_values["_nl_retry_count"] == 0, (
+        "a correctly pre-sized neighbor list should never need a host-side realloc"
+    )
+
+
+@pytest.mark.slow
+def test_single_bundle_nl_overflow_then_reallocate_recovers():
+    """Defeating *both* capacity defenses still recovers via geometric realloc.
+
+    The single-bundle path now has two independent lines of defense: jax_md's
+    ``capacity_multiplier`` and the ``compute_nl_capacity`` top-up. Shrinking
+    only the multiplier no longer reaches the retry path -- the top-up rescues
+    it -- so this test disables both, then asserts the host-side reallocation
+    recovers rather than raising.
+    """
+    import prolix.physics.neighbor_list as nl_mod
+    from prolix.api import ensemble_plan as ep_mod
+    from prolix.api.ensemble_plan import EnsemblePlan
+
+    bundle_a, _bundle_b = _load_vacuum_boxed_1vii_pair()
+    plan = EnsemblePlan.from_bundle(bundle_a)
+
+    _orig_make = nl_mod.make_neighbor_list_fn
+    _orig_target = ep_mod._nl_target_capacity
+
+    def _tiny_capacity(displacement_fn, box_size, cutoff, **kwargs):
+        kwargs["capacity_multiplier"] = 0.5
+        return _orig_make(displacement_fn, box_size, cutoff, **kwargs)
+
+    nl_mod.make_neighbor_list_fn = _tiny_capacity
+    ep_mod._nl_target_capacity = lambda *_a, **_k: 0
+    try:
+        trajs = plan.run(
+            n_steps=10, dt=0.5, kT=0.6, seed=4, run_mode="inference",
+            use_neighbor_list=True, nl_update_every=2,
+        )
+    finally:
+        nl_mod.make_neighbor_list_fn = _orig_make
+        ep_mod._nl_target_capacity = _orig_target
+
+    traj = trajs[0] if isinstance(trajs, list) else trajs
+    retries = traj.observable_values["_nl_retry_count"]
+    if retries == 0:
+        pytest.skip(
+            "crushed capacity did not overflow for this fixture -- the retry "
+            "path was not exercised (assertion would be vacuous)"
+        )
+    assert bool(jnp.all(jnp.isfinite(traj.positions))), (
+        "overflow-then-reallocate did not recover cleanly"
+    )

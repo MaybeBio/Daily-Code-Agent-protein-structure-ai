@@ -1,0 +1,220 @@
+<!-- markdownlint-disable-file MD024 MD013 -->
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres
+to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+[Unreleased]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.3.0...HEAD
+
+## [1.3.0] - 2026-10-21
+
+[1.3.0]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.2.0...v1.3.0
+
+### Added
+
+- wheels for Linux x86-64 and macOS on Apple Silicon, Python 3.11 - 3.14
+- `--alignment-min-identity` and `--alignment-min-coverage` parameters - discard structural templates whose global alignment falls below the thresholds; off by default
+- `benchmark` command - runs structure retrieval, contact map transfer and prediction for several MMseqs2 identity bins and `--generate-contacts` values from one database search, with per-stage wall times in `timing.tsv`
+
+### Changed
+
+- support for Python 3.13 and 3.14; `requires-python` no longer has an upper bound
+- `biotite`, `foldcomp`, `obonet` and `networkx` are bounded below their next major release
+- PDB100 is downloaded from opendata.mmseqs.org instead of wwwuser.gwdg.de, which refuses connections from some networks; the file is identical
+- MMseqs2 is pinned to build `bd01c22` and FoldComp to v0.1.0 instead of the latest nightly builds
+- `predict_protein_function` is composed of reusable stages: `align_database_hits`, `select_templates`, `build_contact_maps` and `predict_from_contact_maps`
+
+### Fixed
+
+- `align_contact_map` returning an asymmetric map for one-directional template contacts
+- runs aborting when a PDB template cannot be downloaded or parsed - the template is now skipped with a warning
+- MMseqs2 results with a single hit, no hits or numeric-like identifiers - identifiers stay strings and empty results keep their header
+- `search-databases` failing on unexpected keyword arguments
+- test data missing from the package, failing `python -m unittest mDeepFRI.tests` on an installed copy
+- downloads hanging indefinitely when a host does not respond
+- an interrupted PDB100 download or re-compression leaving a truncated database that later runs reused
+- alignments failing on Apple Silicon with `no supported SIMD backend available` - PyOpal's macOS arm64 wheels do not enable their NEON backend
+- installs on macOS bundling a Linux MMseqs2 binary, Linux aarch64 installs bundling an x86-64 FoldComp binary, and a dead MMseqs2 URL for ppc64le
+
+## [1.2.0] - 2026-08-10
+
+[1.2.0]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.1.10...v1.2.0
+
+### Added
+
+- GO term mapping to COG categories, SuperCOGs and Information Content (IC) in output results -
+new `ic`, `cogs` and `supercogs` columns in `results.tsv`.
+- `go2cog_USECLO_ALL.tsv` mapping file in assets from [GO2COG](https://github.com/Tomasz-Lab/go2cog)
+- `--custom-mapping` parameter - predict from a user-supplied protein-to-structure TSV,
+bypassing the database search. Proteins without a loadable structure fall back to CNN.
+- `--propagate-go-terms` and `--obo-path` parameters - propagate GO terms up the ontology
+DAG with the true-path rule (`is_a`, `part_of`), written to `results_propagated.tsv`.
+- `--write-metadata` flag - prepend `##` provenance lines (timestamp, version, command line)
+to `results.tsv`. Off by default so the file stays a plain TSV.
+- `[gpu]` install extra - `pip install mdeepfri[gpu]` pins ONNX Runtime 1.26 with
+bundled CUDA 12 libraries (Linux x86_64).
+
+### Changed
+
+- default install (`pip install mdeepfri`) now ships CPU ONNX Runtime.
+GPU users should install `mdeepfri[gpu]`; a system CUDA stack is still picked up
+automatically when present.
+- `prediction_matrix_{mode}.tsv` is split into `prediction_matrix_{mode}_gcn.tsv` and
+`prediction_matrix_{mode}_cnn.tsv` when the GCN and CNN heads use different
+output vocabularies (the case for `v1.1` weights).
+- license corrected from `GPL-3.0-or-later` to `BSD-3-Clause` - the previous metadata
+did not match the shipped `LICENSE` file.
+
+### Fixed
+
+- `IndexError` when only the CNN was used with `v1.1` weights ([#110](https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/issues/110))
+- GCN/CNN output vocabulary mismatch producing misaligned GO term names
+- spurious empty column in `results.tsv` - rows carried one more field than the header
+- unparsable `pyproject.toml` (missing separator in `dependencies`)
+- `go2cog_USECLO_ALL.tsv` is now shipped in the distribution - the asset glob only
+matched `*.pkl`, so COG/IC columns stayed empty on installs from PyPI
+- Information Content parsed as `float`, with row length guarding
+
+## [1.1.10] - 2026-01-16
+
+[1.1.10]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.1.9...v1.1.10
+
+### Fixed
+
+- error with processing `UniProt` headers ([#101](https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/issues/101))
+- error for no alignment result with `MMseqs`
+- critical error for selenoproteins is now an `info` ([#102](https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/issues/102))
+- uppercase sequences before `pyopal` to avoid alphabet errors
+
+## [1.1.9] - 2026-01-06
+
+[1.1.9]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.1.8...v1.1.9
+
+### Added
+
+- `--alignment-min-coverage` parameter to filter low coverage alignments
+- `generate-config` CLI command - generate config file in case models are downloaded manually
+- `calculate-maps` CLI command - calculates all contact maps from PDB/MMCIF in directory ([#100](https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/issues/100))
+- prediction matrices - predicted vectors allow to compare proteins with the help of distance analysis ([#79](https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/issues/79))
+- custom scoring matrices - default `VTML80`
+- support for python < 3.13
+
+### Fixed
+
+- Skipping extraction of broken structures from `highquality_clust30`,
+which caused segmentation fault (<https://github.com/steineggerlab/foldcomp/issues/56>)
+- all output from the software log to `stdout`
+- `np.genfromtext` bug ([#96](https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/issues/96))
+- contact map wrapping ([#99](https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/issues/99))
+- query file losing sequences ([#92](https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/issues/92))
+- `MMseqs` convertalis unlimited thread usage
+
+## [1.1.8] - 2024-06-26
+
+[1.1.8]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.1.7...v1.1.8
+
+### Added
+
+- fixed tests and added to CI/CD
+- added function to download MMseqs2 binaries for full CI/CD runs
+- removed Conda install - fully installable from PyPI
+
+### Fixed
+
+- hetero atom bug introduced by Ruff (c044a158)
+- MacOS CI/CD bug connected to Foldcomp binary
+
+## [1.1.7] - 2024-06-10
+
+[1.1.7]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.1.6...v1.1.7
+
+### Fixed
+
+- resolved old naming issues ([#84](https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/issues/84))
+
+## [1.1.6] - 2024-06-04
+
+[1.1.6]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.1.5...v1.1.6
+
+### Added
+
+- MMseqs2 API + tests
+- rudimentary documentation website
+- fixed bugs of v1.1.5
+
+## [1.1.5] - 2024-04-01
+
+[1.1.5]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.1.4...v1.1.5
+
+### Added
+
+- improved logging
+- support for ESM databases ([#80](https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/issues/80))
+- corrected structures retrieval from PDB ([#81](https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/issues/81), [#83](https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/issues/83))
+  - correct non-standard amino acids
+  - remove base pairs
+
+### Changed
+
+- retrieval of structures from PDB & FoldComp databases
+- optimized contact map alignment via Cython -
+improved search in large databases (ESM)
+
+## [v1.1.4] - 2024-03-23
+
+[v1.1.4]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.1.3...v1.1.4
+
+### Added
+
+- `--skip-pdb` flag in case of unexpected PDB bugs
+- user parameter for allowed protein lengths `--min-length` and `--max-length`
+
+### Fixes
+
+- installation of PDB database
+- alignment of faulty PDB structures
+  - cases are reported via `logging`, require case-by-case investigation
+  - faulty structures are then aligned to a predicted database, which are consistent
+  - around 130/1300 alignments to PDB fail (10%)
+
+## [v1.1.3] - 2024-03-13
+
+[v1.1.3]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.1.2...v1.1.3
+
+### Fixes
+
+- bug where MMseqs2 returned empty results search [#73](https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/issues/73)
+
+## [v1.1.2] - 2024-02-22
+
+[v1.1.2]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.1.1...v1.1.2
+
+### Added
+
+- chunked loading of MMseqs2 preselected targets - improves runtime
+
+### Fixed
+
+- C++17 lowered to C++14 for compatibility
+- pyopal API v0.5 integrated
+- removed `scipy` distance calculation with function
+- replaced `biopython` with `biotite` for structure manipulation
+better runtime and easier deploy
+- tests fixed & added to CI/CD
+
+## [v1.1.1] - 2024-03-01
+
+[v1.1.1]: https://github.com/Tomasz-Lab/Metagenomic-DeepFRI/compare/v1.0.0...v1.1.1
+
+### Added
+
+- Automatic setup of the PDB database during the first run
+- Automatic parsing of both mmCIF and PDB files
+- Removed `torch` dependency - significant improvement in startup times
+- added models of v1.1 - available for the download via `get-models` subcommand
+- CI/CD

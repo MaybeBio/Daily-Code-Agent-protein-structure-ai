@@ -1,0 +1,1177 @@
+"""
+api/routers/pro_features.py
+
+PRO mode endpoints: multi-target selectivity, MM-GBSA rescoring,
+hardware-adaptive configuration.
+"""
+
+from __future__ import annotations
+
+import functools
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from core.config import get_settings
+from core.database import get_db
+from core.models import UserORM
+from db.repository import Repository
+from api.dependencies import get_current_user_optional
+from api.routers.evaluation_access import require_owned_molecule
+from services.targets.access import (
+    get_target_for_user,
+    require_target_object_access,
+    target_is_accessible,
+)
+from services.docking.selectivity import (
+    run_selectivity_panel,
+    validar_protocolo_panel,
+    seleccionar_anti_dianas,
+    panel_bowes_2012,
+    discordancia_de_sitio_de,
+    sitio_adjudicado_de,
+    texto_de_alerta,
+    ANTI_TARGET_PANEL,
+)
+from services.targets.disponibilidad import motivo_no_disponible
+from services.docking.anti_target_sitio import (
+    AntiDianaSinSitio,
+    resolver_sitio_de_anti_diana,
+)
+from services.chemistry.mmgbsa_contrato import (
+    MMGBSA_CONDICION,
+    elementos_no_parametrizables,
+    motivo_de_no_parametrizable,
+)
+from services.docking.selectividad_margen import (
+    margen_de_selectividad,
+    veredicto_de_margen,
+)
+from scoring.mmgbsa import is_gpu_available
+from utils.file_handlers import StoragePath
+from utils.local_storage import exists, read_text
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+router = APIRouter(prefix="/pro", tags=["PRO Features"])
+settings = get_settings()
+
+
+def estructura_del_panel_por_defecto(pdb_id: str) -> dict | None:
+    """Medida de la estructura acoplada; nunca de la alternativa histórica."""
+    fila = next((f for f in panel_bowes_2012() if f.get("pdb_id") == pdb_id), {})
+    redock = fila.get("redock") or {}
+    if not redock:
+        return None
+    return {"pdb_id": pdb_id, "metodo": fila.get("metodo"),
+            "resolucion_A": fila.get("resolucion_A"), "ligando_de_referencia": fila.get("site_ligand"),
+            "distancia_centroides_A": redock.get("distancia_centroides_A"),
+            "pose_reproducida": redock.get("pose_reproducida"),
+            "rmsd_pose1_A": redock.get("rmsd_pose1_A"),
+            "truncadas_en_sitio": fila.get("truncadas_en_sitio"),
+            "sitio_adjudicado": fila.get("sitio_adjudicado", False),
+            "discordancia_de_sitio": fila.get("discordancia_de_sitio")}
+
+
+@router.get("/anti-targets")
+async def list_anti_targets(
+    current_user: UserORM | None = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """Panel por defecto, sugeridas de Bowes 2012 y anti-dianas del usuario.
+
+    Cada entrada declara `por_defecto` (si la interfaz la marca al abrir) y
+    `disponible`/`motivo_no_disponible` (si hoy se puede preparar su receptor).
+    """
+    targets = [
+        {
+            "pdb_id": t["pdb_id"],
+            "name": t["name"],
+            "category": t.get("category", "Safety"),
+            "risk": t.get("risk", ""),
+            "threshold_kcal": t["affinity_threshold"],
+            "source": "default",
+            "por_defecto": True,
+            "estructura": estructura_del_panel_por_defecto(t["pdb_id"]),
+        }
+        for t in ANTI_TARGET_PANEL
+    ]
+    # Las 44 del panel mínimo de Bowes 2012: se listan TODAS con su estado, para
+    # que el usuario vea qué se le puede ofrecer y qué no, y por qué.
+    ya_listadas = {t["pdb_id"] for t in targets}
+    for fila in panel_bowes_2012():
+        pdb_id = str(fila.get("pdb_id") or "").upper()
+        if pdb_id and pdb_id in ya_listadas:
+            continue                                  # hERG y 5-HT2B ya van por defecto
+        validada = fila.get("estado") == "validada"
+        redock = fila.get("redock") or {}
+        targets.append({
+            "pdb_id": pdb_id or None,
+            "name": f"{fila['assay']} ({fila.get('gen') or '—'})",
+            "category": f"Bowes 2012 · {fila.get('familia') or 'panel'}",
+            "risk": fila.get("riesgo") or "",
+            "threshold_kcal": fila.get("affinity_threshold") or -7.0,
+            "source": "bowes2012",
+            "por_defecto": False,
+            "estado": fila.get("estado"),
+            "seleccionable": validada,
+            "motivo": fila.get("motivo"),
+            "estructura": None if not validada else {
+                "pdb_id": pdb_id, "metodo": fila.get("metodo"),
+                "resolucion_A": fila.get("resolucion_A"),
+                "ligando_de_referencia": fila.get("site_ligand"),
+                "distancia_centroides_A": redock.get("distancia_centroides_A"),
+                "pose_reproducida": redock.get("pose_reproducida"),
+                "rmsd_pose1_A": redock.get("rmsd_pose1_A"),
+                "sitio_adjudicado": fila.get("sitio_adjudicado", False),
+                "discordancia_de_sitio": fila.get("discordancia_de_sitio"),
+            },
+        })
+
+    # Append DB-backed anti-targets
+    try:
+        repo = Repository(db)
+        db_anti = await repo.get_anti_targets()
+        for t in db_anti:
+            if not target_is_accessible(t, current_user):
+                continue
+            targets.append({
+                "pdb_id": t.pdb_id,
+                "name": t.name,
+                "category": "Custom",
+                "risk": getattr(t, "anti_target_risk", None) or f"Target subido por el usuario: {t.name}",
+                "threshold_kcal": t.affinity_threshold or -7.0,
+                "source": "user",
+                "por_defecto": True,
+            })
+    except Exception as exc:  # noqa: BLE001 - degradacion declarada, no silencio
+        # Degradar a solo el panel por defecto es aceptable: el usuario sigue
+        # pudiendo evaluar. Hacerlo EN SILENCIO no lo es —vería menos
+        # anti-targets de los que tiene y no sabría por qué—, y es la misma
+        # familia de defecto que B1: un fallo que nadie registra no existe.
+        log.warning(
+            "anti_targets_de_usuario_no_listados",
+            error=f"{type(exc).__name__}: {exc}",
+            devueltos=len(targets),
+        )
+
+    for fila in targets:
+        fila.setdefault("seleccionable", True)
+        fila["motivo_no_disponible"] = (
+            motivo_no_disponible(fila["pdb_id"]) if fila.get("pdb_id") else None
+        ) or (None if fila["seleccionable"] else fila.get("motivo"))
+        fila["disponible"] = fila["seleccionable"] and fila["motivo_no_disponible"] is None
+    return {"anti_targets": targets}
+
+
+async def _selectivity_reference(repository, evaluation) -> float:
+    """Recupera una medida de la MISMA corrida; nunca fabrica afinidades."""
+    import math
+    value = evaluation.affinity_kcal
+    if value is None and getattr(evaluation, "task_id", None):
+        run = await repository.get_evaluation_run(evaluation.task_id, evaluation.molecule_id)
+        if run is not None and run.status == "SUCCESS" and isinstance(run.snapshot_json, dict):
+            value = run.snapshot_json.get("affinity_kcal")
+            if value is not None:
+                log.info("selectivity_reference_recovered", task_id=evaluation.task_id)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise HTTPException(422, "Selectividad no evaluada: falta una afinidad medida de la corrida principal.")
+    return float(value)
+
+
+@router.post("/selectivity/{molecule_id}")
+async def run_selectivity(
+    molecule_id: str,
+    num_workers: int = Query(2, ge=1, le=4, description="Parallel docking workers"),
+    anti_targets: str | None = Query(None, description="Comma-separated anti-target PDB IDs"),
+    current_user: UserORM | None = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Run selectivity panel: dock the molecule against anti-targets
+    to compute a safety profile.
+
+    Uses configurable parallel workers to adapt to user's CPU.
+    """
+    from uuid import UUID
+
+    try:
+        mol_uuid = UUID(molecule_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid molecule_id")
+
+    repository = Repository(db)
+    await require_owned_molecule(
+        repository=repository,
+        db=db,
+        molecule_id=mol_uuid,
+        current_user=current_user,
+        forbidden_detail="No tienes permiso para operar esta evaluación.",
+        missing_detail="Evaluation not found",
+    )
+    evaluation = await repository.get_evaluation_result(mol_uuid)
+    if evaluation is None:
+        raise HTTPException(status_code=404, detail="Evaluation not found")
+
+    if evaluation.molecule is None:
+        raise HTTPException(status_code=404, detail="Molecule data missing")
+
+    smiles = evaluation.molecule.smiles
+    smiles_hash = evaluation.molecule.smiles_hash
+    target = (
+        require_target_object_access(evaluation.molecule.target, current_user)
+        if evaluation.molecule.target else None
+    )
+    target_pdb = target.pdb_id if target else "7E2Y"
+    on_affinity = await _selectivity_reference(repository, evaluation)
+    anti_ids = anti_targets.split(",") if anti_targets else None
+    for target_id in anti_ids or []:
+        await get_target_for_user(
+            repository, target_id, current_user, allow_missing=True
+        )
+
+    try:
+        validar_protocolo_panel(evaluation.docking_protocol)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    result = await run_selectivity_panel(
+        smiles=smiles,
+        smiles_hash=smiles_hash,
+        on_target_pdb=target_pdb,
+        on_target_affinity=on_affinity,
+        num_workers=num_workers,
+        anti_targets=anti_ids,
+        # El panel resuelve `site_chains` de cada anti-diana contra el catálogo.
+        # Sin el repositorio, hERG (5VA1) y NaV1.5 (6MVW) se preparaban con una
+        # sola cadena teniendo el sitio declarado en dos y tres.
+        repository=repository,
+        docking_protocol=evaluation.docking_protocol,
+    )
+
+    # Persistencia del panel. Aqui habia un tercer `except Exception: pass`
+    # sobre la misma escritura -el mismo defecto B1 en un endpoint distinto-.
+    from core.database import commit_with_retry
+
+    persistido = False
+    try:
+        persistido = await repository.update_evaluation_for_task(
+            mol_uuid, evaluation.task_id,
+            selectivity_ratio=result.selectivity_ratio,
+            selectivity_delta_delta_g=result.delta_delta_g_kcal,
+            selectivity_ran=True,
+            selectivity_verdict=veredicto_de_margen(result.delta_delta_g_kcal),
+            anti_target_results=result.off_targets,
+        )
+        await commit_with_retry(db)
+    except Exception as exc:  # noqa: BLE001 - se reporta, no se traga
+        log.error(
+            "selectividad_no_persistida",
+            molecule_id=molecule_id,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    return {
+        "molecule_id": molecule_id,
+        "task_id": evaluation.task_id,
+        "persisted": persistido,
+        "on_target": {
+            "pdb_id": result.on_target_pdb,
+            "affinity_kcal": result.on_target_affinity,
+        },
+        # `selectivity_ratio` viaja para no romper clientes antiguos, pero no
+        # decide nada: ΔΔG es la magnitud con sentido físico.
+        "selectivity_ratio": result.selectivity_ratio,
+        "selectivity_delta_delta_g": result.delta_delta_g_kcal,
+        "peor_anti_diana": result.peor_anti_diana,
+        "selectivity_verdict": veredicto_de_margen(result.delta_delta_g_kcal),
+        "off_targets": result.off_targets,
+        "safety_flags": result.safety_flags,
+        "execution_time_s": result.execution_time_s,
+        # Cobertura: el cociente es un mínimo sobre lo que se llegó a evaluar.
+        # Con anti-dianas sin sitio o desconocidas puede ser optimista, y sin
+        # estos dos números el lector no tiene cómo saberlo.
+        "anti_dianas_evaluadas": result.anti_dianas_evaluadas,
+        "anti_dianas_solicitadas": result.anti_dianas_solicitadas,
+    }
+
+
+@router.post("/selectivity/stream/{molecule_id}")
+async def run_selectivity_stream(
+    molecule_id: str,
+    num_workers: int = Query(2, ge=1, le=4, description="Parallel docking workers"),
+    anti_targets: str | None = Query(None, description="Comma-separated anti-target PDB IDs"),
+    current_user: UserORM | None = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    SSE Stream of selectivity calculations: docks anti-targets one by one (or in parallel)
+    and emits real-time updates as each anti-target completes.
+    """
+    from uuid import UUID
+    import json
+    import time
+    import asyncio
+
+    try:
+        mol_uuid = UUID(molecule_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid molecule_id")
+
+    repository = Repository(db)
+    await require_owned_molecule(
+        repository=repository,
+        db=db,
+        molecule_id=mol_uuid,
+        current_user=current_user,
+        forbidden_detail="No tienes permiso para operar esta evaluación.",
+        missing_detail="Evaluation not found",
+    )
+    evaluation = await repository.get_evaluation_result(mol_uuid)
+    if evaluation is None or evaluation.molecule is None:
+        raise HTTPException(status_code=404, detail="Evaluation or molecule missing")
+
+    smiles = evaluation.molecule.smiles
+    smiles_hash = evaluation.molecule.smiles_hash
+    if evaluation.molecule.target:
+        require_target_object_access(evaluation.molecule.target, current_user)
+    on_affinity = await _selectivity_reference(repository, evaluation)
+    try:
+        exhaustiveness, num_poses, seed = validar_protocolo_panel(evaluation.docking_protocol)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+    anti_ids = anti_targets.split(",") if anti_targets else None
+    for target_id in anti_ids or []:
+        await get_target_for_user(
+            repository, target_id, current_user, allow_missing=True
+        )
+    # Misma selección que el panel no-stream: las anti-dianas del usuario se
+    # resuelven contra el catálogo en vez de caerse del filtro en silencio.
+    targets_list, anti_dianas_desconocidas = await seleccionar_anti_dianas(
+        anti_ids, repository
+    )
+
+    async def event_generator():
+        start_time = time.monotonic()
+        # El total incluye las que no se van a poder evaluar: contando sólo las
+        # acoplables, la barra llegaría al 100 % y el usuario creería que se
+        # evaluó todo lo que pidió.
+        total_targets = len(targets_list) + len(anti_dianas_desconocidas)
+
+        yield f"data: {json.dumps({'type': 'start', 'total': total_targets})}\n\n"
+
+        sem = asyncio.Semaphore(num_workers)
+        off_target_results = []
+        safety_flags = [
+            "Los scores de Vina entre receptores distintos son exploratorios "
+            "y no equivalen a diferencias experimentales de energía libre."
+        ]
+        worst_off_affinity = 0.0
+        peor_anti_diana: str | None = None
+
+        for pid in anti_dianas_desconocidas:
+            no_evaluada = {
+                "pdb_id": pid, "name": pid, "category": "Safety", "risk": "",
+                "affinity": None, "poses": 0, "threshold": -7.0,
+                "status": "desconocida",
+                "error": "no está en el panel ni en el catálogo de este equipo",
+            }
+            off_target_results.append(no_evaluada)
+            safety_flags.append(
+                f"NO EVALUADA {pid}: se pidió como anti-diana y no está en este "
+                f"equipo. El cociente de selectividad NO la incluye."
+            )
+            yield f"data: {json.dumps({'type': 'target', 'result': no_evaluada})}\n\n"
+
+        from services.docking.vina_service import run_vina_docking
+
+        for idx, at in enumerate(targets_list):
+            pdb_id = at["pdb_id"]
+            res = None
+            # El sitio real del receptor, resuelto contra el catálogo. Ver
+            # `services/docking/anti_target_sitio.py`.
+            sitio = await resolver_sitio_de_anti_diana(at, repository)
+            if isinstance(sitio, AntiDianaSinSitio):
+                res = {
+                    "pdb_id": pdb_id,
+                    "name": at["name"],
+                    "category": at.get("category", "Safety"),
+                    "risk": at.get("risk", ""),
+                    "affinity": None,
+                    "poses": 0,
+                    "threshold": at.get("affinity_threshold", -7.0),
+                    "status": "sin_sitio",
+                    "error": sitio.motivo,
+                    "sitio_adjudicado": sitio_adjudicado_de(pdb_id),
+                }
+                off_target_results.append(res)
+                yield f"data: {json.dumps({'type': 'target', 'index': idx, 'result': res})}\n\n"
+                continue
+            async with sem:
+                try:
+                    docking = await run_vina_docking(
+                        smiles_hash=smiles_hash,
+                        smiles=smiles,
+                        target_pdb_id=pdb_id,
+                        target_chain=sitio.chain,
+                        target_center=sitio.center,
+                        target_size=sitio.size,
+                        site_chains=sitio.site_chains,
+                        exhaustiveness=exhaustiveness,
+                        num_poses=num_poses,
+                        seed=seed,
+                    )
+                    res = {
+                        "pdb_id": pdb_id,
+                        "name": at["name"],
+                        "category": at.get("category", "Safety"),
+                        "risk": at.get("risk", ""),
+                        "affinity": docking.best_affinity if docking else None,
+                        "poses": len(docking.poses) if docking and docking.poses else 0,
+                        "threshold": at["affinity_threshold"],
+                        "site_chains": sitio.site_chains,
+                        "procedencia_caja": sitio.procedencia_caja,
+                        "docking_protocol": {"engine": "vina", "exhaustiveness": exhaustiveness,
+                                             "num_poses": num_poses, "seed": seed,
+                                             "smiles_hash": smiles_hash},
+                        "status": "ok",
+                    }
+                except Exception as e:
+                    error_msg = str(e)[:200]
+                    status_str = "failed"
+                    reason = error_msg
+                    if "VinaExecutable" in str(type(e).__name__) or "vina" in error_msg.lower():
+                        status_str = "no_vina"
+                        reason = "Vina no encontrado"
+                    elif "timeout" in error_msg.lower():
+                        status_str = "timeout"
+                        reason = "Timeout -- docking excedió el tiempo límite"
+
+                    res = {
+                        "pdb_id": pdb_id,
+                        "name": at["name"],
+                        "category": at.get("category", "Safety"),
+                        "risk": at.get("risk", ""),
+                        "affinity": None,
+                        "poses": 0,
+                        "threshold": at["affinity_threshold"],
+                        "status": status_str,
+                        "error": reason,
+                    }
+
+            res.setdefault("sitio_adjudicado", sitio_adjudicado_de(pdb_id))
+            off_target_results.append(res)
+
+            # Safety metrics check for this target
+            aff = res.get("affinity")
+            threshold = res.get("threshold", -7.0)
+            if aff is not None:
+                if aff < threshold:
+                    safety_flags.append(texto_de_alerta(res["name"], aff, threshold,
+                                                        res.get("risk", "Desconocido"),
+                                                        res.get("sitio_adjudicado"),
+                                                        discordancia_de_sitio_de(pdb_id)))
+                if aff < worst_off_affinity:
+                    worst_off_affinity = aff
+                    peor_anti_diana = res.get("name") or res.get("pdb_id")
+            else:
+                safety_flags.append(f"Sin datos para {res['name']} -- no se pudo evaluar")
+
+            # Stream individual progress event
+            chunk_data = {
+                "type": "anti_target",
+                "anti_target": res,
+                "completed": idx + 1,
+                "total": total_targets,
+            }
+            yield f"data: {json.dumps(chunk_data)}\n\n"
+
+        # Calculate final metrics
+        # Misma métrica que el panel no-stream: ΔΔG en kcal/mol. Antes esta
+        # ruta repetía el cociente ΔG_on/ΔG_off por su cuenta.
+        margen = margen_de_selectividad(
+            on_affinity, worst_off_affinity if worst_off_affinity < 0 else None, peor_anti_diana
+        )
+        delta_delta_g = margen.delta_delta_g if margen else None
+
+        selectivity_ratio = None
+        if on_affinity is not None and worst_off_affinity < 0:
+            selectivity_ratio = round(on_affinity / worst_off_affinity, 2)
+
+        verdict_str = veredicto_de_margen(delta_delta_g)
+        elapsed = time.monotonic() - start_time
+
+        # ── Persistencia del resultado de selectividad ──────────────────────
+        #
+        # DOC 71, DEFECTOS B1 y B2. Aqui habia un `except Exception: pass`
+        # alrededor de la UNICA escritura de este resultado. Si el commit
+        # fallaba -y con SQLite, escribir desde una segunda sesion mientras la
+        # respuesta esta en streaming es justo cuando falla- el flujo seguia
+        # emitiendo `done` con los numeros, la interfaz los pintaba, y la base
+        # no se enteraba nunca.
+        #
+        # De ahi salen los dos defectos que el informe listo por separado:
+        #   B1  el dossier lee `selectivity_ran = False` y declara "la corrida no
+        #       registro un panel de anti-targets", que desde su punto de vista
+        #       es literalmente cierto;
+        #   B2  el resultado solo vive en el estado del componente, asi que
+        #       desaparece al cambiar de pestana.
+        #
+        # Son la misma causa vista desde dos sitios, como sospechaba el doc 71.
+        #
+        # Ahora se reintenta con `commit_with_retry` -lo que usa el pipeline para
+        # exactamente este bloqueo de SQLite-, se registra el fallo, y sobre todo
+        # SE LE DICE AL CLIENTE: un resultado que no se pudo guardar no puede
+        # presentarse como si lo estuviera.
+        persistido = False
+        error_al_guardar = None
+        try:
+            from core.database import commit_with_retry, get_db_session
+            async with get_db_session() as db2:
+                repo2 = Repository(db2)
+                persistido = await repo2.update_evaluation_for_task(
+                    mol_uuid, evaluation.task_id, selectivity_ratio=selectivity_ratio,
+                    selectivity_delta_delta_g=delta_delta_g, selectivity_ran=True,
+                    selectivity_verdict=verdict_str, anti_target_results=off_target_results,
+                )
+                await commit_with_retry(db2)
+                if not persistido:
+                    error_al_guardar = "La proyección ya pertenece a otra corrida o no existe"
+        except Exception as exc:  # noqa: BLE001 - se reporta, no se traga
+            error_al_guardar = f"{type(exc).__name__}: {exc}"
+            log.error(
+                "selectividad_no_persistida",
+                molecule_id=str(mol_uuid),
+                anti_targets=len(off_target_results),
+                error=error_al_guardar,
+            )
+
+        final_data = {
+            "type": "done",
+            "task_id": evaluation.task_id,
+            "selectivity_ratio": selectivity_ratio,
+            "selectivity_delta_delta_g": delta_delta_g,
+            "peor_anti_diana": peor_anti_diana,
+            "selectivity_verdict": verdict_str,
+            "off_targets": off_target_results,
+            "safety_flags": safety_flags,
+            "execution_time_s": round(elapsed, 1),
+            # El cliente necesita saberlo para no prometer permanencia.
+            "persisted": persistido,
+            "persist_error": error_al_guardar,
+        }
+        yield f"data: {json.dumps(final_data)}\n\n"
+
+    from starlette.responses import StreamingResponse
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+async def _persistir_anti_target(db, evaluation, resultado: dict) -> bool:
+    """Escribe UN anti-target en la evaluacion, fusionando con los que ya estan.
+
+    # Por que persiste el servidor y no el cliente
+
+    DOC 71, B2. El panel de selectividad guardaba desde el navegador: el
+    endpoint que hacia el docking devolvia el resultado y se desentendia. Si el
+    usuario cerraba la pestana, cambiaba de vista o se le caia la conexion entre
+    un anti-target y el siguiente, ese docking -que ya se habia PAGADO en CPU-
+    se perdia sin dejar rastro.
+
+    Quien hace el trabajo es quien lo guarda. Asi el resultado sobrevive aunque
+    el cliente desaparezca a mitad de la tanda, que es exactamente lo que pasa
+    al cambiar de pestana en un panel que se desmonta.
+
+    La fusion es por `pdb_id` para que reacoplar un objetivo lo actualice en vez
+    de duplicarlo, y para que dos escrituras concurrentes no se pisen.
+    """
+    from core.database import commit_with_retry
+
+    if not isinstance(resultado, dict) or not resultado.get("pdb_id"):
+        return False
+
+    try:
+        fusionados = await Repository(db).merge_selectivity_for_task(
+            evaluation.molecule_id, evaluation.task_id, [resultado], selectivity_ran=True,
+        )
+        await commit_with_retry(db)
+        return fusionados is not None
+    except Exception as exc:  # noqa: BLE001 - se reporta, no se traga
+        log.error(
+            "anti_target_no_persistido",
+            molecule_id=str(getattr(evaluation, "molecule_id", "")),
+            pdb_id=resultado.get("pdb_id"),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return False
+
+
+@router.post("/selectivity/dock-target/{molecule_id}")
+async def dock_single_anti_target(
+    molecule_id: str,
+    target_pdb_id: str = Query(..., description="Anti-target PDB ID"),
+    current_user: UserORM | None = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Dock molecule against a single anti-target for progressive modal updates.
+    """
+    from uuid import UUID
+    from services.docking.vina_service import run_vina_docking
+
+    try:
+        mol_uuid = UUID(molecule_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid molecule_id")
+
+    repository = Repository(db)
+    await get_target_for_user(
+        repository, target_pdb_id, current_user, allow_missing=True
+    )
+    await require_owned_molecule(
+        repository=repository,
+        db=db,
+        molecule_id=mol_uuid,
+        current_user=current_user,
+        forbidden_detail="No tienes permiso para operar esta evaluación.",
+        missing_detail="Evaluation or molecule missing",
+    )
+    evaluation = await repository.get_evaluation_result(mol_uuid)
+    if evaluation is None or evaluation.molecule is None:
+        raise HTTPException(status_code=404, detail="Evaluation or molecule missing")
+    if task_id is not None and task_id != evaluation.task_id:
+        raise HTTPException(409, "La corrida seleccionada ya no es la vigente; no se calcula sobre otra evaluación.")
+
+    smiles = evaluation.molecule.smiles
+    smiles_hash = evaluation.molecule.smiles_hash
+    try:
+        exhaustiveness, num_poses, seed = validar_protocolo_panel(evaluation.docking_protocol)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+    # Find anti-target config
+    at = next((t for t in ANTI_TARGET_PANEL if t["pdb_id"] == target_pdb_id), None)
+    if at is None:
+        # SIN caja inventada. Aquí había `center=(0,0,0)` y `size=20³` para
+        # cualquier receptor desconocido: eso acopla contra el ORIGEN del
+        # sistema de coordenadas —espacio vacío en casi cualquier PDB— y
+        # devuelve la afinidad resultante como un dato de seguridad. El
+        # resolvedor toma la caja del catálogo y, si no hay ninguna calibrada,
+        # se abstiene.
+        at = {
+            "pdb_id": target_pdb_id,
+            "name": f"Target {target_pdb_id}",
+            "category": "Custom",
+            "risk": "Anti-diana no estándar",
+            "affinity_threshold": -7.0,
+        }
+
+    sitio = await resolver_sitio_de_anti_diana(at, repository)
+    if isinstance(sitio, AntiDianaSinSitio):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"No se puede evaluar {target_pdb_id} como anti-diana: {sitio.motivo}"
+            ),
+        )
+
+    try:
+        docking = await run_vina_docking(
+            smiles_hash=smiles_hash,
+            smiles=smiles,
+            target_pdb_id=target_pdb_id,
+            target_chain=sitio.chain,
+            target_center=sitio.center,
+            target_size=sitio.size,
+            site_chains=sitio.site_chains,
+            exhaustiveness=exhaustiveness,
+            num_poses=num_poses,
+            seed=seed,
+        )
+        res = {
+            "pdb_id": target_pdb_id,
+            "name": at["name"],
+            "category": at.get("category", "Safety"),
+            "risk": at.get("risk", ""),
+            "affinity": docking.best_affinity if docking else None,
+            "poses": len(docking.poses) if docking and docking.poses else 0,
+            "threshold": at["affinity_threshold"],
+            "site_chains": sitio.site_chains,
+            "procedencia_caja": sitio.procedencia_caja,
+            "docking_protocol": {"engine": "vina", "exhaustiveness": exhaustiveness,
+                                 "num_poses": num_poses, "seed": seed,
+                                 "smiles_hash": smiles_hash},
+            "status": "ok",
+        }
+    except Exception as e:
+        error_msg = str(e)[:200]
+        status_str = "failed"
+        reason = error_msg
+        if "VinaExecutable" in str(type(e).__name__) or "vina" in error_msg.lower():
+            status_str = "no_vina"
+            reason = "Vina no encontrado"
+        elif "timeout" in error_msg.lower():
+            status_str = "timeout"
+            reason = "Timeout -- docking excedió tiempo límite"
+
+        # El fallo NO se traga: se convierte en el resultado del anti-target,
+        # con su motivo, y se persiste igual que un exito. Un objetivo que no
+        # se pudo acoplar es informacion -el panel lo muestra en rojo- y no un
+        # hueco que el usuario deba interpretar.
+        #
+        # Se registra ademas en el servidor: un fallo de Vina que solo ve el
+        # navegador no aparece en `backend.latest.log`, y es justo lo que hace
+        # falta para diagnosticar por que un panel sale incompleto.
+        log.warning(
+            "anti_target_fallido",
+            molecule_id=molecule_id,
+            pdb_id=target_pdb_id,
+            estado=status_str,
+            motivo=reason,
+        )
+        res = {
+            "pdb_id": target_pdb_id,
+            "name": at["name"],
+            "category": at.get("category", "Safety"),
+            "risk": at.get("risk", ""),
+            "affinity": None,
+            "poses": 0,
+            "threshold": at["affinity_threshold"],
+            "status": status_str,
+            "error": reason,
+        }
+
+    # El trabajo ya esta hecho: se guarda aqui, no cuando al navegador le
+    # parezca. Si esto falla, el cliente se entera por `persisted` y puede
+    # reintentar; lo que no puede es creer que quedo guardado.
+    res["task_id"] = evaluation.task_id
+    res.setdefault("sitio_adjudicado", sitio_adjudicado_de(res.get("pdb_id")))
+    persistido = await _persistir_anti_target(db, evaluation, res)
+    return {"target": res, "persisted": persistido}
+
+
+
+
+class SaveSelectivityRequest(BaseModel):
+    task_id: str | None = Field(default=None, min_length=1, max_length=200)
+    off_targets: list[dict]
+    selectivity_ratio: float | None = None
+    selectivity_delta_delta_g: float | None = None
+    selectivity_verdict: str | None = None
+    safety_flags: list[str] = Field(default_factory=list)
+
+
+@router.post("/selectivity/save/{molecule_id}")
+async def save_selectivity_results_endpoint(
+    molecule_id: str,
+    payload: SaveSelectivityRequest,
+    current_user: UserORM | None = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    from uuid import UUID
+    try:
+        mol_uuid = UUID(molecule_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid molecule_id")
+
+    repository = Repository(db)
+    await require_owned_molecule(
+        repository=repository,
+        db=db,
+        molecule_id=mol_uuid,
+        current_user=current_user,
+        forbidden_detail="No tienes permiso para modificar esta evaluación.",
+        missing_detail="Evaluation not found",
+    )
+    evaluation = await repository.get_evaluation_result(mol_uuid)
+    if evaluation is None:
+        raise HTTPException(status_code=404, detail="Evaluation not found")
+
+    if not payload.task_id or payload.task_id != evaluation.task_id:
+        raise HTTPException(409, "El guardado requiere el task_id de la corrida vigente; recargue la evaluación.")
+    from core.database import commit_with_retry
+    fusionados = await repository.merge_selectivity_for_task(
+        mol_uuid, payload.task_id, payload.off_targets,
+        selectivity_ratio=payload.selectivity_ratio,
+        selectivity_delta_delta_g=payload.selectivity_delta_delta_g,
+        selectivity_ran=True,
+        selectivity_verdict=payload.selectivity_verdict or veredicto_de_margen(payload.selectivity_delta_delta_g),
+    )
+    if fusionados is None:
+        raise HTTPException(409, "La corrida cambió durante el guardado; el resultado no se sobrescribió.")
+    await commit_with_retry(db)
+
+    log.info(
+        "selectividad_guardada",
+        molecule_id=molecule_id,
+        recibidos=len(payload.off_targets),
+        total_persistido=len(fusionados),
+    )
+    return {
+        "success": True,
+        "molecule_id": molecule_id,
+        "task_id": evaluation.task_id,
+        # El cliente necesita saber cuantos hay GUARDADOS, no cuantos mando.
+        "anti_targets_persistidos": len(fusionados),
+    }
+
+
+async def _pose_de_piscina(evaluation, pose_rank: int):
+    """Recupera la pose `pose_rank` de una piscina de ensemble, DEMOSTRADA.
+
+    Levanta 422 con el motivo exacto si no se puede demostrar. No hay ruta que
+    genere coordenadas desde el SMILES ni que herede la pose de otra
+    conformación: ésas son las dos cosas que ENS-04 prohíbe expresamente.
+    """
+    from core.models import DockingPose
+    from services.docking.pose_recovery import (
+        PoseNoRecuperable,
+        recuperar_pose_agrupada,
+    )
+
+    guardadas = getattr(evaluation, "docking_poses", None) or []
+    candidata = next(
+        (p for p in guardadas if isinstance(p, dict) and p.get("rank") == pose_rank),
+        None,
+    )
+    # Sin procedencia no hay nada que recuperar, y el motivo no es el de la
+    # recuperación: es que esta corrida -de una sola conformación, o anterior al
+    # contrato de procedencia- no conserva su pose. Se dice eso y no otra cosa.
+    if candidata is None or not isinstance(candidata.get("source_provenance"), dict):
+        raise HTTPException(
+            422, "MM-GBSA no evaluado: la corrida no conserva su pose acoplada."
+        )
+    try:
+        recuperada = await recuperar_pose_agrupada(
+            DockingPose.model_validate(candidata)
+        )
+    except PoseNoRecuperable as exc:
+        log.warning(
+            "mmgbsa_pose_agrupada_no_recuperable",
+            task_id=getattr(evaluation, "task_id", None),
+            motivo=str(exc)[:200],
+        )
+        raise HTTPException(
+            422, f"MM-GBSA no evaluado: no se puede demostrar la pose. {exc}"
+        ) from exc
+    log.info(
+        "mmgbsa_pose_agrupada_verificada",
+        archivo=recuperada.poses_file_path,
+        rank_original=recuperada.rank_original,
+        conformer_index=recuperada.conformer_index,
+        atomos=recuperada.atomos_verificados,
+    )
+    return recuperada
+
+
+async def _mmgbsa_docked_pose(repository, evaluation, pose_rank):
+    """Load exactly the selected SDF record belonging to this run."""
+    import math
+    from rdkit import Chem
+    pose_path = getattr(evaluation, "poses_file_path", None)
+    if not pose_path and getattr(evaluation, "task_id", None):
+        run = await repository.get_evaluation_run(evaluation.task_id, evaluation.molecule_id)
+        if run and run.status == "SUCCESS" and isinstance(run.snapshot_json, dict):
+            pose_path = run.snapshot_json.get("poses_file_path")
+    # ── Una piscina de ensemble no tiene UN archivo ───────────────────
+    #
+    # `poses_file_path` es None a propósito en un resultado agrupado: apuntar al
+    # SDF de la primera corrida presentaría coordenadas distintas de las poses
+    # entregadas. Hasta aquí eso dejaba la pose irrecuperable y el endpoint se
+    # abstenía, que era correcto pero definitivo.
+    #
+    # Ahora se recupera de SU corrida, y sólo si las seis puertas de
+    # `pose_recovery` demuestran que el registro es esa pose: hash del artefacto,
+    # hash de la conformación de entrada, rank dentro del archivo, mismos átomos
+    # pesados y correspondencia coordenada a coordenada con el bloque PDBQT que
+    # el dossier ya citó. Si alguna falla, se sigue absteniendo, con el motivo.
+    indice_en_contenido = pose_rank - 1
+    if not pose_path:
+        # El registro recuperado es UN solo registro, así que su índice es 0: el
+        # rank de origen ya lo consumió la recuperación y volver a aplicarlo aquí
+        # devolvería otra pose. De qué archivo y rank salió queda en el log de
+        # `_pose_de_piscina`.
+        content = (await _pose_de_piscina(evaluation, pose_rank)).sdf_record
+        indice_en_contenido = 0
+    else:
+        try:
+            content = await read_text(pose_path)
+        except Exception as exc:
+            log.warning("mmgbsa_pose_read_failed", task_id=evaluation.task_id, error=str(exc))
+            raise HTTPException(
+                422, "MM-GBSA no evaluado: no se puede leer la pose de esta corrida."
+            ) from exc
+    try:
+        supplier = Chem.SDMolSupplier()
+        supplier.SetData(content)
+        # Filtering invalid records would silently change the requested rank.
+        mol = (
+            supplier[indice_en_contenido]
+            if 0 <= indice_en_contenido < len(supplier) else None
+        )
+    except Exception as exc:
+        log.warning("mmgbsa_pose_read_failed", task_id=evaluation.task_id, error=str(exc))
+        raise HTTPException(422, "MM-GBSA no evaluado: no se puede leer la pose de esta corrida.") from exc
+    if mol is None or not mol.GetNumConformers() or not mol.GetNumAtoms():
+        raise HTTPException(422, "MM-GBSA no evaluado: pose solicitada ausente o inválida.")
+    conf = mol.GetConformer()
+    coordinates = conf.GetPositions()
+    if not all(math.isfinite(float(x)) for xyz in coordinates for x in xyz):
+        raise HTTPException(422, "MM-GBSA no evaluado: coordenadas no finitas.")
+    if not conf.Is3D() and not any(abs(float(xyz[2])) > 1e-6 for xyz in coordinates):
+        raise HTTPException(422, "MM-GBSA no evaluado: se requiere una pose tridimensional.")
+    return mol
+
+
+@router.post("/mmgbsa/{molecule_id}")
+async def run_mmgbsa_endpoint(
+    molecule_id: str,
+    pose_rank: int = Query(1, ge=1, le=5, description="Which pose to rescore (1=best)"),
+    num_steps: int = Query(1000, ge=500, le=5000, description="Minimization steps"),
+    current_user: UserORM | None = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """
+    Motor MM-GBSA legacy retirado hasta validar una parametrización consistente.
+    """
+    from uuid import UUID
+
+    try:
+        mol_uuid = UUID(molecule_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid molecule_id")
+
+    repository = Repository(db)
+    await require_owned_molecule(
+        repository=repository,
+        db=db,
+        molecule_id=mol_uuid,
+        current_user=current_user,
+        forbidden_detail="No tienes permiso para operar esta evaluación.",
+        missing_detail="Evaluation not found",
+    )
+    from services.chemistry.mmgbsa_contrato import MMGBSA_NO_DISPONIBLE
+    raise HTTPException(status_code=422, detail=MMGBSA_NO_DISPONIBLE)
+
+
+
+@router.get("/gpu")
+async def gpu_status() -> dict[str, Any]:
+    """Check GPU availability for acceleration features."""
+    return {
+        "mmgbsa": {"disponible": False, "motivo": "MMGBSA_CONDICION: parametrización legacy inconsistente"},
+        "openmm_gpu": is_gpu_available(),
+        "torch_cuda": _check_torch_cuda(),
+        "platforms": _get_openmm_platforms(),
+    }
+
+
+def _check_torch_cuda() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
+def _get_openmm_platforms() -> list[str]:
+    try:
+        import openmm
+        return [
+            openmm.Platform.getPlatform(i).getName()
+            for i in range(openmm.Platform.getNumPlatforms())
+        ]
+    except ImportError:
+        return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ADMET-AI POST-DOCKING
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# POR QUE EXISTE. ADMET-AI es opt-in en las opciones avanzadas, y esa decision
+# se toma ANTES de ejecutar. Quien no lo marco se quedaba sin perfil ADMET para
+# siempre: la unica forma de tenerlo era volver a acoplar la molecula entera
+# —minutos de Vina— para recalcular algo que solo depende del SMILES.
+#
+# Este endpoint es el mismo trato que ya tiene MM-GBSA: un modulo caro que se
+# pide despues, sobre una corrida que ya existe, y que se PERSISTE porque quien
+# hace el trabajo es quien lo guarda.
+#
+# TRES COSAS QUE PROTEGE:
+#
+# 1. **El mismo calculo que el pipeline.** Llama a `calculate_properties(...,
+#    run_admet_ai=True)` y persiste con `Repository.upsert_evaluation_result`,
+#    que es el mapeo canonico. Escribir las columnas a mano aqui crearia una
+#    segunda copia del mapeo, y dos copias divergen —es exactamente el defecto
+#    que costo doce minutos de build en el gate del dossier embebido—.
+#
+# 2. **No inventa un perfil.** Si ADMET-AI no esta disponible, `predict_admet_ai`
+#    devuelve `None` en vez de valores simulados y el indice sale `None`. Aqui se
+#    comprueba DESPUES de correr: si no hay indice, se responde que no se pudo
+#    evaluar en vez de declarar exito sobre un perfil vacio.
+#
+# 3. **No pisa el docking ni la marca de control.** `upsert_evaluation_result`
+#    solo escribe lo que recibe, asi que la evidencia de acoplamiento sigue
+#    intacta; pero `is_control` SI se escribe siempre, y por eso se le reenvia
+#    el valor que ya tenia el registro. Sin eso, calcular ADMET sobre un control
+#    lo convertiria en una molecula normal.
+
+
+@router.post(
+    "/admet/{molecule_id}",
+    summary="Perfil ADMET de una molecula ya evaluada, calculado despues del acoplamiento",
+)
+async def run_admet_endpoint(
+    molecule_id: str,
+    recalcular: bool = Query(
+        False,
+        description=(
+            "Vuelve a calcularlo aunque ya haya un perfil guardado. Por omision "
+            "se devuelve el que hay: el modelo tarda y el resultado es el mismo."
+        ),
+    ),
+    current_user: UserORM | None = Depends(get_current_user_optional),
+    db: AsyncSession = Depends(get_db),
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    """Calcula el perfil ADMET de una molecula ya evaluada, y lo guarda."""
+    from uuid import UUID
+
+    try:
+        mol_uuid = UUID(molecule_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid molecule_id")
+
+    repository = Repository(db)
+    await require_owned_molecule(
+        repository=repository,
+        db=db,
+        molecule_id=mol_uuid,
+        current_user=current_user,
+        forbidden_detail="No tienes permiso para operar esta evaluacion.",
+        missing_detail="Evaluation not found",
+    )
+    evaluation = await repository.get_evaluation_result(mol_uuid)
+    if evaluation is None:
+        raise HTTPException(status_code=404, detail="Evaluation not found")
+    if task_id is not None and task_id != evaluation.task_id:
+        raise HTTPException(409, "La corrida seleccionada ya no es la vigente; no se calcula sobre otra evaluación.")
+    if evaluation.molecule is None:
+        raise HTTPException(status_code=404, detail="Molecule missing")
+
+    smiles = evaluation.molecule.smiles
+
+    def _perfil(origen: Any) -> dict[str, Any]:
+        """Lo que la interfaz necesita, leido de una sola fuente."""
+        return {
+            "blood_viability_score": getattr(origen, "blood_viability_score", None),
+            "blood_solubility_logs": getattr(origen, "blood_solubility_logs", None),
+            "blood_ppb_category": getattr(origen, "blood_ppb_category", None),
+            "blood_bbb_permeable": getattr(origen, "blood_bbb_permeable", None),
+            "blood_bbb_motivo": getattr(origen, "blood_bbb_motivo", None),
+            "blood_cns_mpo": getattr(origen, "blood_cns_mpo", None),
+            "blood_hia_permeable": getattr(origen, "blood_hia_permeable", None),
+            "blood_systemic_reactivity": list(
+                getattr(origen, "blood_systemic_reactivity", None) or []
+            ),
+            "blood_tabpfn_estado": getattr(origen, "blood_tabpfn_estado", None),
+        }
+
+    # Ya calculado: se devuelve tal cual. Repetirlo costaria la carga del modelo
+    # para obtener el mismo numero, y en una maquina virtual eso son minutos.
+    if not recalcular and evaluation.blood_viability_score is not None:
+        # Un perfil calculado antes de que la corrida lo guardara en su propio
+        # addendum está en la proyección pero no al reabrir la corrida (Historial).
+        # Se anexa aquí, sin recalcular: es el mismo número.
+        try:
+            if await repository.anexar_admet_existente(
+                mol_uuid, evaluation.task_id, evaluation,
+            ):
+                from core.database import commit_with_retry
+
+                await commit_with_retry(db)
+        except Exception as exc:  # noqa: BLE001 - se reporta, no se traga
+            log.error(
+                "admet_post_docking_anexo_fallo",
+                molecule_id=molecule_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        return {
+            "molecule_id": molecule_id,
+            "task_id": evaluation.task_id,
+            "estado": "ya_calculado",
+            "persistido": True,
+            **_perfil(evaluation),
+        }
+
+    # ── FUERA DEL BUCLE DE EVENTOS ──────────────────────────────────────────
+    #
+    # La primera prediccion carga el ensamble de Chemprop y domina el reloj de
+    # la llamada. Este endpoint es `async def`: correrlo aqui dejaria el backend
+    # sin contestar nada mas mientras dura —ni el sondeo de la corrida, ni
+    # `/health`—, que es el mismo defecto que ya se corrigio en MM-GBSA.
+    from anyio.to_thread import run_sync
+
+    from chem.properties import calculate_properties
+
+    try:
+        props = await run_sync(
+            functools.partial(calculate_properties, smiles, run_admet_ai=True)
+        )
+    except Exception as exc:  # noqa: BLE001 - se reporta, no se traga
+        log.error(
+            "admet_post_docking_fallo",
+            molecule_id=molecule_id,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=f"El perfil ADMET no se pudo calcular ({type(exc).__name__}).",
+        )
+
+    # NO se declara exito sobre un perfil vacio. `predict_admet_ai` devuelve
+    # `None` cuando el modelo no esta disponible —a proposito, para que nadie
+    # confunda un hueco con un valor—, y eso llega aqui como indice nulo.
+    if props.blood_viability_score is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "ADMET-AI no esta disponible en esta instalacion, asi que no hay "
+                "perfil que calcular. No se devuelve un perfil vacio como si lo "
+                "fuera."
+            ),
+        )
+
+    persistido = False
+    try:
+        # El mapeo canonico, el mismo que usa el pipeline. `is_control` se
+        # reenvia porque `upsert_evaluation_result` lo escribe SIEMPRE y su
+        # valor por omision convertiria un control en molecula normal.
+        # Proyección Y addendum de la corrida: el Historial lee el segundo.
+        persistido = await repository.guardar_admet_de_la_corrida(
+            mol_uuid, evaluation.task_id, props,
+        )
+        from core.database import commit_with_retry
+
+        await commit_with_retry(db)
+    except Exception as exc:  # noqa: BLE001 - se reporta, no se traga
+        log.error(
+            "admet_post_docking_no_persistido",
+            molecule_id=molecule_id,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+    log.info("admet_post_docking", molecule_id=molecule_id, persistido=persistido)
+    return {
+        "molecule_id": molecule_id,
+        "task_id": evaluation.task_id,
+        "estado": "calculado",
+        # Se dice si quedo guardado. Un perfil que el usuario ve pero que el
+        # dossier no leera es peor que uno que no se calculo.
+        "persistido": persistido,
+        **_perfil(props),
+    }

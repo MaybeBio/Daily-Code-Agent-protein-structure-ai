@@ -1,0 +1,818 @@
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+"""
+DataStream: Unified container for tool I/O data.
+
+Provides a consistent interface for structures, sequences, compounds, and MSAs
+regardless of their underlying representation (files, SMILES strings, etc.).
+
+Supports pattern-based IDs for compact representation:
+    ids=["5HG6_<0..49>"]  →  lazily expands to 50 IDs
+    files=["<id>.pdb"]    →  lazily expands using expanded IDs
+"""
+
+import os
+import pandas as pd
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Set, Iterator, Tuple, Union
+
+# A pipe script loads this chain standalone via sys.path, where a relative import has no package.
+try:
+    from . import contract_enforcement
+    from . import id_patterns
+except ImportError:
+    import sys
+    sys.path.append(os.path.dirname(__file__))
+    import contract_enforcement
+    import id_patterns
+
+
+@dataclass
+class StreamRecord:
+    """Materialized record from a DataStream."""
+
+    id: str
+    file: Optional[str] = None
+    values: Dict[str, Any] = field(default_factory=dict)
+
+    def __getattr__(self, name: str) -> Any:
+        if name in self.values:
+            return self.values[name]
+        raise AttributeError(name)
+
+
+@dataclass
+class DataStream:
+    """
+    Unified container for any data type flowing between tools.
+
+    A DataStream represents a collection of items (structures, sequences, compounds, etc.)
+    with a consistent interface regardless of storage format.
+
+    Attributes:
+        name: Name of this data stream (e.g., "structures", "sequences", "compounds")
+        ids: List of identifiers, may contain patterns (e.g., ["5HG6_<0..49>"])
+        files: List of file paths, may contain "<id>" template or "*" globs
+        map_table: Path to CSV file mapping ids to files/values and additional metadata
+        format: Data format ("pdb", "cif", "fasta", "csv", "sdf", "smiles", "ccd", etc.)
+        metadata: Additional tool-specific metadata
+
+    The map_table CSV always contains at minimum:
+        - id: The item identifier
+        - file: Path to file (empty string if format is inline like "smiles")
+        - value: Inline value (empty string if format is file-based)
+
+    Examples:
+        # Structure data (file-based)
+        structures = DataStream(
+            name="structures",
+            ids=["protein_1", "protein_2"],
+            files=["/path/to/protein_1.pdb", "/path/to/protein_2.pdb"],
+            map_table="/path/to/structures_map.csv",
+            format="pdb"
+        )
+
+        # Pattern-based IDs (compact representation)
+        designs = DataStream(
+            name="structures",
+            ids=["5HG6_<0..49>"],
+            files=[os.path.join(folder, "<id>.pdb")],
+            format="pdb"
+        )
+        # len(designs) == 50, but ids stores only 1 pattern string
+
+        # Iteration yields single-item DataStreams that can be passed to tools
+        for structure in structures:
+            print(f"Processing {structure.ids[0]}: {structure.files[0]}")
+            tool = SomeTool(structures=structure)
+    """
+
+    name: str = ""
+    ids: List[str] = field(default_factory=list)
+    files: Union[str, List[str]] = field(default_factory=list)
+    map_table: str = ""
+    format: str = "pdb"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # Internal caches (not serialized, not compared)
+    _ids_expanded: Optional[List[str]] = field(default=None, repr=False, compare=False)
+    _files_expanded: Optional[List[str]] = field(default=None, repr=False, compare=False)
+    _map_data: Optional[pd.DataFrame] = field(default=None, repr=False, compare=False)
+    _runtime_mode: bool = field(default=False, repr=False, compare=False)
+
+    def __post_init__(self):
+        """Validate DataStream after initialization."""
+        # Above the early returns below, so pattern and shared-file streams are checked too.
+        contract_enforcement.check_stream(self.name, self.files, self.format,
+                                          self.ids, self.map_table)
+        # Shared-file form: files is a non-empty str — no length check, the
+        # one path covers all ids by design.
+        if self.is_shared_file:
+            return
+        # Skip validation when patterns or <id> template are present
+        if self.has_patterns() or self._has_file_template():
+            return
+        # Validation rules for files (list form):
+        # - Empty files list: valid (value-based, data in map_table)
+        # - Single file: valid (one file contains all records, e.g., CSV)
+        # - Multiple files: must match number of ids (one file per record)
+        if len(self.files) > 1 and len(self.files) != len(self.ids):
+            raise ValueError(
+                f"Length mismatch: {len(self.ids)} ids but {len(self.files)} files. "
+                f"Use empty files list or single file for table-based data, "
+                f"or provide one file per id."
+            )
+
+    def _invalidate_caches(self):
+        """Clear expansion caches (call when ids or files change)."""
+        self._ids_expanded = None
+        self._files_expanded = None
+
+    def has_patterns(self) -> bool:
+        """True if any ID contains a pattern slot."""
+        return any(id_patterns.contains_pattern(s) for s in self.ids)
+
+    @property
+    def is_lazy(self) -> bool:
+        """True if any ID contains [...] bracket segments (runtime-dependent)."""
+        return any(id_patterns.is_lazy(s) for s in self.ids)
+
+    @property
+    def is_shared_file(self) -> bool:
+        """True if files is a single shared artifact (str) covering all ids.
+
+        Shared-file streams own one file (e.g. a multi-record FASTA) whose
+        rows correspond to the stream's ids. Distinct from per-ID file
+        lists and from value-based streams (empty files).
+        """
+        return isinstance(self.files, str) and bool(self.files)
+
+    def _has_file_template(self) -> bool:
+        """True if files list uses <id> template substitution."""
+        if isinstance(self.files, str):
+            return False
+        return len(self.files) == 1 and '<id>' in self.files[0]
+
+    @property
+    def ids_expanded(self) -> List[str]:
+        """Lazily expand patterns in ids. Cached after first call.
+
+        For lazy patterns (with brackets), expands only the deterministic prefix
+        at config time. In runtime mode, reads fully-expanded IDs from map_table.
+        """
+        if self._ids_expanded is None:
+            if self.is_lazy:
+                if self._runtime_mode:
+                    # Runtime: fully-expanded IDs are in the map_table written by bash
+                    self._ids_expanded = list(self._get_map_data()['id'])
+                else:
+                    # Config time: expand only the deterministic prefix
+                    self._ids_expanded, _ = id_patterns.try_expand_ids(self.ids)
+            elif self.has_patterns():
+                if self._runtime_mode and self.map_table:
+                    # A range pattern (<1..N>) states the design space, not what exists:
+                    # expanding it arithmetically re-declares ids an upstream filter has
+                    # already dropped. At runtime the map_table is what was produced.
+                    self._ids_expanded = list(self._get_map_data()['id'])
+                else:
+                    self._ids_expanded = id_patterns.expand_ids(self.ids)
+            else:
+                self._ids_expanded = self.ids  # No copy — same list reference
+        return self._ids_expanded
+
+    @property
+    def files_expanded(self) -> List[str]:
+        """Lazily expand file patterns using expanded IDs.
+
+        For shared-file streams (files is a single str path), returns
+        [self.files] — length 1, not duplicated per id. Consumers that
+        zip files with ids must check is_shared_file first.
+        """
+        if self._files_expanded is None:
+            if self.is_shared_file:
+                self._files_expanded = [self.files]
+            elif not self.files:
+                self._files_expanded = []
+            elif self._has_file_template():
+                template = self.files[0]
+                self._files_expanded = [
+                    id_patterns.expand_file_pattern(template, eid)
+                    for eid in self.ids_expanded
+                ]
+            elif len(self.files) == len(self.ids) and len(self.files) != len(self.ids_expanded):
+                # Files stored compact (one per pattern), need expansion to match expanded IDs
+                expanded = []
+                for f in self.files:
+                    expanded.extend(id_patterns.expand_pattern(f))
+                self._files_expanded = expanded
+            else:
+                self._files_expanded = self.files  # Already explicit
+        return self._files_expanded
+
+    def __len__(self) -> int:
+        """
+        Return number of items in the stream.
+
+        Uses pattern counting when possible to avoid full expansion.
+        """
+        if self._ids_expanded is not None:
+            return len(self._ids_expanded)
+        return id_patterns.count_ids(self.ids)
+
+    def __iter__(self) -> Iterator['DataStream']:
+        """
+        Iterate over single-item DataStream objects.
+
+        Each yielded DataStream has the same name, format, map_table, and
+        _runtime_mode as the parent, with ids containing a single ID and files
+        containing the corresponding file (for file-based streams) or empty
+        (for value-based streams, where values are read via map_table).
+
+        For shared-file streams, each yielded sub-stream keeps `files` as
+        the shared `str` path — every sub-stream points at the same file.
+
+        Yields:
+            Single-item DataStream for each item
+        """
+        expanded_ids = self.ids_expanded
+        if self.is_shared_file:
+            for item_id in expanded_ids:
+                yield self._inherit_producer(DataStream(
+                    name=self.name,
+                    ids=[item_id],
+                    files=self.files,
+                    map_table=self.map_table,
+                    format=self.format,
+                    _runtime_mode=self._runtime_mode
+                ))
+            return
+
+        expanded_files = self.files_expanded
+        if expanded_files:
+            for item_id, item_file in zip(expanded_ids, expanded_files):
+                yield self._inherit_producer(DataStream(
+                    name=self.name,
+                    ids=[item_id],
+                    files=[item_file],
+                    map_table=self.map_table,
+                    format=self.format,
+                    _runtime_mode=self._runtime_mode
+                ))
+        else:
+            for item_id in expanded_ids:
+                yield self._inherit_producer(DataStream(
+                    name=self.name,
+                    ids=[item_id],
+                    files=[],
+                    map_table=self.map_table,
+                    format=self.format,
+                    _runtime_mode=self._runtime_mode
+                ))
+
+    def chunks(self, count: Optional[int] = None, *, size: Optional[int] = None) -> List['DataStream']:
+        """Split into groups, for fanning a stream across parallel tasks.
+
+        ``__iter__`` yields one single-item stream per id, which is the wrong
+        granularity when the work is meant to be shared between a handful of
+        workers::
+
+            with Parallel(pack=4):
+                Resources(...)
+                for chunk in designs.chunks(4):
+                    with Run():
+                        Boltz2(structures=chunk, ...)
+
+        ``count`` is the number of chunks; ``size`` is the number of items per
+        chunk, with the other derived. Exactly one must be given. With
+        ``count``, a remainder is spread over the leading chunks (10 into 4 is
+        3/3/2/2) rather than left as a stunted tail. Chunks that would be empty
+        are dropped, so asking for more chunks than items yields fewer.
+
+        Lazy ids split on their deterministic outer axis and keep their
+        ``[...]`` suffix, so ``prot_<0..9>[_<#><A V>]`` chunks into groups of
+        ``prot_N[_<#><A V>]`` whose runtime fan-out is still deferred. An id
+        that is lazy at the top level has no such axis and raises.
+        """
+        if (count is None) == (size is None):
+            raise ValueError("chunks() takes exactly one of 'count' or 'size'.")
+        for label, value in (("count", count), ("size", size)):
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 1):
+                raise ValueError(f"chunks({label}=) must be a positive integer, got {value!r}.")
+
+        ids = self.ids_expanded
+        if not ids:
+            return []
+        if len(ids) == 1 and id_patterns.is_lazy(ids[0]) and id_patterns.strip_brackets(ids[0]) == "":
+            raise ValueError(
+                f"Cannot chunk DataStream '{self.name}': its id {ids[0]!r} is lazy at the top "
+                "level, so it has no config-time axis to split on. Chunk a stream whose ids "
+                "have a deterministic prefix, or split downstream of the tool that expands it."
+            )
+
+        n = len(ids)
+        if size is not None:
+            bounds = [(i, min(i + size, n)) for i in range(0, n, size)]
+        else:
+            base, extra = divmod(n, count)
+            bounds = []
+            start = 0
+            for i in range(count):
+                stop = start + base + (1 if i < extra else 0)
+                if stop > start:
+                    bounds.append((start, stop))
+                start = stop
+        return [self[start:stop] for start, stop in bounds]
+
+    def _records_stream(self) -> 'DataStream':
+        if self.is_lazy and not self._runtime_mode:
+            if self.map_table and os.path.exists(self.map_table):
+                return self._inherit_producer(DataStream(
+                    name=self.name,
+                    ids=self.ids.copy(),
+                    files=self.files if isinstance(self.files, str) else self.files.copy(),
+                    map_table=self.map_table,
+                    format=self.format,
+                    metadata=self.metadata.copy(),
+                    _runtime_mode=True,
+                ))
+            raise ValueError(
+                f"Cannot iterate records for lazy DataStream '{self.name}' before "
+                "its map_table is materialized."
+            )
+        return self
+
+    def records(self, columns: Optional[Union[str, List[str]]] = None) -> Iterator[StreamRecord]:
+        """
+        Iterate materialized stream records for notebook/result inspection.
+
+        File-based streams yield records with ``id`` and ``file``. Value-based
+        streams (``files=[]``) read ``map_table`` and yield records whose table
+        columns are available through ``record.values`` and dot access.
+        """
+        ds = self._records_stream()
+
+        if isinstance(columns, str):
+            requested_columns = [columns]
+        else:
+            requested_columns = columns
+
+        if ds.files:
+            from .biopipelines_io import iterate_files
+
+            for item_id, file_path in iterate_files(ds):
+                yield StreamRecord(id=item_id, file=file_path)
+            return
+
+        if not ds.map_table:
+            raise ValueError(
+                f"Cannot iterate records for value-based DataStream '{ds.name}': "
+                "no map_table configured."
+            )
+        if not os.path.exists(ds.map_table):
+            raise FileNotFoundError(f"map_table not found: {ds.map_table}")
+
+        from .biopipelines_io import iterate_values
+
+        for item_id, values in iterate_values(ds, columns=requested_columns):
+            yield StreamRecord(id=item_id, values=values)
+
+    def __getitem__(self, index):
+        """Get item by index or slice.
+
+        For integer index: returns single-item DataStream.
+        For slice: returns new DataStream with sliced items.
+
+        Shared-file streams (files is str) preserve the str form on both
+        slice and integer access — the shared artifact is shared.
+        """
+        if isinstance(index, slice):
+            sliced_ids = self.ids_expanded[index]
+            if self.is_shared_file:
+                sliced_files = self.files
+            else:
+                sliced_files = self.files_expanded[index] if self.files_expanded else []
+            return self._inherit_producer(DataStream(
+                name=self.name,
+                ids=sliced_ids,
+                files=sliced_files,
+                map_table=self.map_table,
+                format=self.format,
+                _runtime_mode=self._runtime_mode
+            ))
+
+        # Integer indexing — try O(1) expand_at for single-pattern case
+        n = len(self)
+        if index < 0 or index >= n:
+            raise IndexError(f"Index {index} out of range for DataStream with {n} items")
+
+        # can_expand, not has_patterns: expand_at on a lazy id fabricates an id matching no row.
+        if len(self.ids) == 1 and id_patterns.can_expand(self.ids[0]):
+            item_id = id_patterns.expand_at(self.ids[0], index)
+        else:
+            item_id = self.ids_expanded[index]
+
+        if self.is_shared_file:
+            return self._inherit_producer(DataStream(
+                name=self.name,
+                ids=[item_id],
+                files=self.files,
+                map_table=self.map_table,
+                format=self.format,
+                _runtime_mode=self._runtime_mode
+            ))
+
+        if self.files_expanded:
+            return self._inherit_producer(DataStream(
+                name=self.name,
+                ids=[item_id],
+                files=[self.files_expanded[index]],
+                map_table=self.map_table,
+                format=self.format,
+                _runtime_mode=self._runtime_mode
+            ))
+        else:
+            return self._inherit_producer(DataStream(
+                name=self.name,
+                ids=[item_id],
+                files=[],
+                map_table=self.map_table,
+                format=self.format,
+                _runtime_mode=self._runtime_mode
+            ))
+
+    def __bool__(self) -> bool:
+        """DataStream is truthy if it has any items."""
+        return len(self.ids) > 0
+
+    @property
+    def formats(self) -> tuple:
+        """Return the pipe-delimited stream formats as normalized tokens."""
+        return tuple(
+            fmt.strip().lower()
+            for fmt in (self.format or "").split("|")
+            if fmt.strip()
+        )
+
+    def has_format(self, format: str) -> bool:
+        """Return True when this stream advertises the given format."""
+        return format.strip().lower() in self.formats
+
+    def has_only_formats(self, *formats: str) -> bool:
+        """Return True when all advertised formats are in the allowed set."""
+        allowed = {fmt.strip().lower() for fmt in formats if fmt.strip()}
+        actual = set(self.formats)
+        return bool(actual) and actual <= allowed
+
+    def _get_map_data(self) -> Optional[pd.DataFrame]:
+        """Lazily load map_table data."""
+        if self._map_data is None:
+            if not self.map_table:
+                if self._runtime_mode:
+                    raise ValueError(f"DataStream '{self.name}' has no map_table configured")
+                return None
+            if not os.path.exists(self.map_table):
+                if self._runtime_mode:
+                    raise FileNotFoundError(f"map_table not found: {self.map_table}")
+                return None
+            self._map_data = pd.read_csv(self.map_table)
+        return self._map_data
+
+    def get_file(self, item_id: str) -> Optional[str]:
+        """
+        Get file path for a specific ID.
+
+        For shared-file streams every id maps to the same shared path.
+
+        Args:
+            item_id: The item identifier
+
+        Returns:
+            File path if found, None otherwise
+        """
+        expanded_ids = self.ids_expanded
+        if self.is_shared_file:
+            return self.files if item_id in expanded_ids else None
+        expanded_files = self.files_expanded
+        if item_id in expanded_ids and expanded_files:
+            idx = expanded_ids.index(item_id)
+            return expanded_files[idx]
+        return None
+
+    def get_value(self, item_id: str, column: str = 'value') -> Optional[str]:
+        """
+        Get a value from the map_table for a specific ID.
+
+        Args:
+            item_id: The item identifier
+            column: Column name to retrieve (default: 'value')
+
+        Returns:
+            Value if found, None otherwise
+        """
+        map_data = self._get_map_data()
+        if map_data is not None and column in map_data.columns:
+            row = map_data[map_data['id'] == item_id]
+            if not row.empty:
+                return row.iloc[0][column]
+        return None
+
+    def filter_by_ids(self, keep_ids: Union[Set[str], List[str]]) -> 'DataStream':
+        """
+        Create a new DataStream containing only specified IDs.
+
+        Triggers expansion (unavoidable — must check each ID).
+
+        For shared-file streams the shared path is preserved as-is; the
+        caller is responsible for slicing the underlying file (see
+        ``biopipelines.stream_slicers``) if the content must match.
+        """
+        if isinstance(keep_ids, list):
+            keep_ids = set(keep_ids)
+
+        expanded_ids = self.ids_expanded
+
+        if self.is_shared_file:
+            new_ids = [i for i in expanded_ids if i in keep_ids]
+            return self._inherit_producer(DataStream(
+                name=self.name,
+                ids=new_ids,
+                files=self.files,
+                map_table=self.map_table,
+                format=self.format,
+                metadata={**self.metadata, '_filtered': True, '_original_count': len(self)},
+                _runtime_mode=self._runtime_mode
+            ))
+
+        expanded_files = self.files_expanded
+
+        new_ids = []
+        new_files = []
+
+        for i, item_id in enumerate(expanded_ids):
+            if item_id in keep_ids:
+                new_ids.append(item_id)
+                if expanded_files:
+                    new_files.append(expanded_files[i])
+
+        return self._inherit_producer(DataStream(
+            name=self.name,
+            ids=new_ids,
+            files=new_files,
+            map_table=self.map_table,
+            format=self.format,
+            metadata={**self.metadata, '_filtered': True, '_original_count': len(self)},
+            _runtime_mode=self._runtime_mode
+        ))
+
+    def _inherit_producer(self, derived: 'DataStream') -> 'DataStream':
+        """Carry the producing tool onto a stream derived from this one.
+
+        Dataflow edges are recovered by walking ``_producer``, so a filtered,
+        sliced or chunked stream that drops it makes the run page state that
+        the two steps are not wired when they are. ``StandardizedOutput``
+        already does this for its own derivations.
+        """
+        producer = getattr(self, '_producer', None)
+        if producer is not None:
+            derived._producer = producer
+        return derived
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Convert to dictionary for serialization.
+
+        Stores pattern-based ids/files (compact representation). The
+        ``files`` field is serialized in whatever shape it was set —
+        list for per-id or templated, str for shared-file streams.
+        """
+        return {
+            'name': self.name,
+            'ids': self.ids.copy(),
+            'files': self.files if isinstance(self.files, str) else self.files.copy(),
+            'map_table': self.map_table,
+            'format': self.format,
+            'metadata': self.metadata.copy()
+        }
+
+    def save_json(self, path: str) -> str:
+        """Save DataStream to JSON file with compact patterns.
+
+        Patterns stay compact; pipe scripts load at runtime via load_datastream().
+        """
+        import json
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        data = {
+            'name': self.name,
+            'ids': self.ids.copy(),
+            'files': self.files if isinstance(self.files, str) else self.files.copy(),
+            'map_table': self.map_table,
+            'format': self.format,
+            'metadata': self.metadata.copy()
+        }
+        with open(path, 'w') as f:
+            json.dump(data, f, indent=2)
+        return path
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'DataStream':
+        """
+        Create DataStream from dictionary.
+
+        Accepts both pattern and explicit ids. Silently ignores
+        legacy 'files_contain_wildcards' key for backward compat.
+        """
+        return cls(
+            name=data.get('name', ''),
+            ids=data.get('ids', []),
+            files=data.get('files', []),
+            map_table=data.get('map_table', ''),
+            format=data.get('format', 'pdb'),
+            metadata=data.get('metadata', {})
+        )
+
+    @classmethod
+    def empty(cls, name: str, format: str) -> 'DataStream':
+        """Create an empty DataStream."""
+        return cls(name=name, ids=[], files=[], map_table="", format=format, metadata={})
+
+    def __repr__(self) -> str:
+        """Detailed string representation."""
+        if self.is_shared_file:
+            files_repr = "1(shared)"
+        else:
+            files_repr = str(len(self.files))
+        return (
+            f"DataStream(name='{self.name}', format='{self.format}', "
+            f"items={len(self)}, "
+            f"files={files_repr}, "
+            f"map_table={'set' if self.map_table else 'unset'})"
+        )
+
+    def __str__(self) -> str:
+        """Human-readable string representation."""
+        name_part = self.name or "unnamed"
+        if len(self) == 0:
+            return f"DataStream({name_part}, {self.format}): empty"
+
+        if self.has_patterns():
+            id_preview = ", ".join(self.ids)
+            return f"DataStream({name_part}, {self.format}): [{id_preview}] ({len(self)} total)"
+
+        if len(self) <= 3:
+            id_preview = ", ".join(self.ids)
+        else:
+            id_preview = f"{self.ids[0]}, {self.ids[1]}, ... ({len(self)} total)"
+
+        return f"DataStream({name_part}, {self.format}): [{id_preview}]"
+
+
+def create_map_table(
+    output_path: str,
+    ids: List[str],
+    files: Optional[Union[str, List[str]]] = None,
+    values: Optional[List[str]] = None,
+    additional_columns: Optional[Dict[str, List[Any]]] = None,
+    provenance: Optional[Dict[str, List[str]]] = None,
+    parent_ids: Optional[List[str]] = None,
+    suffix_pattern: Optional[str] = None,
+    input_stream_name: Optional[str] = None,
+    prune_redundant_provenance: bool = False
+) -> str:
+    """
+    Create a map_table CSV file for a DataStream.
+
+    Accepts pattern-based ids/files and expands them internally.
+
+    Args:
+        output_path: Path where CSV will be written
+        ids: List of item identifiers (may contain patterns)
+        files: List of file paths (optional, may contain "<id>" template)
+        values: List of inline values (optional, for value-based formats like SMILES)
+        additional_columns: Dict of column_name -> values to include
+        provenance: Dict of {stream_name: [input_id_per_output, ...]}
+        parent_ids: Parent IDs (may contain patterns) for auto-provenance
+        suffix_pattern: Suffix pattern (e.g., "<1..3>") — when set along with
+            parent_ids and input_stream_name, auto-generates provenance by
+            stripping the suffix from each expanded ID.
+        input_stream_name: Name of the input stream for auto-provenance column
+        prune_redundant_provenance: When True, drop plain ``<axis>.id``
+            provenance columns whose every non-empty cell is recoverable from
+            the row id by id-semantics alone (see
+            ``id_map_utils.prune_redundant_provenance_columns``). Default False.
+
+    Returns:
+        Path to created CSV file
+    """
+    # Expand deterministic slots. Lazy ids keep their [...] brackets (concrete
+    # values arrive in the runtime map_table); a config-time write of a lazy
+    # stream is a placeholder the pipe script overwrites at runtime.
+    if any(id_patterns.is_lazy(s) for s in ids):
+        expanded_ids = id_patterns.partial_expand_ids(ids)
+    elif any(id_patterns.contains_pattern(s) for s in ids):
+        expanded_ids = id_patterns.expand_ids(ids)
+    else:
+        expanded_ids = ids
+
+    # Expand file template if needed.
+    # Shared-file form: a single str path covers all ids — replicate it
+    # into the map_table so every row carries the same path (one shared
+    # artifact, len(ids) rows).
+    if isinstance(files, str) and files:
+        expanded_files = [files] * len(expanded_ids)
+    elif files and len(files) == 1 and '<id>' in files[0]:
+        template = files[0]
+        expanded_files = [id_patterns.expand_file_pattern(template, eid) for eid in expanded_ids]
+    elif files and any(id_patterns.is_lazy(s) for s in files):
+        expanded_files, _ = id_patterns.try_expand_ids(files)
+    elif files and any(id_patterns.contains_pattern(s) for s in files):
+        expanded_files = id_patterns.expand_ids(files)
+    else:
+        expanded_files = files
+
+    data = {'id': expanded_ids}
+
+    if expanded_files:
+        data['file'] = expanded_files
+    else:
+        data['file'] = [''] * len(expanded_ids)
+
+    if values:
+        data['value'] = values
+    else:
+        data['value'] = [''] * len(expanded_ids)
+
+    if additional_columns:
+        for col_name, col_values in additional_columns.items():
+            if len(col_values) != len(expanded_ids):
+                raise ValueError(
+                    f"Column '{col_name}' has {len(col_values)} values "
+                    f"but expected {len(expanded_ids)}"
+                )
+            data[col_name] = col_values
+
+    # Auto-generate provenance from parent_ids + suffix_pattern
+    if parent_ids is not None and suffix_pattern and input_stream_name:
+        if id_patterns.is_lazy(suffix_pattern):
+            suffix_values, _ = id_patterns.try_expand(suffix_pattern)
+        elif id_patterns.contains_pattern(suffix_pattern):
+            suffix_values = id_patterns.expand_pattern(suffix_pattern)
+        else:
+            suffix_values = [suffix_pattern]
+        n_suffixes = len(suffix_values)
+        if any(id_patterns.is_lazy(s) for s in parent_ids):
+            expanded_parents, _ = id_patterns.try_expand_ids(parent_ids)
+        elif any(id_patterns.contains_pattern(s) for s in parent_ids):
+            expanded_parents = id_patterns.expand_ids(parent_ids)
+        else:
+            expanded_parents = parent_ids
+        prov_list = []
+        for pid in expanded_parents:
+            prov_list.extend([pid] * n_suffixes)
+        col_name = f"{input_stream_name}.id"
+        data[col_name] = prov_list
+
+    if provenance:
+        # Compute per-element expansion factors from the original ids list.
+        # Each element in ids (which may be a pattern like "a_<0..1>") expands
+        # to N concrete IDs. Provenance has one value per ids element, so each
+        # provenance value must be replicated by the same factor.
+        expansion_factors = [id_patterns.count_pattern(s) for s in ids]
+
+        for stream_name, prov_ids in provenance.items():
+            col_name = f"{stream_name}.id"
+            if len(prov_ids) == len(ids):
+                # Provenance is at pattern-element level — replicate each value
+                # by the expansion factor of the corresponding main ID pattern,
+                # then expand any patterns within the provenance values themselves.
+                expanded_prov = []
+                for prov_val, factor in zip(prov_ids, expansion_factors):
+                    if id_patterns.is_lazy(prov_val):
+                        vals, _ = id_patterns.try_expand(prov_val)
+                    elif id_patterns.contains_pattern(prov_val):
+                        vals = id_patterns.expand_pattern(prov_val)
+                    else:
+                        vals = [prov_val] * factor
+                    expanded_prov.extend(vals)
+            else:
+                # Already at expanded level — use as-is
+                expanded_prov = prov_ids
+            if len(expanded_prov) != len(expanded_ids):
+                raise ValueError(
+                    f"Provenance column '{col_name}' has {len(expanded_prov)} values "
+                    f"but expected {len(expanded_ids)}"
+                )
+            data[col_name] = expanded_prov
+
+    df = pd.DataFrame(data)
+
+    if prune_redundant_provenance:
+        from .id_map_utils import prune_redundant_provenance_columns
+        df = prune_redundant_provenance_columns(df)
+
+    # Ensure parent directory exists
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    df.to_csv(output_path, index=False)
+    return output_path

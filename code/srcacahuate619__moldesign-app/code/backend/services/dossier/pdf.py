@@ -1,0 +1,905 @@
+"""
+Render del dossier a PDF. Determinista y derivado del modelo canónico.
+
+# Qué NO hace, y por qué importa
+
+- **No consulta la red.** Ni PubChem, ni Ollama, ni proveedores. Un documento de
+  evidencia no puede depender de que un tercero conteste, ni filtrar el SMILES
+  del usuario a un servicio externo al imprimirlo.
+- **No calcula nada científico.** Recibe `CaseDossier` ya interpretado. Si el
+  renderizador pudiera decidir qué es «pasa», habría dos interpretaciones de la
+  misma corrida y el paquete verificable dejaría de coincidir con el PDF.
+- **No pone un score en la jerarquía principal.** Los índices 0-100 aparecen una
+  sola vez, en el apéndice heredado, con su advertencia. No hay portada con
+  nota, ni resumen con nota, ni «GLOBAL SCORE».
+
+# Composición
+
+Se usa `platypus` con un `SimpleDocTemplate`: el flujo decide los saltos de
+página, que es lo que evita el defecto clásico de los PDF dibujados a mano —
+texto que se sale del margen inferior cuando el contexto del usuario es largo.
+Los encabezados van con `KeepTogether` junto a su primer bloque para que no
+queden huérfanos al final de una página.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import os
+from dataclasses import replace
+from typing import Any
+
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas as pdfcanvas
+from reportlab.platypus import (
+    CondPageBreak,
+    KeepTogether,
+    Paragraph as _Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table as _Table,
+    TableStyle,
+)
+
+from core.i18n import current_locale, translate_text
+from core.i18n_plantillas import traducir
+from services.dossier.localization import traducir_dossier
+from services.pdf_glifos import codigo_en_monoespaciada, sin_glifos_ausentes
+from services.dossier.model import CaseDossier, Campo, Control
+from services.dossier.taxonomy import ETIQUETA, GLOSARIO, Estado
+
+class Table(_Table):
+    """`Table` cuya fuente por defecto es la incrustada.
+
+    `Table._drawCell` selecciona la fuente de la CELDA aunque lleve un `Paragraph` con la suya, y la de una celda sin
+    estilo es la Helvetica estándar: cada página del PDF la declaraba, sin incrustar (B6). Los estilos que se añadan
+    después se aplican encima, en el orden en que llegan.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.setStyle(TableStyle([("FONTNAME", (0, 0), (-1, -1), _fuentes_de_texto()[0])]))
+
+
+class Paragraph(_Paragraph):
+    """`Paragraph` que no deja pasar lo que un PDF no puede dibujar.
+
+    Todo texto del dossier acaba aquí, así que es el sitio donde no se escapa nada: quita los pictogramas que la fuente no
+    tiene (B1) y dibuja `código` entre comillas inversas en monoespaciada, sin las comillas (B7).
+    """
+
+    def __init__(self, text: Any, *args: Any, **kwargs: Any) -> None:
+        if isinstance(text, str):
+            text = codigo_en_monoespaciada(sin_glifos_ausentes(text), fuente_monoespaciada())
+        super().__init__(text, *args, **kwargs)
+
+
+# ── Tokens de presentación ───────────────────────────────────────────
+INK = colors.HexColor("#0f172a")
+SLATE = colors.HexColor("#475569")
+SLATE_LT = colors.HexColor("#64748b")
+LINE = colors.HexColor("#e2e8f0")
+HEAD_BG = colors.HexColor("#f1f5f9")
+BRAND = colors.HexColor("#1e40af")
+
+#: Color por estado. Deliberadamente sobrio: `PASA` no es verde brillante
+#: porque el documento no celebra resultados, los declara.
+COLOR_ESTADO: dict[Estado, colors.Color] = {
+    Estado.PASA: colors.HexColor("#15803d"),
+    Estado.REGISTRADO: colors.HexColor("#334155"),
+    Estado.REVISAR: colors.HexColor("#b45309"),
+    Estado.ABSTENCION: colors.HexColor("#b91c1c"),
+    Estado.NO_EVALUADO: colors.HexColor("#64748b"),
+    Estado.NO_DISPONIBLE: colors.HexColor("#64748b"),
+    Estado.NO_DEFINIDO: colors.HexColor("#64748b"),
+    Estado.NO_APLICA: colors.HexColor("#64748b"),
+}
+
+_ANCHO_UTIL = A4[0] - 3.6 * cm  # márgenes de 1.8 cm a cada lado
+
+
+# ── Fuente del texto: incrustada, no la Helvetica «estándar» ──────────
+#
+# AMP-08. El documento usaba Helvetica y Symbol sin incrustar. Un visor que no
+# tiene la métrica exacta (Poppler en la auditoría) dejó huecos en α, β, Δ y ≤
+# de la pregunta del caso, aunque el texto sí estaba en la extracción. Eso es
+# un problema de PORTABILIDAD del documento, no de su contenido: el dossier se
+# transfiere a terceros que abren el PDF en visores que no controlamos. Una
+# TrueType se incrusta (subconjunto) y se ve igual en todas partes.
+#
+# Se busca donde de verdad puede estar: Arial en Windows, que es la plataforma
+# de este producto, y DejaVu/Liberation en Linux. Si no hay ninguna, el
+# documento se compone con Helvetica como antes —no se inventa una fuente— y
+# `fuente_de_texto_incrustada()` lo dice, para que quien necesite la garantía
+# pueda comprobarla.
+_FAMILIA_DE_TEXTO = "MolDesignSans"
+_CANDIDATAS_DE_FUENTE = (
+    # (regular, negrita, cursiva, negrita cursiva)
+    tuple(
+        os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", nombre)
+        for nombre in ("arial.ttf", "arialbd.ttf", "ariali.ttf", "arialbi.ttf")
+    ),
+    (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-BoldOblique.ttf",
+    ),
+    (
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
+    ),
+)
+_FUENTES_DE_TEXTO: tuple[str, str] | None = None
+
+
+def _fuentes_de_texto() -> tuple[str, str]:
+    """(regular, negrita). Registra la familia incrustable la primera vez."""
+    global _FUENTES_DE_TEXTO
+    if _FUENTES_DE_TEXTO is not None:
+        return _FUENTES_DE_TEXTO
+    for juego in _CANDIDATAS_DE_FUENTE:
+        if not all(os.path.exists(ruta) for ruta in juego):
+            continue
+        try:
+            nombres = [f"{_FAMILIA_DE_TEXTO}-{sufijo}" for sufijo in ("R", "B", "I", "BI")]
+            for nombre, ruta in zip(nombres, juego):
+                pdfmetrics.registerFont(TTFont(nombre, ruta))
+            pdfmetrics.registerFontFamily(
+                _FAMILIA_DE_TEXTO,
+                normal=nombres[0], bold=nombres[1], italic=nombres[2], boldItalic=nombres[3],
+            )
+            _FUENTES_DE_TEXTO = (nombres[0], nombres[1])
+            return _FUENTES_DE_TEXTO
+        except Exception:  # noqa: BLE001 - una fuente ilegible no tumba el dossier
+            continue
+    _FUENTES_DE_TEXTO = ("Helvetica", "Helvetica-Bold")
+    return _FUENTES_DE_TEXTO
+
+
+def fuente_de_texto_incrustada() -> bool:
+    """`True` si el texto del dossier va con una TrueType incrustada."""
+    return _fuentes_de_texto()[0] != "Helvetica"
+
+
+def fuente_de_cursiva() -> str:
+    """La cursiva de la misma familia (o la Helvetica-Oblique estándar si no hay TrueType)."""
+    regular, _ = _fuentes_de_texto()
+    return "Helvetica-Oblique" if regular == "Helvetica" else f"{_FAMILIA_DE_TEXTO}-I"
+
+
+# La monoespaciada, también incrustada (B6): hashes, SMILES y `código` iban en la Courier estándar, que no se incrusta.
+_CANDIDATAS_MONOESPACIADA = (
+    os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "consola.ttf"),
+    os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "cour.ttf"),
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+)
+_FUENTE_MONOESPACIADA: str | None = None
+
+
+def fuente_monoespaciada() -> str:
+    """El nombre de la TrueType monoespaciada registrada, o «Courier» si en este equipo no hay ninguna."""
+    global _FUENTE_MONOESPACIADA
+    if _FUENTE_MONOESPACIADA is not None:
+        return _FUENTE_MONOESPACIADA
+    for ruta in _CANDIDATAS_MONOESPACIADA:
+        if not os.path.exists(ruta):
+            continue
+        try:
+            nombre = "MolDesignMono-" + os.path.splitext(os.path.basename(ruta))[0]
+            pdfmetrics.registerFont(TTFont(nombre, ruta))
+            _FUENTE_MONOESPACIADA = nombre
+            return nombre
+        except Exception:  # noqa: BLE001 - una fuente ilegible no tumba el dossier
+            continue
+    _FUENTE_MONOESPACIADA = "Courier"
+    return _FUENTE_MONOESPACIADA
+
+
+def _escapar(texto: Any) -> str:
+    """
+    Escapa para `Paragraph`, que interpreta un subconjunto de XML.
+
+    Sin esto, un SMILES con `<` o un nombre con `&` rompe el render o, peor,
+    desaparece del documento sin avisar.
+    """
+    if texto is None:
+        return ""
+    return (
+        # Un aviso heredado empieza con «⚠️», que la fuente del PDF no tiene: salía como cuadros (B1).
+        sin_glifos_ausentes(str(texto))
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _legible(valor: Any) -> str:
+    """Un valor JSON como lo leería una persona: `clave: valor; clave: valor`, sin llaves, corchetes ni comillas.
+
+    Caza 1, A08: «Versiones de preparación» y «Configuración PRO declarada» salían como `{"meeko": "0.7.1", …}`. El modelo canónico y
+    el paquete conservan el JSON; sólo el PDF lo presenta.
+    """
+    if isinstance(valor, dict):
+        return "; ".join(f"{clave}: {_legible_anidado(v)}" for clave, v in valor.items())
+    if isinstance(valor, list):
+        return ", ".join(_legible_anidado(v) for v in valor)
+    if isinstance(valor, bool):
+        return ("yes" if valor else "no") if current_locale() == "en" else ("sí" if valor else "no")
+    return "" if valor is None else str(valor)
+
+
+def _legible_anidado(valor: Any) -> str:
+    return f"({_legible(valor)})" if isinstance(valor, dict) else _legible(valor)
+
+
+def _texto_legible(texto: str) -> str:
+    """`texto` si no es un objeto JSON; si lo es, su lectura (`_legible`)."""
+    candidato = texto.strip()
+    if candidato.startswith(("{", "[")):
+        try:
+            return _legible(json.loads(candidato))
+        except ValueError:
+            return texto
+    return texto
+
+
+#: Los campos de procedencia que el dossier puede declarar sin sellar, con el nombre que se lee.
+_NOMBRE_DE_CAMPO_DE_PROCEDENCIA = {
+    "ligando_smiles_sha256": "hash del ligando (SMILES)",
+    "receptor_referencia": "referencia del receptor",
+    "configuracion_sha256": "hash de la configuración",
+    "poses_sha256": "hash de las poses",
+    "motor": "motor de acoplamiento",
+    "modelo": "modelo de rescoring",
+    "vocabulario_especies": "vocabulario de especies del sitio",
+}
+
+
+def _romper_largo(texto: str) -> str:
+    """
+    Deja que reportlab parta las cadenas largas por su cuenta.
+
+    La versión anterior insertaba U+200B (espacio de ancho cero) cada 60
+    caracteres para partir hashes y SMILES. Helvetica no tiene glifo para ese
+    carácter, así que el PDF lo pintaba como un **cuadrado negro** en mitad del
+    SHA-256 — visible en el QA de la página 1. Un carácter invisible en el
+    editor y sólido en el papel es la peor clase de defecto tipográfico.
+
+    `Paragraph` ya parte palabras que no caben (`splitLongWords`, activo por
+    defecto). No hace falta ayudarle, y ayudarle rompía el documento.
+    """
+    return texto or ""
+
+
+class _Chrome(pdfcanvas.Canvas):
+    """Encabezado, pie y numeración «página N de M»."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Sin esto cada página abría con «BT /Helvetica 12 Tf», una fuente estándar que figuraba en el PDF sin incrustar.
+        # (`BaseDocTemplate` la pasa explícitamente como `None`, así que `setdefault` no bastaba.)
+        if not kwargs.get("initialFontName"):
+            kwargs["initialFontName"] = _fuentes_de_texto()[0]
+        super().__init__(*args, **kwargs)
+        self._paginas: list[dict[str, Any]] = []
+        self.encabezado = ""
+
+    def showPage(self) -> None:  # noqa: N802 (API de reportlab)
+        self._paginas.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self) -> None:
+        total = len(self._paginas)
+        for estado in self._paginas:
+            self.__dict__.update(estado)
+            self._dibujar_chrome(total)
+            super().showPage()
+        super().save()
+
+    def _dibujar_chrome(self, total: int) -> None:
+        self.saveState()
+        self.setFillColor(BRAND)
+        self.rect(0, A4[1] - 0.18 * cm, A4[0], 0.18 * cm, stroke=0, fill=1)
+
+        self.setFont(_fuentes_de_texto()[0], 7)
+        self.setFillColor(SLATE_LT)
+        self.drawString(1.8 * cm, A4[1] - 0.85 * cm, self.encabezado)
+        self.drawRightString(
+            A4[0] - 1.8 * cm, 1.0 * cm,
+            translate_text(f"Página {self._pageNumber} de {total}")
+        )
+        self.drawString(
+            1.8 * cm, 1.0 * cm,
+            translate_text("MolDesign · dossier de evidencia computacional · no es una recomendación clínica"),
+        )
+        self.restoreState()
+
+
+def _estilos() -> dict[str, ParagraphStyle]:
+    base = getSampleStyleSheet()
+    regular, negrita = _fuentes_de_texto()
+    estilos = {
+        "titulo": ParagraphStyle(
+            "DossierTitulo", parent=base["Heading1"], fontSize=17, leading=21,
+            textColor=BRAND, spaceAfter=2, alignment=TA_LEFT,
+        ),
+        "subtitulo": ParagraphStyle(
+            "DossierSubtitulo", parent=base["Normal"], fontSize=10, leading=13,
+            textColor=SLATE, spaceAfter=10,
+        ),
+        "seccion": ParagraphStyle(
+            "DossierSeccion", parent=base["Heading2"], fontSize=11.5, leading=14,
+            textColor=BRAND, spaceBefore=12, spaceAfter=5,
+        ),
+        "cuerpo": ParagraphStyle(
+            "DossierCuerpo", parent=base["Normal"], fontSize=8.6, leading=11.6,
+            textColor=INK, spaceAfter=3,
+        ),
+        "nota": ParagraphStyle(
+            "DossierNota", parent=base["Normal"], fontSize=7.6, leading=10,
+            textColor=SLATE, spaceAfter=2,
+        ),
+        "celda": ParagraphStyle(
+            "DossierCelda", parent=base["Normal"], fontSize=8.2, leading=10.6, textColor=INK,
+        ),
+        "celda_nota": ParagraphStyle(
+            "DossierCeldaNota", parent=base["Normal"], fontSize=7.4, leading=9.6, textColor=SLATE,
+        ),
+        "mono": ParagraphStyle(
+            "DossierMono", parent=base["Normal"], fontName=fuente_monoespaciada(), fontSize=7.4,
+            leading=9.4, textColor=INK,
+        ),
+    }
+    for nombre, estilo in estilos.items():
+        if nombre == "mono":
+            continue  # lleva su propia fuente: la monoespaciada
+        estilo.fontName = negrita if nombre in ("titulo", "seccion") else regular
+    return estilos
+
+
+def _tabla_campos(campos: list[Campo], est: dict[str, ParagraphStyle]) -> Table:
+    """
+    Tabla etiqueta / valor / estado.
+
+    Celdas con `Paragraph` para que una fila larga se parta entre páginas sin
+    recortar texto, y `repeatRows=1` para que la cabecera viaje con ella. Los
+    anchos son fijos: dejarlos automáticos hacía que una etiqueta larga
+    empujara el valor fuera del margen.
+    """
+    filas = [[
+        Paragraph(f"<b>{translate_text('Campo')}</b>", est["celda"]),
+        Paragraph(f"<b>{translate_text('Contenido')}</b>", est["celda"]),
+        Paragraph(f"<b>{translate_text('Estado')}</b>", est["celda"]),
+    ]]
+    estilos_fila = []
+    for indice, campo in enumerate(campos, start=1):
+        texto = _texto_legible(campo.texto)
+        # Missing-value labels are generated taxonomy, not case-authored data.
+        # Translate only that exact fallback so free-text case values remain intact.
+        if texto == ETIQUETA[campo.estado]:
+            texto = translate_text(texto)
+        cuerpo = _escapar(_romper_largo(texto))
+        # La razón sólo se añade si DICE algo distinto del valor. Repetir la
+        # misma frase dos veces seguidas es ruido, y aparecía en la fila de
+        # «relación de la corrida con los inputs».
+        if campo.razon and campo.razon.strip() != (campo.valor or "").strip():
+            cuerpo += f"<br/><font size='7' color='#64748b'>{_escapar(campo.razon)}</font>"
+        filas.append([
+            Paragraph(_escapar(campo.etiqueta), est["celda"]),
+            Paragraph(cuerpo, est["celda"]),
+            Paragraph(translate_text(ETIQUETA[campo.estado]), est["celda_nota"]),
+        ])
+        estilos_fila.append(("TEXTCOLOR", (2, indice), (2, indice), COLOR_ESTADO[campo.estado]))
+
+    # `repeatRows=1`: si la tabla se parte entre páginas, la cabecera se repite.
+    # Sin esto, la segunda mitad quedaba sin decir qué era cada columna.
+    # `splitInRow=1`: sin él `Table` sólo parte ENTRE filas, y una celda más alta que la página lanzaba LayoutError
+    # (2AW1 en inglés, 843 pt de 742: el paquete respondía 500).
+    tabla = Table(filas, colWidths=[_ANCHO_UTIL * 0.28, _ANCHO_UTIL * 0.55, _ANCHO_UTIL * 0.17],
+                  repeatRows=1, splitInRow=1)
+    tabla.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), HEAD_BG),
+        ("TEXTCOLOR", (0, 0), (-1, 0), INK),
+        ("GRID", (0, 0), (-1, -1), 0.4, LINE),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        *estilos_fila,
+    ]))
+    return tabla
+
+
+def _tabla_controles(controles: list[Control], est: dict[str, ParagraphStyle]) -> Table:
+    filas = [[
+        Paragraph(f"<b>{translate_text('Control')}</b>", est["celda"]),
+        Paragraph(f"<b>{translate_text('Observación y protocolo')}</b>", est["celda"]),
+        Paragraph(f"<b>{translate_text('Estado')}</b>", est["celda"]),
+    ]]
+    estilos_fila = []
+    for indice, control in enumerate(controles, start=1):
+        cuerpo = _escapar(control.observacion)
+        if control.protocolo:
+            cuerpo += (f"<br/><font size='7' color='#64748b'>{translate_text('Protocolo')}: "
+                       f"{_escapar(control.protocolo)}</font>")
+        if control.procedencia:
+            cuerpo += (f"<br/><font size='7' color='#64748b'>{translate_text('Procedencia')}: "
+                       f"{_escapar(control.procedencia)}</font>")
+        filas.append([
+            Paragraph(f"{_escapar(control.titulo)}<br/><font size='6.6' color='#64748b'>{_escapar(control.codigo)}</font>", est["celda"]),
+            Paragraph(cuerpo, est["celda"]),
+            Paragraph(translate_text(ETIQUETA[control.estado]), est["celda_nota"]),
+        ])
+        estilos_fila.append(("TEXTCOLOR", (2, indice), (2, indice), COLOR_ESTADO[control.estado]))
+
+    tabla = Table(filas, colWidths=[_ANCHO_UTIL * 0.26, _ANCHO_UTIL * 0.57, _ANCHO_UTIL * 0.17],
+                  repeatRows=1)
+    tabla.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), HEAD_BG),
+        ("GRID", (0, 0), (-1, -1), 0.4, LINE),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        *estilos_fila,
+    ]))
+    return tabla
+
+
+def _tabla_poses_evidencia(evidencia: list[Any], est: dict[str, ParagraphStyle]) -> Table:
+    """
+    Una fila por pose: afinidad, veredicto físico, selector y papel.
+
+    Los papeles se imprimen JUNTOS y no se colapsan en una etiqueta: la top-1 de
+    Vina puede ser además una alternativa válida, y la pose sugerida puede ser
+    la que falla. Colapsarlos escondería justo la combinación que hay que ver.
+    """
+    filas = [[
+        Paragraph(f"<b>{translate_text('Pose')}</b>", est["celda"]),
+        Paragraph(f"<b>{translate_text('Afinidad Vina (kcal/mol)')}</b>", est["celda"]),
+        Paragraph(f"<b>{translate_text('Controles físicos')}</b>", est["celda"]),
+        Paragraph(f"<b>{translate_text('Selector')}</b>", est["celda"]),
+        Paragraph(f"<b>{translate_text('Papel')}</b>", est["celda"]),
+        Paragraph(f"<b>{translate_text('Controles que fallan')}</b>", est["celda"]),
+    ]]
+    for pose in evidencia:
+        papeles = []
+        if pose.es_vina_top1:
+            papeles.append("Vina top-1")
+        if pose.es_sugerida:
+            papeles.append(translate_text("Sugerida"))
+        if pose.es_alternativa:
+            papeles.append(translate_text("Alternativa válida"))
+        filas.append([
+            Paragraph(f"#{pose.rango}" if pose.rango is not None else "—", est["celda"]),
+            Paragraph(f"{pose.afinidad_kcal_mol:.2f}" if pose.afinidad_kcal_mol is not None
+                      else translate_text(ETIQUETA[Estado.NO_DISPONIBLE]), est["celda"]),
+            Paragraph(translate_text(ETIQUETA[pose.estado_fisico]), est["celda"]),
+            Paragraph(f"{pose.puntuacion_selector:.4f}" if pose.puntuacion_selector is not None
+                      else "—", est["celda"]),
+            Paragraph(_escapar(" · ".join(papeles)) if papeles else "—", est["celda"]),
+            Paragraph(_romper_largo(_escapar(", ".join(pose.checks_que_fallan)))
+                      if pose.checks_que_fallan else "—", est["celda"]),
+        ])
+    tabla = Table(filas, colWidths=[_ANCHO_UTIL * 0.08, _ANCHO_UTIL * 0.17,
+                                    _ANCHO_UTIL * 0.19, _ANCHO_UTIL * 0.11,
+                                    _ANCHO_UTIL * 0.20, _ANCHO_UTIL * 0.25],
+                  repeatRows=1)
+    tabla.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), HEAD_BG),
+        ("GRID", (0, 0), (-1, -1), 0.4, LINE),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    return tabla
+
+
+#: Espacio que tiene que quedar en la página para abrir una sección en ella: el título y las primeras filas de su tabla.
+_ESPACIO_PARA_ABRIR_SECCION = 4.2 * cm
+
+
+def _seccion(titulo: str, est: dict[str, ParagraphStyle], *cuerpo: Any) -> list[Any]:
+    """
+    Encabezado seguido de su cuerpo, sin dejar el título solo al pie de una página.
+
+    La versión anterior metía el título y el PRIMER bloque en un `KeepTogether`. Eso evitaba el título huérfano, pero una tabla
+    de campos de media página que no cabía en lo que quedaba saltaba entera a la hoja siguiente y dejaba un hueco del 44 al
+    71 % de la página en 13 de 14 dossiers medidos (B5). Con `CondPageBreak` la sección se abre en la página actual si caben
+    el título y las primeras filas; si no, se abre en la siguiente. La tabla se parte entre filas (`repeatRows`, `splitInRow`).
+    """
+    return [CondPageBreak(_ESPACIO_PARA_ABRIR_SECCION), Paragraph(translate_text(titulo), est["seccion"]), *cuerpo]
+
+
+#: Valores de sistema que el caso guarda como códigos, con el nombre que les da la interfaz (`CASE_STUDY_KIND_LABELS` y
+#: `RUN_EXECUTION_STATES` de `frontend/lib/cases/types.ts`). El PDF imprimía «prepare-evidence», «completed» y «docking_vina»
+#: tal cual en 14 de 14 corridas de la cápsula (N2). Sólo cambia lo que se IMPRIME: el modelo y el paquete conservan el código,
+#: que es lo que lee una máquina. Un valor que no esté en la tabla se imprime como llegó, nunca se omite ni se adivina.
+_ROTULOS_DE_SISTEMA: dict[str, dict[str, str]] = {
+    "Tipo de estudio": {
+        "explore-hypothesis": "Explorar una hipótesis",
+        "compare-series": "Comparar una serie",
+        "review-pose": "Revisar una pose",
+        "prepare-evidence": "Preparar evidencia para un cálculo posterior",
+    },
+    "Estado de ejecución (técnico)": {
+        "idle": "Sin ejecutar",
+        "submitted": "Enviada",
+        "running": "En curso",
+        "interrupted": "Seguimiento perdido: no se sabe cómo terminó",
+        "completed": "Completada",
+        "failed": "Fallida",
+        "cancelled": "Cancelada",
+    },
+    "Política de heteroátomos declarada": {
+        "docking_vina": "Docking con AutoDock Vina",
+    },
+}
+
+
+def _con_rotulos_de_sistema(dossier: CaseDossier) -> CaseDossier:
+    """El dossier para imprimir: los códigos de sistema, con su nombre en el idioma del documento."""
+    idioma = current_locale()
+    etiquetas = {}
+    for es, tabla in _ROTULOS_DE_SISTEMA.items():
+        etiquetas[es] = tabla
+        etiquetas[traducir(es, "en")] = tabla  # el modelo puede llegar ya traducido
+
+    def campo(c: Campo) -> Campo:
+        tabla = etiquetas.get(c.etiqueta)
+        if not tabla or not c.valor or c.valor not in tabla:
+            return c
+        return replace(c, valor=traducir(tabla[c.valor], idioma))
+
+    return replace(
+        dossier,
+        proposito=[campo(c) for c in dossier.proposito],
+        ejecucion={k: campo(c) if isinstance(c, Campo) else c for k, c in dossier.ejecucion.items()},
+        preparacion=[campo(c) for c in dossier.preparacion],
+    )
+
+
+def render_dossier_pdf(dossier: CaseDossier) -> io.BytesIO:
+    """Convierte el modelo canónico en PDF. Sin red, sin cálculo, sin estado."""
+    dossier = _con_rotulos_de_sistema(traducir_dossier(dossier, current_locale()))
+    est = _estilos()
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=1.8 * cm, rightMargin=1.8 * cm,
+        topMargin=1.5 * cm, bottomMargin=1.6 * cm,
+        title=f"Dossier · {dossier.case_name}",
+        author="MolDesign",
+        subject=translate_text("Dossier de evidencia computacional"),
+        # DETERMINISMO. Sin `invariant`, reportlab escribe `/CreationDate` con la
+        # hora real y un `/ID` aleatorio en el tráiler, así que dos PDF del mismo
+        # caso difieren byte a byte. Eso propagaba la diferencia al hash del
+        # manifiesto y hacía que el paquete NO fuera reproducible — el
+        # verificador no podría distinguir un cambio real de dos exportaciones.
+        # La fecha del documento vive en el modelo (`generated_at`), no en los
+        # metadatos del PDF.
+        invariant=1,
+    )
+    flujo: list[Any] = []
+
+    # ── 1. Portada ───────────────────────────────────────────────────
+    flujo.append(Paragraph(translate_text("DOSSIER DE EVIDENCIA COMPUTACIONAL"), est["titulo"]))
+    flujo.append(Paragraph(
+        translate_text("Este documento describe qué evidencia produjo una corrida, qué partes son "
+        "reproducibles y qué quedó sin evaluar. No califica la molécula ni afirma que sea "
+        "un fármaco, un candidato clínico ni un compuesto seguro."),
+        est["subtitulo"],
+    ))
+    flujo.append(_tabla_campos(dossier.portada, est))
+
+    if dossier.avisos_integridad:
+        flujo.append(Spacer(1, 6))
+        for aviso in dossier.avisos_integridad:
+            flujo.append(Paragraph(
+                translate_text(f"<b>Aviso de integridad:</b> {_escapar(aviso)}"), est["cuerpo"]))
+
+    # ── 2. Pregunta y propósito ──────────────────────────────────────
+    flujo.extend(_seccion("1. Pregunta y propósito del caso", est,
+                          _tabla_campos(dossier.proposito, est)))
+
+    # ── 3. Resumen de lo ejecutado ───────────────────────────────────
+    flujo.extend(_seccion(
+        "2. Resumen de lo ejecutado", est,
+        _tabla_campos(
+            [dossier.ejecucion["tecnico"], dossier.ejecucion["cientifico"], dossier.ejecucion["humano"]],
+            est,
+        ),
+        Paragraph(
+            translate_text("El estado técnico, la disposición científica y la revisión humana son tres cosas "
+            "distintas. Que un proceso termine no valida su resultado, y que no haya alertas no "
+            "significa que alguien lo haya revisado."),
+            est["nota"],
+        ),
+    ))
+
+    # ── 4. Entradas y procedencia ────────────────────────────────────
+    flujo.extend(_seccion("3. Entradas y procedencia", est,
+                          _tabla_campos(dossier.entradas, est)))
+
+    hashes = [
+        Campo(translate_text("Hash del ligando (SMILES)"), dossier.procedencia.get("ligando_smiles_sha256"),
+              Estado.REGISTRADO if dossier.procedencia.get("ligando_smiles_sha256") else Estado.NO_DISPONIBLE,
+              None if dossier.procedencia.get("ligando_smiles_sha256") else translate_text("La corrida no selló el ligando.")),
+        Campo(translate_text("Referencia del receptor"), dossier.procedencia.get("receptor_referencia"),
+              Estado.REGISTRADO if dossier.procedencia.get("receptor_referencia") else Estado.NO_DISPONIBLE,
+              None if dossier.procedencia.get("receptor_referencia") else translate_text("Sin referencia de receptor.")),
+        Campo(translate_text("Hash de la configuración"), dossier.procedencia.get("configuracion_sha256"),
+              Estado.REGISTRADO if dossier.procedencia.get("configuracion_sha256") else Estado.NO_DISPONIBLE,
+              None if dossier.procedencia.get("configuracion_sha256") else translate_text("Sin configuración sellada.")),
+        Campo(translate_text("Hash de las poses"), dossier.procedencia.get("poses_sha256"),
+              Estado.REGISTRADO if dossier.procedencia.get("poses_sha256") else Estado.NO_DISPONIBLE,
+              None if dossier.procedencia.get("poses_sha256") else
+              translate_text("La corrida no serializó bloques de pose que sellar.")),
+    ]
+    # La tabla de hashes es corta: se mantiene entera. Sin esto, su cabecera
+    # quedaba sola al pie de la página 1 y las filas empezaban en la 2.
+    flujo.append(KeepTogether([Spacer(1, 6), _tabla_campos(hashes, est)]))
+
+    # ── 5. Preparación y supuestos ───────────────────────────────────
+    flujo.extend(_seccion("4. Preparación del sistema y supuestos", est,
+                          _tabla_campos(dossier.preparacion, est)))
+
+    if dossier.decisiones:
+        filas = [[
+            Paragraph(f"<b>{translate_text('Control')}</b>", est["celda"]),
+            Paragraph(f"<b>{translate_text('Decisión')}</b>", est["celda"]),
+            Paragraph(f"<b>{translate_text('Aplica a los inputs actuales')}</b>", est["celda"]),
+        ]]
+        for decision in dossier.decisiones:
+            nota = f"<br/><font size='7' color='#64748b'>{_escapar(decision.get('nota'))}</font>" if decision.get("nota") else ""
+            filas.append([
+                Paragraph(_escapar(decision["control"]), est["celda"]),
+                Paragraph(f"{_escapar(translate_text(decision['decision']))} · {_escapar(decision.get('fecha'))}{nota}", est["celda"]),
+                Paragraph(translate_text("Sí" if decision.get("aplica_a_los_inputs_actuales") else "No"), est["celda_nota"]),
+            ])
+        tabla_dec = Table(filas, colWidths=[_ANCHO_UTIL * 0.3, _ANCHO_UTIL * 0.5, _ANCHO_UTIL * 0.2],
+                          repeatRows=1)
+        tabla_dec.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), HEAD_BG),
+            ("GRID", (0, 0), (-1, -1), 0.4, LINE),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        flujo.append(Spacer(1, 6))
+        flujo.append(Paragraph(translate_text("Decisiones humanas registradas"), est["cuerpo"]))
+        flujo.append(tabla_dec)
+    else:
+        flujo.append(Spacer(1, 4))
+        flujo.append(Paragraph(
+            translate_text("<b>Decisiones humanas:</b> NO EVALUADO — nadie ha revisado ni reconocido controles "
+            "de esta corrida."), est["cuerpo"]))
+
+    # ── 6. Protocolo y entorno ───────────────────────────────────────
+    flujo.extend(_seccion("5. Protocolo y entorno de ejecución", est,
+                          _tabla_campos(dossier.protocolo, est)))
+
+    # ── 7. Evidencia estructural ─────────────────────────────────────
+    if dossier.poses:
+        filas = [[
+            Paragraph(f"<b>{translate_text('Rango')}</b>", est["celda"]),
+            Paragraph(f"<b>{translate_text('Afinidad (kcal/mol)')}</b>", est["celda"]),
+            Paragraph(f"<b>{translate_text('RMSD l.b.')}</b>", est["celda"]),
+            Paragraph(f"<b>{translate_text('RMSD u.b.')}</b>", est["celda"]),
+        ]]
+        for pose in dossier.poses:
+            filas.append([
+                Paragraph(str(pose.rango), est["celda"]),
+                Paragraph(f"{pose.afinidad_kcal_mol:.2f}" if pose.afinidad_kcal_mol is not None
+                          else translate_text(ETIQUETA[Estado.NO_DISPONIBLE]), est["celda"]),
+                Paragraph(f"{pose.rmsd_lb:.2f}" if isinstance(pose.rmsd_lb, (int, float)) else "—", est["celda"]),
+                Paragraph(f"{pose.rmsd_ub:.2f}" if isinstance(pose.rmsd_ub, (int, float)) else "—", est["celda"]),
+            ])
+        tabla_poses = Table(filas, colWidths=[_ANCHO_UTIL * 0.14, _ANCHO_UTIL * 0.34,
+                                              _ANCHO_UTIL * 0.26, _ANCHO_UTIL * 0.26],
+                            repeatRows=1)
+        tabla_poses.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), HEAD_BG),
+            ("GRID", (0, 0), (-1, -1), 0.4, LINE),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]))
+        cuerpo_poses: list[Any] = [tabla_poses, Paragraph(
+            translate_text("Las afinidades son señales de ranking dentro de este protocolo, no mediciones de "
+            "energía libre. La pose de mejor energía no es, por serlo, la pose correcta: sin un "
+            "control geométrico superado no hay evidencia estructural."),
+            est["nota"],
+        )]
+    else:
+        cuerpo_poses = [Paragraph(
+            f"<b>{translate_text(ETIQUETA[dossier.poses_estado])}</b> — {_escapar(dossier.poses_razon)}",
+            est["cuerpo"])]
+    flujo.extend(_seccion("6. Evidencia estructural y acoplamiento", est, *cuerpo_poses))
+
+    # ── 7. Generación de poses ───────────────────────────────────────
+    flujo.extend(_seccion(
+        "7. Generación de poses", est,
+        _tabla_campos(dossier.generacion, est),
+        Paragraph(
+            translate_text("Los parámetros que la corrida no persistió aparecen como NO EVALUADO con su razón. "
+            "No se sustituyen por los de la configuración del caso: describirían un ajuste que "
+            "nadie guardó con este resultado."),
+            est["nota"]),
+    ))
+
+    # ── 8. Selección de pose ─────────────────────────────────────────
+    flujo.extend(_seccion(
+        "8. Selección de pose", est,
+        _tabla_campos(dossier.seleccion, est),
+        Paragraph(
+            translate_text("El selector RECOMIENDA; no sustituye. La pose principal del producto sigue siendo "
+            "la top-1 de Vina, que se conserva y se declara siempre. Cuando el selector se "
+            "abstiene, falta o falla, la referencia es Vina top-1 en calidad de FALLBACK — no "
+            "como un acierto del selector. El margen de confianza es la distancia entre la "
+            "primera y la segunda pose según el modelo: no es una probabilidad ni una nota."),
+            est["nota"]),
+    ))
+
+    # ── 9. Validación geométrica y física ────────────────────────────
+    cuerpo_val: list[Any] = [_tabla_campos(dossier.validacion, est)]
+    if dossier.evidencia_poses:
+        cuerpo_val.append(Spacer(1, 0.25 * cm))
+        # El subtítulo no puede quedar solo al pie de la página con su tabla en la siguiente (B4).
+        cuerpo_val.append(CondPageBreak(_ESPACIO_PARA_ABRIR_SECCION))
+        cuerpo_val.append(Paragraph(f"<b>{translate_text('Veredicto por pose')}</b>", est["cuerpo"]))
+        cuerpo_val.append(_tabla_poses_evidencia(dossier.evidencia_poses, est))
+    else:
+        cuerpo_val.append(Paragraph(
+            translate_text(f"<b>{translate_text(ETIQUETA[Estado.NO_EVALUADO])}</b> — Esta corrida no registró veredicto físico "
+            f"por pose."), est["cuerpo"]))
+    cuerpo_val.append(Paragraph(
+        translate_text("Sólo un CONTROL SUPERADO explícito autoriza llamar válida a una pose. REVISIÓN "
+        "describe una batería que no corrió entera, y NO EVALUADO un validador que no corrió: "
+        "las dos describen lo que le pasó a la comprobación, nunca a la molécula, y ninguna de "
+        "las dos es evidencia negativa sobre el compuesto."),
+        est["nota"]))
+    flujo.extend(_seccion("9. Validación geométrica y física", est, *cuerpo_val))
+
+    # ── 8. Controles físicos ─────────────────────────────────────────
+    flujo.extend(_seccion("10. Controles físicos y geométricos", est,
+                          _tabla_controles(dossier.controles, est),
+                          Paragraph(
+                              translate_text("La ausencia de alertas no equivale a validez: un control que no se "
+                              "ejecutó aparece como NO EVALUADO y no autoriza ninguna conclusión."),
+                              est["nota"])))
+
+    # ── 9. Evidencia por dimensión ───────────────────────────────────
+    # Deja que Platypus use el espacio restante. El salto forzado producía una
+    # página casi vacía cuando los controles físicos eran breves.
+    flujo.extend(_seccion("11. Evidencia por dimensión", est,
+                          _tabla_controles(dossier.dimensiones, est)))
+
+    # ── 10. Supuestos e incertidumbres ───────────────────────────────
+    cuerpo_sup: list[Any] = []
+    for texto in dossier.supuestos:
+        cuerpo_sup.append(Paragraph(f"• {_escapar(texto)}", est["cuerpo"]))
+    if not cuerpo_sup:
+        cuerpo_sup.append(Paragraph(translate_text(ETIQUETA[Estado.NO_DEFINIDO]), est["cuerpo"]))
+    flujo.extend(_seccion("12. Supuestos declarados", est, *cuerpo_sup))
+
+    cuerpo_inc: list[Any] = []
+    for texto in dossier.incertidumbres:
+        cuerpo_inc.append(Paragraph(f"• {_escapar(texto)}", est["cuerpo"]))
+    if not cuerpo_inc:
+        cuerpo_inc.append(Paragraph(
+            translate_text("No se registraron incertidumbres adicionales. Esto no significa que no existan."),
+            est["cuerpo"]))
+    flujo.extend(_seccion("13. Incertidumbres y limitaciones", est, *cuerpo_inc))
+
+    # ── 11. Siguiente acción ─────────────────────────────────────────
+    accion = dossier.siguiente_accion
+    flujo.extend(_seccion(
+        "14. Interpretación justificable y próximos pasos", est,
+        Paragraph(f"<b>{_escapar(accion.texto)}</b>", est["cuerpo"]),
+        Paragraph(_escapar(accion.razon or ""), est["cuerpo"]),
+        Paragraph(
+            translate_text("Ninguna acción de esta lista afirma que el compuesto sea un fármaco, un candidato "
+            "clínico ni un compuesto seguro. Describen qué trabajo computacional queda "
+            "justificado por la evidencia de esta corrida."),
+            est["nota"]),
+    ))
+
+    # ── 12. Procedencia y manifiesto ─────────────────────────────────
+    faltantes = dossier.procedencia.get("campos_ausentes") or []
+    flujo.extend(_seccion(
+        "15. Procedencia e instrucciones de verificación", est,
+        Paragraph(
+            translate_text("El paquete reproducible que acompaña a este dossier lleva un `manifest.json` con "
+            "rol, tamaño y SHA-256 de cada archivo, y un `checksums.sha256` ordenado que permite "
+            "detectar archivos ausentes, modificados o añadidos."),
+            est["cuerpo"]),
+        Paragraph(
+            translate_text(f"Campos de procedencia sin sellar en esta corrida: "
+            f"{_escapar(', '.join(translate_text(_NOMBRE_DE_CAMPO_DE_PROCEDENCIA.get(f, f)) for f in faltantes)) if faltantes else 'ninguno'}."),
+            est["cuerpo"]),
+        Paragraph(
+            translate_text("<b>Cómo verificar el paquete, sin ejecutar nada:</b> (1) abrir el ZIP y leer "
+            "`manifest.json`, que declara rol, tamaño y SHA-256 de cada archivo, incluidos los "
+            "ausentes con su razón; (2) recalcular el SHA-256 de cada archivo y compararlo con "
+            "`checksums.sha256`; (3) comprobar que no sobra ni falta ningún archivo respecto al "
+            "manifiesto. El propio ZIP, `checksums.sha256` y la entrada de `manifest.json` "
+            "dentro de `files` quedan fuera por construcción —un archivo no puede contener su "
+            "propio hash—, y el README del paquete lo declara."),
+            est["cuerpo"]),
+        Paragraph(
+            translate_text("Un checksum correcto demuestra INTEGRIDAD: que los archivos coinciden con el "
+            "manifiesto y los checksums que trae el propio paquete; que no cambiaron desde la "
+            "exportación sólo se comprueba contra una huella guardada aparte. No demuestra que "
+            "el método sea adecuado, que la preparación "
+            "fuera correcta ni que la conclusión sea cierta. Integridad no es validez "
+            "científica, y este dossier no las presenta como lo mismo."),
+            est["nota"]),
+        Paragraph(_escapar(dossier.procedencia.get("nota", "")), est["nota"]),
+    ))
+
+    # ── 13. Glosario de estados ──────────────────────────────────────
+    filas_glos = [[Paragraph(f"<b>{translate_text('Estado')}</b>", est["celda"]), Paragraph(f"<b>{translate_text('Significado')}</b>", est["celda"])]]
+    for estado in Estado:
+        filas_glos.append([
+            Paragraph(translate_text(ETIQUETA[estado]), est["celda"]),
+            Paragraph(_escapar(translate_text(GLOSARIO[estado])), est["celda"]),
+        ])
+    tabla_glos = Table(filas_glos, colWidths=[_ANCHO_UTIL * 0.25, _ANCHO_UTIL * 0.75],
+                       repeatRows=1)
+    tabla_glos.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), HEAD_BG),
+        ("GRID", (0, 0), (-1, -1), 0.4, LINE),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    flujo.extend(_seccion("16. Glosario de estados", est, tabla_glos))
+
+    # ── 14. Apéndice heredado ────────────────────────────────────────
+    cuerpo_ap: list[Any] = [Paragraph(
+        translate_text("Los índices siguientes los calcula el pipeline por compatibilidad con lecturas "
+        "anteriores. <b>No son decisionales.</b> No son probabilidad, ni confianza, ni calidad, "
+        "y no deben usarse para comparar moléculas ni para priorizar trabajo experimental."),
+        est["cuerpo"])]
+    if dossier.apendice_heredado:
+        cuerpo_ap.append(_tabla_campos(dossier.apendice_heredado, est))
+    else:
+        cuerpo_ap.append(Paragraph(
+            translate_text("Esta corrida no serializó ningún índice heredado."), est["cuerpo"]))
+    flujo.extend(_seccion("Apéndice A. Resultados heredados (no decisionales)", est, *cuerpo_ap))
+
+    # El encabezado se compone al revés de lo intuitivo: el identificador de
+    # corrida es lo ÚLTIMO que puede perderse, porque es la identidad del
+    # documento. Antes se concatenaba caso + receptor + corrida y se recortaba
+    # a 110 caracteres, lo que cortaba justo el identificador («corrida task-c»).
+    # Ahora se recorta el nombre del caso y el receptor se cede entero.
+    corrida = dossier.task_id or "sin identificador"
+    espacio = 108 - len(corrida) - len(" · corrida ")
+    caso = dossier.case_name
+    if len(caso) > espacio:
+        caso = caso[: max(0, espacio - 1)].rstrip() + "…"
+    # El nombre del caso lo escribió la persona: no se traduce aunque se parezca a un nombre generado por el catálogo.
+    encabezado = f"{caso} · {translate_text('corrida')} {corrida}"
+
+    def _con_chrome(*args: Any, **kwargs: Any) -> _Chrome:
+        lienzo = _Chrome(*args, **kwargs)
+        lienzo.encabezado = encabezado
+        return lienzo
+
+    doc.build(flujo, canvasmaker=_con_chrome)
+    buf.seek(0)
+    return buf

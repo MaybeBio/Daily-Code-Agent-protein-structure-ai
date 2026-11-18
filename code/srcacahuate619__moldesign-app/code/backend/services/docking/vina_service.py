@@ -1,0 +1,1657 @@
+"""
+services/docking/vina_service.py
+
+Orquestación del docking real con AutoDock Vina.
+
+Estrategia del MVP:
+- preparar receptor con Meeko,
+- preparar ligando desde SDF con Meeko,
+- ejecutar Vina con parámetros explícitos,
+- exportar poses a SDF con Meeko,
+- parsear poses y cachear resultado.
+
+Si alguna herramienta necesaria no existe, el servicio falla explícitamente.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import importlib.metadata
+import json
+import math
+import os
+import subprocess
+import re
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from filelock import FileLock, Timeout as FileLockTimeout
+
+from chem.conformer_ensemble import es_hash_derivado
+from core.config import get_settings, directorio_de_datos
+from core.exceptions import DockingFailed, VinaExecutableNotFound
+from core.models import DockingPose, DockingResult
+from core.version import APP_VERSION
+from services.docking.pose_recovery import (
+    PoseNoRecuperable, verificar_pares_sdf_pdbqt,
+)
+from services.docking.search_policy import (
+    BOX_VOLUME_WARNING_A3, VINA_PROCESS_LIMIT, box_volume,
+    effective_exhaustiveness as resolve_exhaustiveness,
+)
+from services.docking.preparer import (
+    RECEPTOR_RECIPE_VERSION,
+    _meeko_report_path,
+    prepare_target,
+    prepared_receptor_chains,
+    resolve_effective_docking_box,
+)
+from utils.cache import cache
+from utils.file_handlers import (
+    StoragePath,
+    parse_vina_output_sdf,
+    fusionar_rmsd_desde_pdbqt,
+    extract_pdbqt_poses,
+    validate_pdbqt_content,
+)
+from utils.local_storage import (
+    exists,
+    read_bytes,
+    # `read_text` faltaba, y el censo de aguas lo llama. El `except Exception`
+    # que lo envuelve convertía el NameError en «no se pudo medir», así que el
+    # censo añadido el 2026-09-04 no funcionó una sola vez: cada corrida
+    # registraba la advertencia genérica de desolvatación en lugar del conteo.
+    read_text,
+    temp_file,
+    write_bytes,
+    write_file,
+    write_text,
+)
+from services.avisos import Severidad, aviso
+from services.chemistry.censo_de_aguas import (
+    aguas_en_la_caja,
+    censar_aguas,
+    censo_en_cache,
+    describir_aguas_conservadas,
+    describir_receptor_propio_sin_aguas,
+    describir_censo,
+    guardar_censo,
+)
+from utils.procesos import BANDERAS_SIN_VENTANA, communicate_managed
+from utils.logger import get_logger
+
+settings = get_settings()
+log = get_logger(__name__)
+
+# Con vina_cpu=0 un Vina ocupa todos los núcleos disponibles. El semáforo
+# protege las event loops de este proceso y el candado de archivo coordina
+# otros procesos MolDesign (incluido selectivity_subprocess). El límite
+# (`VINA_PROCESS_LIMIT`) se declara en `search_policy`.
+_vina_process_gate = threading.BoundedSemaphore(VINA_PROCESS_LIMIT)
+
+
+def _vina_lock_path() -> Path:
+    directory = directorio_de_datos("locks")
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / "vina-process.lock"
+
+
+@asynccontextmanager
+async def vina_process_slot():
+    acquired = False
+    file_lock = None
+    try:
+        while not acquired:
+            acquired = _vina_process_gate.acquire(blocking=False)
+            if not acquired:
+                await asyncio.sleep(0.05)
+        file_lock = FileLock(str(_vina_lock_path()))
+        while True:
+            try:
+                file_lock.acquire(timeout=0)
+                break
+            except FileLockTimeout:
+                await asyncio.sleep(0.05)
+        yield
+    finally:
+        if file_lock is not None and file_lock.is_locked:
+            file_lock.release()
+        if acquired:
+            _vina_process_gate.release()
+
+
+def _source_commit() -> str | None:
+    """Commit de desarrollo si hay Git; en bundle sólo se declara con env."""
+    declared = os.environ.get("MOLDESIGN_BUILD_COMMIT")
+    if declared and re.fullmatch(r"[0-9a-fA-F]{40}", declared):
+        return declared.lower()
+    repo = Path(__file__).resolve().parents[3]
+    if not (repo / ".git").exists():
+        return None
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=normal"], cwd=repo,
+            capture_output=True, text=True, timeout=3, creationflags=flags,
+        )
+        # HEAD de un árbol modificado no identifica los bytes que se ejecutan.
+        if dirty.returncode != 0 or dirty.stdout.strip():
+            return None
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,
+            text=True, timeout=2, creationflags=flags,
+        )
+        value = result.stdout.strip()
+        return value.lower() if result.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40}", value) else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+async def _sha256_del_objeto(object_name: str) -> str | None:
+    """SHA-256 de un objeto del almacén, o None si no se puede leer.
+
+    Devuelve None en vez de lanzar porque la ausencia es un estado legítimo en
+    varias rutas -conformero todavía no escrito, caché heredada-. Lo que NO es
+    legítimo es sustituir el dato ausente por otro: quien recibe None tiene que
+    declararlo, no rellenarlo.
+    """
+    try:
+        return hashlib.sha256(await read_bytes(object_name)).hexdigest()
+    except Exception:                                              # noqa: BLE001
+        return None
+
+
+async def _huella_del_conformero(smiles_hash: str) -> str | None:
+    """Identidad de la geometría de entrada de ese hash, si está en disco."""
+    return await _sha256_del_objeto(StoragePath.ligand_conformer(smiles_hash))
+
+
+async def _pdbqt_declara_su_origen(
+    smiles_hash: str,
+    conformer_path: str,
+    conformer_sha256: str | None,
+) -> bool:
+    """¿Se puede demostrar que ese `.pdbqt` salió de ESTE conformero?
+
+    Exige las tres cosas: registro presente, geometría de origen idéntica y
+    bytes del PDBQT intactos. Un registro que no cubra el archivo actual no
+    certifica nada; uno que no cubra la geometría certifica la molécula
+    equivocada.
+    """
+    if conformer_sha256 is None:
+        return False
+    try:
+        registro = json.loads(
+            await read_text(
+                StoragePath.ligand_vina_input_provenance(smiles_hash)
+            )
+        )
+    except Exception:                                              # noqa: BLE001
+        return False
+    if not isinstance(registro, dict):
+        return False
+    if registro.get("conformer_object") != conformer_path:
+        return False
+    if registro.get("conformer_sha256") != conformer_sha256:
+        return False
+    # Un PDBQT preparado por otro protocolo no es el PDBQT de este protocolo,
+    # aunque viva en la misma ruta. `quantum_ad4_service` escribe ese mismo
+    # objeto con cargas GFN2-xTB en lugar de las de Meeko: hoy no tiene llamante
+    # vivo, y si lo recupera no debe heredar esta caché sin decirlo.
+    if registro.get("prepared_by") != "meeko.cli.mk_prepare_ligand":
+        return False
+    return registro.get("pdbqt_sha256") == await _sha256_del_objeto(
+        StoragePath.ligand_vina_input(smiles_hash)
+    )
+
+
+def _docking_cache_fingerprint(
+    *,
+    receptor_sha256: str,
+    target_chain: str,
+    center: tuple[float, float, float],
+    size: tuple[float, float, float],
+    hotspots: list[dict] | None,
+    docking_engine: str,
+    exhaustiveness: int,
+    num_poses: int,
+    seed: int,
+    ligand_input_sha256: str | None = None,
+    trace_binary_sha256: str | None = None,
+) -> str:
+    """Identifica el protocolo real, no sólo la pareja ligando/PDB.
+
+    El caché histórico ignoraba cadena, caja, receptor preparado y parámetros
+    de Vina. Dos hipótesis distintas podían por ello compartir un resultado.
+
+    `ligand_input_sha256` cierra el mismo hueco por el lado del ligando: la
+    clave del caché es el `smiles_hash`, y en el ensemble eso identifica la
+    conformación, no la geometría. Si la geometría de una conformación cambia,
+    el resultado anterior deja de describirla. Se declara None cuando el SDF no
+    está en disco al consultar; None es «no se pudo leer», no «da igual».
+    """
+
+    document = {
+        "ligand_input_sha256": ligand_input_sha256,
+        "receptor_sha256": receptor_sha256,
+        "target_chain": target_chain,
+        "center": [round(float(value), 3) for value in center],
+        "size": [round(float(value), 3) for value in size],
+        "hotspots": sorted(
+            hotspots or [],
+            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
+        ),
+        "docking_engine": docking_engine,
+        "exhaustiveness": int(exhaustiveness),
+        "num_poses": int(num_poses),
+        "seed": int(seed),
+    }
+    if trace_binary_sha256:
+        document["trace_binary_sha256"] = trace_binary_sha256
+    encoded = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+
+def _is_valid_sdf(s: str) -> bool:
+    """Validate that a string represents a well-formed SDF block."""
+    if not s or not isinstance(s, str):
+        return False
+    lines = s.splitlines()
+    if not any("M  END" in line for line in lines):
+        return False
+    if len(lines) < 4:
+        return False
+    try:
+        atom_count = int(lines[3][0:3])
+    except Exception:
+        atom_count = 0
+    atom_lines = lines[4:4 + atom_count]
+    has_atoms = any(len(l.strip()) > 0 for l in atom_lines)
+    return has_atoms and atom_count > 0
+
+
+def _resolve_executable(path_or_name: str) -> str | None:
+    candidate = Path(path_or_name)
+    if candidate.exists():
+        return str(candidate)
+
+    found = shutil.which(path_or_name)
+    if found:
+        return found
+
+    # Fallbacks for Windows Python environments
+    search_dirs = [
+        Path(sys.executable).resolve().parent,
+        Path(sys.executable).resolve().parent / "Scripts",
+        Path(sys.prefix) / "Scripts",
+        Path.home() / "AppData" / "Roaming" / "Python" / "Python314" / "Scripts"
+    ]
+
+    for sdir in search_dirs:
+        for ext in ["", ".exe", ".py"]:
+            c = sdir / f"{path_or_name}{ext}"
+            if c.exists():
+                return str(c)
+
+    return None
+
+
+def _parse_vina_stdout(stdout: str) -> list[DockingPose]:
+    mode_table_pattern = re.compile(
+        r"^\s*(\d+)\s+([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s+([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*$"
+    )
+
+    poses: list[DockingPose] = []
+    in_mode_table = False
+
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if stripped.lower().startswith("mode |"):
+            in_mode_table = True
+            continue
+
+        if not in_mode_table:
+            continue
+
+        if stripped.startswith("-----+"):
+            continue
+
+        match = mode_table_pattern.match(stripped)
+        if not match:
+            if poses:
+                break
+            continue
+
+        rank, affinity, rmsd_lb, rmsd_ub = match.groups()
+
+        try:
+            poses.append(
+                DockingPose(
+                    rank=int(rank),
+                    affinity=float(affinity),
+                    rmsd_lb=float(rmsd_lb),
+                    rmsd_ub=float(rmsd_ub),
+                )
+            )
+        except ValueError:
+            continue
+
+    return poses
+
+
+def _parse_vina_metadata(stdout: str) -> tuple[str | None, int | None]:
+    version_match = re.search(r"AutoDock Vina\s+v([\d\.]+)", stdout)
+    seed_match = re.search(r"random seed:\s*(-?\d+)", stdout)
+
+    vina_version = version_match.group(1) if version_match else None
+    random_seed = int(seed_match.group(1)) if seed_match else None
+    return vina_version, random_seed
+
+
+def _mensaje_de_vina(stderr: str, limite: int = 400) -> str | None:
+    """La causa que escribió Vina, en una línea, para el estado de la tarea.
+
+    Vina escribe sus errores en stderr («PDBQT parsing error: … > ENDBRANCH  39
+    41», «Vina runtime error: The ligand is outside the grid box…»), a veces
+    detrás de avisos que no son la causa (`WARNING: At low exhaustiveness…`).
+    Sin stderr no hay causa que citar y se devuelve None: la última línea de
+    stdout es la cabecera de la corrida, no el motivo del fallo.
+    """
+    utiles = [linea.strip() for linea in stderr.splitlines()
+              if linea.strip() and not linea.lstrip().startswith("WARNING")]
+    if not utiles:
+        return None
+    texto = " ".join(utiles)
+    return texto if len(texto) <= limite else texto[: limite - 1] + "…"
+
+
+def _relative_error_pct(observed: float, reference: float) -> float:
+    denominator = max(abs(reference), 1e-12)
+    return abs(observed - reference) / denominator * 100.0
+
+
+# ── Open Babel: por qué aquí no hay ninguna resolución de ejecutable ─────
+#
+# Antes vivía aquí un `_obabel_del_bundle()` que buscaba el binario dentro de
+# `site-packages/openbabel/bin/` y, si no lo encontraba, devolvía la cadena
+# `"obabel"` para que el PATH la resolviera. Las dos mitades eran un problema:
+#
+#   - la primera ataba producción al ENTORNO PYTHON de Open Babel, que es
+#     justamente lo que la frontera de licencia exige separar;
+#   - la segunda ejecutaba en silencio un binario ajeno de la máquina del
+#     usuario y después atribuía el resultado a la versión declarada.
+#
+# Ahora hay un único adaptador —`services.external_tools.open_babel`— que
+# ejecuta SÓLO el programa empaquetado, verificado contra su hash, y devuelve
+# errores tipados en vez de degradarse. Ver `docs/79_ADR_FRONTERA_OPEN_BABEL.md`.
+
+#: Cuando una etapa no SABE contra que receptor corre, lo dice. Antes ponia la
+#: constante por defecto, que es afirmar algo falso en el informe de error.
+DESCONOCIDO = "(receptor no informado en esta etapa)"
+
+
+async def _prepare_ligand_pdbqt(
+    smiles_hash: str,
+    smiles: str | None = None,
+    target_pdb_id: str | None = None,
+) -> str:
+    """Prepara el PDBQT del ligando con Meeko. NO ejecuta Vina.
+
+    EL FALLO QUE ARREGLA. Los errores de esta funcion se reportaban con dos
+    datos falsos, y juntos mandaban a investigar el sitio equivocado:
+
+      1. `target_pdb_id=settings.default_target_pdb_id`. Esta funcion no
+         recibia el receptor, asi que ponia la CONSTANTE por defecto -7E2Y-.
+         Un usuario que habia elegido 1TW7 leyo «falló contra target 7E2Y» y
+         se paso el rato mirando una estructura que no intervenia.
+      2. `vina_exit_code=process.returncode`, cuando el proceso que fallo era
+         `mk_prepare_ligand` de Meeko. El mensaje decia «Vina exit code: 1»
+         sobre un fallo en el que Vina ni siquiera habia llegado a arrancar.
+
+    En una herramienta cuyo producto es la trazabilidad, un mensaje de error
+    que nombra el receptor equivocado y la etapa equivocada no es un detalle
+    cosmetico: es la misma clase de mentira de procedencia que ENG-003.
+    """
+    ligand_prepare_cmd = _resolve_executable(settings.meeko_prepare_ligand_path)
+    if not ligand_prepare_cmd:
+        raise DockingFailed(
+            molecule_id=smiles_hash,
+            target_pdb_id=target_pdb_id or DESCONOCIDO,
+            detail=(
+                "PREPARACIÓN DEL LIGANDO (Meeko), antes de ejecutar Vina: no se "
+                "encontró 'mk_prepare_ligand.py'. Instala Meeko o configura "
+                "MEEKO_PREPARE_LIGAND_PATH correctamente."
+            ),
+        )
+
+    object_name = StoragePath.ligand_vina_input(smiles_hash)
+    conformer_path = StoragePath.ligand_conformer(smiles_hash)
+    derivado = es_hash_derivado(smiles_hash)
+
+    # ── La conformación pedida es la que manda ────────────────────────
+    #
+    # EL FALLO QUE ARREGLA (ENS-05, medido el 2026-09-17). Esta búsqueda por
+    # SMILES existe para un desajuste real: el llamante pide un hash y el
+    # conformero quedó escrito bajo otro, porque el hash se recalcula después de
+    # la protonación. Pero se aplicaba SIEMPRE, incluso cuando el hash pedido
+    # tenía su propio SDF, y el ensemble le pasa hashes derivados -`<hash>__c07`-
+    # cuyo canónico es la conformación 0 y existe siempre. Resultado medido con
+    # tres conformaciones de benceno: las tres corridas de Vina recibieron la
+    # geometría de la conformación 0, y cada pose de la piscina declaraba venir
+    # de una conformación distinta. El `conformer_index` era falso y el ensemble
+    # acoplaba K veces el mismo punto de partida.
+    #
+    # Ahora el rescate sólo actúa cuando el hash pedido NO tiene geometría, y
+    # nunca para un hash derivado: para una conformación del ensemble, el único
+    # SDF que la representa es el suyo.
+    if not await exists(conformer_path) and not derivado and smiles:
+        try:
+            from chem.validator import validate_smiles_or_raise
+            v = validate_smiles_or_raise(smiles)
+            cand_path = StoragePath.ligand_conformer(v.smiles_hash)
+            if await exists(cand_path):
+                conformer_path = cand_path
+        except Exception:
+            pass
+
+    if derivado and not await exists(conformer_path):
+        # Regenerar desde el SMILES daría la conformación 0 otra vez -misma
+        # semilla, mismo ETKDG- escrita en la ruta de otra. Abstenerse es la
+        # única salida que no fabrica procedencia.
+        raise DockingFailed(
+            molecule_id=smiles_hash,
+            target_pdb_id=target_pdb_id or DESCONOCIDO,
+            detail=(
+                "PREPARACIÓN DEL LIGANDO, antes de ejecutar Vina: falta la "
+                f"geometría de la conformación del ensemble ({smiles_hash}). No "
+                "se sustituye por otra conformación ni se regenera desde el "
+                "SMILES: la pose resultante se atribuiría a un punto de partida "
+                "que no entró a Vina."
+            ),
+        )
+
+    if not await exists(conformer_path):
+        # Fallback: generate conformer on-the-fly if smiles is known or can be fetched
+        target_smiles = smiles
+        if not target_smiles:
+            try:
+                from core.database import get_db_session
+                from db.repository import Repository
+                async with get_db_session() as db:
+                    repo = Repository(db)
+                    mol = await repo.get_molecule_by_hash(smiles_hash)
+                    if mol:
+                        target_smiles = mol.smiles
+            except Exception:
+                pass
+        if target_smiles:
+            try:
+                from chem.conformer import generate_conformer
+                conf_res = await generate_conformer(target_smiles)
+                sdf_str = conf_res.get("sdf_content") if isinstance(conf_res, dict) else (conf_res if isinstance(conf_res, str) else None)
+                if sdf_str:
+                    await write_text(conformer_path, sdf_str)
+                    await write_text(StoragePath.ligand_conformer(smiles_hash), sdf_str)
+                    if isinstance(conf_res, dict) and conf_res.get("smiles_hash"):
+                        await write_text(StoragePath.ligand_conformer(conf_res["smiles_hash"]), sdf_str)
+                        conformer_path = StoragePath.ligand_conformer(conf_res["smiles_hash"])
+            except Exception as e:
+                log.warning("conformer_generation_fallback_failed", error=str(e))
+
+    # ── La caché del PDBQT vale si puede demostrar de dónde salió ─────
+    #
+    # Antes bastaba con que el archivo existiera. Eso deja el arreglo de arriba
+    # sin efecto en cualquier instalación donde ya haya un `vina_input.pdbqt`
+    # construido desde la conformación equivocada: es indistinguible de uno
+    # correcto, así que se habría devuelto igual. La única salida honesta es
+    # volver a prepararlo cuando su procedencia no se puede establecer.
+    huella_conformero = await _sha256_del_objeto(conformer_path)
+    if await exists(object_name):
+        if await _pdbqt_declara_su_origen(smiles_hash, conformer_path, huella_conformero):
+            return object_name
+        if huella_conformero is None:
+            # Sin geometría en disco no hay nada con lo que contrastar y tampoco
+            # nada mejor que ofrecer. Se reutiliza, y se dice que no se verificó.
+            log.warning(
+                "ligando_pdbqt_sin_procedencia_verificable",
+                smiles_hash=smiles_hash[:16],
+                conformer=conformer_path,
+            )
+            return object_name
+        log.info(
+            "ligando_pdbqt_se_reprepara_por_procedencia",
+            smiles_hash=smiles_hash[:16],
+            conformer=conformer_path,
+        )
+
+    async with temp_file(conformer_path, suffix=".sdf") as local_sdf:
+        Path(settings.vina_temp_dir).mkdir(parents=True, exist_ok=True)
+        # `ignore_cleanup_errors`: en Windows no se puede borrar un archivo que
+        # alguien tenga abierto, y aqui dentro corren procesos hijos -Meeko, Vina,
+        # Open Babel- mas el antivirus escaneando lo recien escrito. Sin esto, la
+        # limpieza puede levantar PermissionError DESPUES de que el trabajo haya
+        # terminado bien, y tirar una corrida completa por no poder borrar un
+        # temporal. Dejar un archivo suelto es mucho mejor que perder el resultado.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True, dir=settings.vina_temp_dir) as tmp_dir:
+            output_pdbqt = Path(tmp_dir) / f"{smiles_hash}.pdbqt"
+            # Se invoca el MODULO con el interprete del backend, nunca el .exe
+            # de Scripts/.
+            #
+            # EL FALLO QUE ARREGLA. Los lanzadores que pip genera en Windows
+            # llevan INCRUSTADA la ruta absoluta del interprete con el que se
+            # instalaron. Los tres de Meeko que viajan en el instalador dicen
+            #
+            #     D:\moldesign-build\python-embed\python.exe
+            #
+            # ...la ruta de la maquina de construccion. En cualquier otro
+            # equipo ese interprete no existe, el lanzador falla y devuelve 1,
+            # asi que TODA evaluacion moria antes de llegar a Vina. En la
+            # maquina donde se construye funciona, que es lo que lo hizo
+            # invisible hasta probarlo en una VM.
+            #
+            # `preparer.py` ya lo resolvia asi para el receptor -«usar
+            # exactamente el interprete del backend instalado por el
+            # launcher»-. Esta ruta y la del export no lo habian aprendido.
+            command = [
+                sys.executable,
+                "-m", "meeko.cli.mk_prepare_ligand",
+                "-i", str(local_sdf),
+                "-o", str(output_pdbqt),
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=BANDERAS_SIN_VENTANA,
+            )
+            stdout, stderr = await communicate_managed(process, timeout=600.0)
+
+            if process.returncode != 0:
+                salida = (stderr.decode("utf-8", errors="replace")
+                          or stdout.decode("utf-8", errors="replace"))
+                raise DockingFailed(
+                    molecule_id=smiles_hash,
+                    target_pdb_id=target_pdb_id or DESCONOCIDO,
+                    # `vina_exit_code` se deja vacio A PROPOSITO: el que fallo
+                    # fue Meeko y Vina no ha llegado a ejecutarse.
+                    detail=(
+                        f"PREPARACIÓN DEL LIGANDO (Meeko `mk_prepare_ligand`) terminó "
+                        f"con codigo {process.returncode}, antes de ejecutar Vina."
+                        + chr(10) + chr(10) + salida
+                    ),
+                )
+
+            content = output_pdbqt.read_text(encoding="utf-8", errors="replace")
+            is_valid, validation_error = validate_pdbqt_content(content)
+            if not is_valid:
+                raise DockingFailed(
+                    molecule_id=smiles_hash,
+                    target_pdb_id=target_pdb_id or DESCONOCIDO,
+                    detail=(
+                        "PREPARACIÓN DEL LIGANDO (Meeko), antes de ejecutar Vina: "
+                        f"el PDBQT resultante es inválido: {validation_error}"
+                    ),
+                )
+
+            await write_file(output_pdbqt, object_name)
+            # El registro se escribe DESPUÉS del PDBQT: si el proceso muere
+            # entre ambos, la próxima corrida encuentra un PDBQT sin
+            # procedencia y lo vuelve a preparar. Al revés, un registro sin su
+            # archivo certificaría algo que no existe.
+            await write_text(
+                StoragePath.ligand_vina_input_provenance(smiles_hash),
+                json.dumps(
+                    {
+                        "conformer_object": conformer_path,
+                        "conformer_sha256": huella_conformero,
+                        # Los bytes guardados, no el texto releído con
+                        # `errors="replace"`: un byte no decodificable haría que
+                        # el registro no correspondiera al archivo.
+                        "pdbqt_sha256": hashlib.sha256(
+                            output_pdbqt.read_bytes()
+                        ).hexdigest(),
+                        "prepared_by": "meeko.cli.mk_prepare_ligand",
+                    },
+                    sort_keys=True,
+                ),
+            )
+
+    return object_name
+
+
+async def _run_vina_subprocess(
+    receptor_path: Path,
+    ligand_path: Path,
+    output_path: Path,
+    log_path: Path,
+    target_pdb_id: str,
+    center: tuple[float, float, float],
+    size: tuple[float, float, float],
+    molecule_id: str = "unknown",
+    exhaustiveness: int | None = None,
+    docking_engine: str = "vina",
+    num_poses: int | None = None,
+    seed: int | None = None,
+) -> str:
+    # ── Select executable based on docking engine ──
+    if docking_engine == "qvina2":
+        vina_executable = _resolve_executable(settings.qvina2_executable_path)
+        if not vina_executable:
+            log.warning({
+                "event": "qvina2_not_found",
+                "path": settings.qvina2_executable_path,
+                "message": "QuickVina 2 binary not found, falling back to Vina (lower exhaustiveness=4)",
+            })
+            vina_executable = _resolve_executable(settings.vina_executable_path)
+    else:
+        vina_executable = _resolve_executable(settings.vina_executable_path)
+
+    if not vina_executable:
+        raise VinaExecutableNotFound(
+            settings.qvina2_executable_path if docking_engine == "qvina2" else settings.vina_executable_path
+        )
+
+    exh = exhaustiveness if exhaustiveness is not None else settings.vina_exhaustiveness
+    from services.docking import search_trace
+    vina_executable, trace_identity = search_trace.instrumented(vina_executable)
+    environment = dict(os.environ)
+    environment.pop("VINA_TRACE_PREFIX", None)
+    if trace_identity:
+        environment["VINA_TRACE_PREFIX"] = str(output_path.parent / "search")
+    modes = num_poses if num_poses is not None else settings.vina_num_poses
+    sd = seed if seed is not None else settings.vina_seed
+
+    command = [
+        vina_executable,
+        "--receptor", str(receptor_path),
+        "--ligand", str(ligand_path),
+        "--center_x", str(center[0]),
+        "--center_y", str(center[1]),
+        "--center_z", str(center[2]),
+        "--size_x", str(size[0]),
+        "--size_y", str(size[1]),
+        "--size_z", str(size[2]),
+        "--exhaustiveness", str(exh),
+        "--num_modes", str(modes),
+        "--cpu", str(settings.vina_cpu),
+        "--seed", str(sd),
+        "--out", str(output_path),
+    ]
+
+    async with vina_process_slot():
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            creationflags=BANDERAS_SIN_VENTANA,
+            env=environment,
+        )
+        arranque = time.monotonic()
+        try:
+            # Timeout de 10 minutos para soportar ex=32 en GPCRs
+            stdout_bytes, stderr_bytes = await communicate_managed(process, timeout=600.0)
+        except asyncio.TimeoutError:
+            raise DockingFailed(
+                molecule_id=molecule_id,
+                target_pdb_id=target_pdb_id,
+                detail="AutoDock Vina excedió el timeout de 600 segundos. "
+                       "La molécula puede ser demasiado grande o compleja para este setup.",
+            )
+
+    stdout = stdout_bytes.decode("utf-8", errors="replace")
+    stderr = stderr_bytes.decode("utf-8", errors="replace")
+
+    # El log viaja en el paquete de la corrida: con la ruta absoluta de cada archivo llevaba la carpeta del usuario
+    # (`C:\Users\<nombre>\…`) a quien lo recibía. Basta el nombre; su hash se calcula después sobre estos bytes.
+    rutas = (receptor_path, ligand_path, output_path, log_path)
+    log_content = (
+        f"# target={target_pdb_id}\n"
+        f"# receptor={Path(receptor_path).name}\n"
+        f"# ligand={Path(ligand_path).name}\n"
+        f"# exhaustiveness={exh}\n"
+        f"# num_modes={modes}\n# seed={sd}\n\n"
+        f"STDOUT:\n{_sin_rutas_locales(stdout, rutas)}\n\nSTDERR:\n{_sin_rutas_locales(stderr, rutas)}\n"
+    )
+    log_path.write_text(log_content, encoding="utf-8")
+
+    if process.returncode != 0:
+        raise DockingFailed(
+            # El hash de la molécula, no `ligand_path.stem`: ese es el nombre del
+            # temporal (`tmpre11suvw`), que no identifica nada y ya no existe.
+            molecule_id=molecule_id,
+            target_pdb_id=target_pdb_id,
+            vina_exit_code=process.returncode,
+            detail=stderr or stdout,
+            vina_message=_mensaje_de_vina(stderr),
+        )
+
+    # Lo que de verdad tardó, en ESTA máquina. Es lo que convierte la estimación
+    # que se le ensena al usuario antes de pulsar «Evaluar» en una medida en vez
+    # de una tabla. Sólo cuentan los acoplamientos que terminaron bien: uno que
+    # falló a los dos segundos no dice cuánto cuesta uno que funciona.
+    #
+    # Va en un `try` amplio a proposito, y es el unico sitio de este archivo
+    # donde eso es correcto: calibrar es accesorio, y perder una estimacion
+    # nunca puede costar una corrida que el motor ya completo.
+    try:
+        from services.estimacion import registrar_docking
+
+        registrar_docking(
+            segundos=time.monotonic() - arranque,
+            cpu=cpu_efectivo_de_vina(),
+            exhaustiveness=exh,
+            volumen_caja=float(size[0]) * float(size[1]) * float(size[2]),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    return stdout
+
+
+def _sin_rutas_locales(texto: str, rutas: tuple[Path | str, ...]) -> str:
+    """Cambia cada ruta absoluta que Vina repite («Rigid receptor: C:\\Users\\…») por el nombre de su archivo.
+
+    Vina escribe las rutas tal como se le pasaron, así que basta reemplazarlas exactas, con las dos barras.
+    El nombre se saca a mano: `Path` sólo parte por la barra de su plataforma, y fuera de Windows no separaba
+    `C:\\Users\\…` y dejaba la ruta entera en el log.
+    """
+    for ruta in rutas:
+        completa = str(ruta)
+        nombre = completa.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        for forma in {completa, completa.replace("\\", "/")}:
+            if forma and forma != nombre:
+                texto = texto.replace(forma, nombre)
+    return texto
+
+
+def cpu_efectivo_de_vina() -> int:
+    """Los núcleos con los que corre Vina de verdad.
+
+    `vina_cpu = 0` (el valor por defecto) es «autodetectar»: Vina usa todos los
+    núcleos lógicos. Registrar la observación con `cpu=0` la hacía descartar
+    (`registrar_docking` ignora `cpu <= 0`), así que con la configuración por
+    defecto la estimación no se calibraba nunca (QA-013, 2026-09-27). La regla es
+    la misma que usa `/evaluation/estimate` para estimar.
+    """
+    configurado = int(settings.vina_cpu or 0)
+    if configurado > 0:
+        return configurado
+    # Sólo los núcleos: `detect_hardware()` importaba torch y openmm aquí, en el bucle de eventos, y congelaba el
+    # backend en la primera evaluación (2026-10-10).
+    from core.hardware import nucleos_logicos
+
+    return nucleos_logicos()
+
+
+def _check_ligand_fits_box(
+    ligand_pdbqt: Path,
+    box_size: tuple[float, float, float],
+    target_pdb_id: str,
+    margin: float = 4.0,
+) -> str | None:
+    """Verifica que el ligando quepa en la caja de docking con margen de solvatacion.
+
+    DOCK-012: se compara el DIÁMETRO del ligando (máxima distancia entre dos
+    átomos), que no depende de cómo orientó ETKDG el confórmero de entrada. La
+    extensión por ejes sí dependía: el mismo ligando disparaba o no el aviso
+    según la semilla. Retorna un warning string si no cabe, None si está OK.
+    """
+    try:
+        coords = []
+        with open(ligand_pdbqt) as f:
+            for line in f:
+                if line.startswith(("ATOM", "HETATM")):
+                    coords.append(tuple(float(line[i:i + 8]) for i in (30, 38, 46)))
+    except (OSError, ValueError) as exc:
+        log.warning("ligand_box_check_unreadable", path=str(ligand_pdbqt), error=str(exc))
+        return None
+    if len(coords) < 2:
+        return None
+    diametro = max(math.dist(a, b) for i, a in enumerate(coords) for b in coords[i + 1:])
+    lado_menor = min(float(v) for v in box_size)
+    if diametro + margin > lado_menor:
+        return (
+            f"El diámetro del ligando ({diametro:.1f} Å) más {margin:.1f} Å de margen "
+            f"supera el lado menor de la caja ({lado_menor:.1f} Å). "
+            "Vina puede rotar el ligando, pero no hay una orientación que garantice que "
+            "quepa entero: revise si las poses tocan el borde."
+        )
+    return None
+
+
+def modo_del_receptor_congelado(target_pdb_id: str | None) -> str | None:
+    """El modo de preparación de un receptor propio cuando la corrida lo trae congelado (Batch) y no hay informe.
+
+    Sin él, el supuesto de aguas del dossier de cohorte decía «se eliminaron todas las aguas» de un receptor que las
+    conservaba (camino B) o que llegó ya en PDBQT (camino C). El perfil de un receptor propio no cambia: es el mismo
+    con el que se congelaron sus bytes. El catálogo no tiene perfil y devuelve None.
+    """
+    from services.targets import perfil_receptor
+
+    if not target_pdb_id or not perfil_receptor.es_propio(target_pdb_id):
+        return None
+    modo = perfil_receptor.modo_de(target_pdb_id)
+    return modo if modo in (perfil_receptor.MODO_RESPETAR, perfil_receptor.MODO_PDBQT) else None
+
+
+def _sin_la_receta_del_catalogo(informe: dict | None) -> bool:
+    """Un receptor propio ya preparado (PDBQT o estructura respetada) no se preparó con la receta del catálogo."""
+    return str((informe or {}).get("modo_de_preparacion") or "").startswith(("pdbqt", "respetar"))
+
+
+async def run_vina_docking(
+    smiles_hash: str,
+    target_pdb_id: str,
+    target_chain: str = "A",
+    target_center: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    target_size: tuple[float, float, float] = (20.0, 20.0, 20.0),
+    force_redock: bool = False,
+    hotspots: list[dict] | None = None,
+    docking_engine: str = "vina",
+    exhaustiveness: int | None = None,
+    num_poses: int | None = None,
+    seed: int | None = None,
+    smiles: str | None = None,
+    prepared_receptor_bytes: bytes | None = None,
+    cofactors_whitelist: list[str] | None = None,
+    site_chains: list[str] | None = None,
+) -> DockingResult:
+    """Ejecuta docking real o devuelve cache si ya existe un cálculo idéntico.
+
+    Args:
+        docking_engine: 'vina' (exhaustiveness=8) o 'qvina2' (exhaustiveness=4, ~3x rapido)
+        site_chains: las cadenas que FORMAN el sitio, del catalogo. Con dos o
+            mas, el receptor se prepara en modo multicadena y se recorta al
+            sitio. Sin esto, un sitio de interfaz se acopla contra media
+            cavidad (doc 71, modo C).
+    """
+    receptor_object_path = None
+    if prepared_receptor_bytes is None:
+        effective_center, effective_size = resolve_effective_docking_box(
+            pdb_id=target_pdb_id,
+            chain_id=target_chain,
+            center=target_center,
+            size=target_size,
+            site_chains=site_chains,
+        )
+        receptor_object_path = await prepare_target(
+            pdb_id=target_pdb_id,
+            chain_id=target_chain,
+            center=effective_center,
+            size=effective_size,
+            force_reprepare=False,
+            cofactors_whitelist=cofactors_whitelist,
+            site_chains=site_chains,
+        )
+        receptor_content = await read_bytes(receptor_object_path)
+    else:
+        # Una corrida durable usa exactamente el receptor que congeló al
+        # abrirse. No consulta ni reprepara el objeto mutable del catálogo.
+        receptor_content = bytes(prepared_receptor_bytes)
+        effective_center = tuple(float(v) for v in target_center)
+        effective_size = tuple(float(v) for v in target_size)
+    receptor_sha256 = hashlib.sha256(receptor_content).hexdigest()
+    preparation_warnings: list[dict] = []
+    preparation_report: dict | None = None
+    if receptor_object_path is not None:
+        try:
+            preparation_report = json.loads(
+                await read_text(_meeko_report_path(receptor_object_path))
+            )
+        except (OSError, ValueError) as exc:
+            raise DockingFailed(
+                molecule_id=smiles_hash,
+                target_pdb_id=target_pdb_id,
+                detail=f"Falta el informe de preparación del receptor: {exc}",
+            ) from exc
+        if preparation_report.get("receptor_sha256") != receptor_sha256:
+            raise DockingFailed(
+                molecule_id=smiles_hash,
+                target_pdb_id=target_pdb_id,
+                detail="El informe de preparación no corresponde al receptor PDBQT.",
+            )
+        templates = preparation_report.get("protonation_templates")
+        if templates is None:
+            raise DockingFailed(
+                molecule_id=smiles_hash,
+                target_pdb_id=target_pdb_id,
+                detail="El informe de preparación no declara plantillas de protonación.",
+            )
+        histidines = sorted(
+            f"{resid}={row['template']}" for resid, row in templates.items()
+            if row.get("input_resname") in {"HIS", "HID", "HIE", "HIP"}
+        )
+        declarada = preparation_report.get("protonacion_declarada")
+        if declarada:
+            # Receptor propio ya preparado: la protonación es la de quien lo preparó, no la
+            # de Meeko, y MolDesign no la comprueba. No se presenta como asignación propia.
+            comprobadas = declarada.get("plantillas_coinciden") is True
+            preparation_warnings.append(aviso(
+                "RECEPTOR_PROTONACION_DECLARADA", Severidad.PRECAUCION,
+                ("La protonación del receptor es la declarada por quien lo preparó "
+                 f"(origen: {declarada.get('origen', 'usuario')}); "
+                 + (f"MolDesign comprobó que Meeko aplicó las plantillas declaradas "
+                    f"({declarada.get('plantillas_declaradas', 0)} residuos) y no fija un pH."
+                    if comprobadas else "MolDesign no la comprueba ni fija un pH.")
+                 + (" Plantillas de histidina comprobadas: " + ", ".join(histidines) + "."
+                    if histidines else "")),
+            ))
+        else:
+            preparation_warnings.append(aviso(
+                "RECEPTOR_PROTONACION_DECLARADA", Severidad.PRECAUCION,
+                "Plantillas de histidina asignadas por Meeko: "
+                + (", ".join(histidines) if histidines else "ninguna en este receptor")
+                + ". La asignación procede de plantillas y no valida el microestado "
+                  "experimental ni un pH concreto.",
+            ))
+        removed = preparation_report.get("removed_residues") or []
+        if removed:
+            label = ", ".join(
+                f"{row['chain']}:{row['residue_number']} {row['name']} "
+                f"({row['distance_to_box_A']} Å de la caja)"
+                for row in removed
+            )
+            preparation_warnings.append(aviso(
+                "RESIDUOS_ELIMINADOS_FUERA_DEL_SITIO",
+                Severidad.PRECAUCION,
+                f"Meeko eliminó residuos del receptor fuera del margen crítico: {label}.",
+            ))
+        truncadas = preparation_report.get("truncated_sidechains") or []
+        if truncadas:
+            en_sitio = [row for row in truncadas if row.get("site_critical")]
+            label = ", ".join(
+                f"{row['chain']}:{row['residue_number']} {row['name']}→{row['action'].split()[-1]} "
+                f"({row['distance_to_box_A']} Å)"
+                for row in en_sitio
+            )
+            preparation_warnings.append(aviso(
+                "CADENAS_LATERALES_TRUNCADAS",
+                Severidad.CRITICA if en_sitio else Severidad.PRECAUCION,
+                f"El cristal no resolvía {len(truncadas)} cadena(s) lateral(es); se truncaron a "
+                "ALA o GLY, conservando sólo átomos observados"
+                + (f". EN EL SITIO, así que la cavidad acoplada pierde esos grupos: {label}."
+                   if en_sitio else ", todas fuera del sitio."),
+            ))
+        fuera = preparation_report.get("cofactors_outside_site") or []
+        if fuera:
+            label = ", ".join(
+                f"{row['name']} {row['chain']}:{row['residue_number']} "
+                f"({row['distance_to_box_A']} Å de la caja, {row['action']})"
+                for row in fuera
+            )
+            preparation_warnings.append(aviso(
+                "COFACTORES_SIN_PLANTILLA_FUERA_DEL_SITIO",
+                Severidad.PRECAUCION,
+                "Cofactores o residuos modificados sin plantilla Meeko validada, "
+                f"lejos del sitio: {label}. No forman parte de la cavidad acoplada.",
+            ))
+    receptor_snapshot_path = StoragePath.prepared_receptor_snapshot(receptor_sha256)
+    # Se materializa incluso ante cache hit: caches creados antes de este
+    # contrato sólo guardaban el hash y no podían reconstruir el input.
+    await write_bytes(receptor_content, receptor_snapshot_path)
+    effective_exhaustiveness = resolve_exhaustiveness(
+        requested=exhaustiveness,
+        default=(4 if docking_engine == "qvina2" else int(settings.vina_exhaustiveness)),
+        size=effective_size,
+        engine=docking_engine,
+    )
+    volume = box_volume(effective_size)
+    if volume > BOX_VOLUME_WARNING_A3:
+        preparation_warnings.append(aviso(
+            "CAJA_BUSQUEDA_AMPLIA", Severidad.PRECAUCION,
+            f"La caja ocupa {volume:.0f} Å³ (> {BOX_VOLUME_WARNING_A3:.0f} Å³). "
+            f"Exhaustividad efectiva: {effective_exhaustiveness}. "
+            "El umbral y el escalón automático son una política conservadora; "
+            "no garantizan convergencia de poses.",
+        ))
+    effective_num_poses = int(num_poses) if num_poses is not None else int(settings.vina_num_poses)
+    effective_seed = int(seed) if seed is not None else int(settings.vina_seed)
+    effective_engine_identity = docking_engine
+    if docking_engine == "qvina2" and not _resolve_executable(settings.qvina2_executable_path):
+        effective_engine_identity = "vina_fallback_from_qvina2"
+    ligand_input_sha256 = await _huella_del_conformero(smiles_hash)
+    from services.docking import search_trace
+    _, trace_identity = search_trace.instrumented(_resolve_executable(settings.vina_executable_path))
+    if docking_engine != "vina":
+        trace_identity = None
+    cache_fingerprint = _docking_cache_fingerprint(
+        # Se lee ANTES de preparar el ligando: es un archivo, no un subproceso,
+        # así que la huella no cuesta una corrida de Meeko en cada acierto.
+        ligand_input_sha256=ligand_input_sha256,
+        receptor_sha256=receptor_sha256,
+        target_chain=target_chain,
+        center=effective_center,
+        size=effective_size,
+        hotspots=hotspots,
+        docking_engine=effective_engine_identity,
+        exhaustiveness=effective_exhaustiveness,
+        num_poses=effective_num_poses,
+        seed=effective_seed,
+        trace_binary_sha256=trace_identity["binary_sha256"] if trace_identity else None,
+    )
+
+    if not force_redock:
+        cached = await cache.get_docking_result(
+            smiles_hash,
+            target_pdb_id,
+            cache_fingerprint,
+        )
+        if cached is not None and trace_identity:
+            try:
+                info = (cached.get("execution_provenance") or {})["search_trace"]
+                await search_trace.recover(info)
+            except (OSError, ValueError, KeyError):
+                cached = None
+        if cached is not None:
+            log.info(
+                {
+                    "event": "vina_cache_hit",
+                    "smiles_hash": smiles_hash,
+                    "target_pdb_id": target_pdb_id,
+                    "config": cache_fingerprint[:12],
+                }
+            )
+            cached["receptor_sha256"] = receptor_sha256
+            cached["receptor_path"] = receptor_snapshot_path
+            current_warnings = list(cached.get("scientific_warnings") or [])
+            for warning in preparation_warnings:
+                if warning not in current_warnings:
+                    current_warnings.append(warning)
+            cached["scientific_warnings"] = current_warnings
+            return DockingResult(**cached)
+
+    # Use a unique subdirectory for each job to avoid race conditions in parallel runs
+    #
+    # El directorio padre se crea aquí y no sólo en el arranque de la API
+    # (`_bootstrap_runtime_resources`). `preparer.py` y `quantum_ad4_service.py`
+    # ya lo hacían; este sitio era el único que daba por hecho que alguien lo
+    # había creado antes. Si %TEMP%\vina desaparece —un limpiador de temporales,
+    # un arnés que no levanta la API— el acoplamiento moría con un
+    # FileNotFoundError de `mkdtemp` en vez de con un error del dominio.
+    Path(settings.vina_temp_dir).mkdir(parents=True, exist_ok=True)
+    job_temp_dir = Path(tempfile.mkdtemp(prefix=f"vina-{smiles_hash[:8]}-{target_pdb_id}-", dir=settings.vina_temp_dir))
+
+    try:
+        ligand_object_path = await _prepare_ligand_pdbqt(
+            smiles_hash, smiles=smiles, target_pdb_id=target_pdb_id
+        )
+
+        ligand_pdbqt_sha256 = await _sha256_del_objeto(ligand_object_path)
+        export_cmd = _resolve_executable(settings.meeko_export_path)
+        if not export_cmd:
+            raise DockingFailed(
+                molecule_id=smiles_hash,
+                target_pdb_id=target_pdb_id,
+                detail=(
+                    "No se encontró 'mk_export.py'. La exportación a SDF es necesaria para "
+                    "conservar conectividad y órdenes de enlace de forma defendible."
+                ),
+            )
+
+        @asynccontextmanager
+        async def receptor_file():
+            # Exactamente los bytes cuyo hash se registró, aunque otra corrida
+            # reprepare el objeto mutable del catálogo antes de lanzar Vina.
+            snapshot_path = job_temp_dir / "receptor_snapshot.pdbqt"
+            snapshot_path.write_bytes(receptor_content)
+            yield snapshot_path
+
+        async with receptor_file() as receptor_local:
+            async with temp_file(ligand_object_path, suffix=".pdbqt") as ligand_local:
+                # We use the job_temp_dir we created
+                tmp_dir_path = job_temp_dir
+                output_pdbqt = tmp_dir_path / f"{smiles_hash}_{target_pdb_id}_out.pdbqt"
+                output_sdf = tmp_dir_path / f"{smiles_hash}_{target_pdb_id}_out.sdf"
+                output_log = tmp_dir_path / f"{smiles_hash}_{target_pdb_id}.log"
+
+                scientific_warnings: list[dict] = list(preparation_warnings)
+
+                # ── Qué aguas tenía el sitio antes de quitarlas ─────────────
+                #
+                # `preparer.py` elimina TODAS las aguas cristalográficas, que es
+                # lo estándar en acoplamiento generalista y no se cambia aquí.
+                # Lo que faltaba era decirlo con números: el dossier declaraba
+                # «condición desolvatada» en abstracto, igual para un sitio seco
+                # que para uno con treinta aguas y ocho bien coordinadas.
+                #
+                # Se mide sobre el PDB DEPOSITADO, que es el único que todavía
+                # las tiene; el preparado ya no. Ver
+                # `services/chemistry/censo_de_aguas.py` para la medición sobre
+                # el catálogo que desaconseja conservarlas por conteo de puentes.
+                #
+                # LA LECTURA ESTABA EN EL CAMINO CALIENTE. El censo es
+                # determinista en (pdb_id, centro, tamaño): mismo receptor y
+                # misma caja, mismo resultado. El cálculo son ~4 ms, pero leer el
+                # PDB depositado es E/S por corrida sobre cientos de KB. Se
+                # consulta la caché ANTES de leer, que es donde está el ahorro.
+                #
+                # UN RECEPTOR PROPIO NO PASA POR ESA RECETA. El camino B conserva
+                # las aguas del archivo y un PDBQT del camino C trae las que dejó
+                # quien lo preparó; «se retiraron N», contado sobre el depositado,
+                # era falso justo ahí (FEP-09, 2026-10-11). Manda el receptor que
+                # entró a Vina: si trae aguas en la caja, se dice que se conservan.
+                # El del catálogo no trae ninguna, así que su frase no cambia.
+                _conservadas = aguas_en_la_caja(
+                    receptor_content.decode("utf-8", errors="replace"),
+                    effective_center, effective_size,
+                )
+                try:
+                    _censo = censo_en_cache(
+                        target_pdb_id, effective_center, effective_size
+                    )
+                    if _censo is None:
+                        # El mismo origen que leyó la preparación: el crudo depositado o, en el árbol de
+                        # desarrollo, la estructura de `data/target_library`, que no deja `raw.pdb`. Leer sólo
+                        # el crudo decía «no se pudo leer la estructura depositada» mientras Preparación contaba
+                        # esas aguas (FEP-06-PRE, 2026-10-24).
+                        from services.docking.preparer import receptor_source_path_no_network
+                        _fuente = receptor_source_path_no_network(target_pdb_id)
+                        if _fuente is None:
+                            raise FileNotFoundError("sin estructura de origen")
+                        _crudo = await asyncio.to_thread(
+                            Path(_fuente).read_text, encoding="utf-8", errors="replace")
+                        _censo = censar_aguas(_crudo, effective_center, effective_size)
+                        guardar_censo(
+                            target_pdb_id, effective_center, effective_size, _censo
+                        )
+                    scientific_warnings.append(
+                        aviso("AGUAS_DEL_SITIO_CONSERVADAS", Severidad.INFO,
+                              describir_aguas_conservadas(_conservadas, _censo))
+                        if _conservadas else
+                        # Un receptor propio sin aguas no pasó por la receta del catálogo: no se «preparó desolvatado».
+                        aviso("SITIO_DESOLVATADO", Severidad.INFO, describir_receptor_propio_sin_aguas(_censo))
+                        if _sin_la_receta_del_catalogo(preparation_report) else
+                        aviso("SITIO_DESOLVATADO", Severidad.INFO, describir_censo(_censo))
+                    )
+                except Exception as _err:  # noqa: BLE001 — declarativo, nunca bloquea
+                    # Sin el crudo no se puede censar. Se dice, en vez de callar:
+                    # un dossier sin la línea de aguas y uno con «no se pudo
+                    # medir» no significan lo mismo.
+                    log.debug("censo_de_aguas_no_disponible",
+                              target=target_pdb_id, error=str(_err)[:120])
+                    if _conservadas:
+                        scientific_warnings.append(aviso(
+                            "AGUAS_DEL_SITIO_CONSERVADAS", Severidad.INFO,
+                            describir_aguas_conservadas(_conservadas, None),
+                        ))
+                    elif _sin_la_receta_del_catalogo(preparation_report):
+                        # Un PDBQT subido sin su estructura de origen: nadie sabe
+                        # si tenía aguas, así que no se afirma que se retiraran.
+                        scientific_warnings.append(aviso(
+                            "SITIO_DESOLVATADO", Severidad.INFO,
+                            "Preparación en condición desolvatada: el receptor acoplado no "
+                            "trae aguas cristalográficas dentro de la caja de acoplamiento. "
+                            "Se subió sin su estructura de origen, así que no se sabe si las tenía.",
+                        ))
+                    else:
+                        scientific_warnings.append(aviso(
+                            "SITIO_DESOLVATADO", Severidad.INFO,
+                            "Preparación en condición desolvatada: se retiraron las aguas "
+                            "cristalográficas del receptor. No se pudo leer la estructura "
+                            "depositada para contar cuántas había en el sitio.",
+                        ))
+
+                # v1.5: Validar que el ligando cabe en la caja de docking
+                _ligand_size_warning = _check_ligand_fits_box(
+                    ligand_local, effective_size, target_pdb_id
+                )
+                if _ligand_size_warning:
+                    # El ligando no cabe en la caja: la búsqueda está recortada y
+                    # la mejor pose puede ser un artefacto del recorte.
+                    scientific_warnings.append(aviso(
+                        "LIGANDO_EXCEDE_CAJA", Severidad.CRITICA, _ligand_size_warning,
+                    ))
+
+                stdout = await _run_vina_subprocess(
+                    receptor_path=receptor_local,
+                    ligand_path=ligand_local,
+                    output_path=output_pdbqt,
+                    log_path=output_log,
+                    target_pdb_id=target_pdb_id,
+                    center=effective_center,
+                    size=effective_size,
+                    molecule_id=smiles_hash,
+                    exhaustiveness=effective_exhaustiveness,
+                    docking_engine=docking_engine,
+                    num_poses=effective_num_poses,
+                    seed=effective_seed,
+                )
+
+                # Mismo motivo que en la preparacion del ligando: el .exe de
+                # Scripts/ apunta al interprete de la maquina de construccion.
+                export_process = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    "-m", "meeko.cli.mk_export",
+                    str(output_pdbqt),
+                    "-s",
+                    str(output_sdf),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    creationflags=BANDERAS_SIN_VENTANA,
+                )
+                try:
+                    export_stdout, export_stderr = await communicate_managed(export_process, timeout=60.0)
+                except asyncio.TimeoutError:
+                    raise DockingFailed(
+                        molecule_id=smiles_hash,
+                        target_pdb_id=target_pdb_id,
+                        detail="La exportación de Meeko (mk_export) excedió el timeout de 60 segundos.",
+                    )
+
+                if export_process.returncode != 0 or not output_sdf.exists():
+                    raise DockingFailed(
+                        molecule_id=smiles_hash,
+                        target_pdb_id=target_pdb_id,
+                        detail=(
+                            export_stderr.decode("utf-8", errors="replace")
+                            or export_stdout.decode("utf-8", errors="replace")
+                            or "mk_export.py no generó el SDF esperado"
+                        ),
+                    )
+
+                sdf_content = output_sdf.read_text(encoding="utf-8", errors="replace")
+                def cast_pose_dict(p):
+                    return {
+                        "rank": int(p["rank"]),
+                        "affinity": float(p["affinity"]),
+                        "rmsd_lb": float(p["rmsd_lb"]),
+                        "rmsd_ub": float(p["rmsd_ub"]),
+                    }
+
+                pdbqt_content = output_pdbqt.read_text(encoding="utf-8", errors="replace")
+                pdbqt_pose_blocks = extract_pdbqt_poses(pdbqt_content)
+
+                parsed_poses = parse_vina_output_sdf(sdf_content) if _is_valid_sdf(sdf_content) else []
+
+                # El SDF de Meeko trae la afinidad pero no el RMSD contra la
+                # pose 1; eso sólo existe en el PDBQT. Ver
+                # `fusionar_rmsd_desde_pdbqt`, que explica por qué un 0.0
+                # entregado sería una afirmación falsa y no un hueco.
+                if parsed_poses:
+                    parsed_poses, diag_rmsd = fusionar_rmsd_desde_pdbqt(
+                        parsed_poses, pdbqt_content
+                    )
+                    if not diag_rmsd["fusionado"] or diag_rmsd["afinidades_discrepantes"]:
+                        raise DockingFailed(
+                            molecule_id=smiles_hash,
+                            target_pdb_id=target_pdb_id,
+                            detail=("Las poses SDF y PDBQT no coinciden en recuento, "
+                                    "orden o afinidad; no se atribuye un bloque "
+                                    "PDBQT a otra geometría."),
+                        )
+                    try:
+                        verificar_pares_sdf_pdbqt(sdf_content, pdbqt_pose_blocks)
+                    except PoseNoRecuperable as exc:
+                        raise DockingFailed(
+                            molecule_id=smiles_hash,
+                            target_pdb_id=target_pdb_id,
+                            detail=f"No se pudo demostrar la correspondencia geométrica SDF/PDBQT: {exc}",
+                        ) from exc
+
+                poses: list[DockingPose] = []
+                for i, pose_dict in enumerate(parsed_poses):
+                    # Asignamos el bloque PDBQT correspondiente si existe
+                    block = pdbqt_pose_blocks[i] if i < len(pdbqt_pose_blocks) else None
+                    poses.append(DockingPose(**cast_pose_dict(pose_dict), pdbqt_block=block))
+
+                # PDBQT no conserva órdenes de enlace ni la química completa.
+                # Si Meeko no exporta poses SDF utilizables, la corrida se
+                # abstiene antes de persistir un archivo estructural falso.
+                if not poses:
+                    raise DockingFailed(
+                        molecule_id=smiles_hash,
+                        target_pdb_id=target_pdb_id,
+                        detail=(
+                            "Meeko no produjo poses SDF químicamente verificables. "
+                            "No se reconstruye la molécula desde el PDBQT de Vina."
+                        ),
+                    )
+                if len(poses) != len(pdbqt_pose_blocks):
+                    raise DockingFailed(
+                        molecule_id=smiles_hash,
+                        target_pdb_id=target_pdb_id,
+                        detail=(
+                            "El número de poses SDF no coincide con los bloques "
+                            "PDBQT producidos por Vina."
+                        ),
+                    )
+                recorded_search = None
+                if trace_identity:
+                    recorded_search = await search_trace.persist(
+                        tmp_dir_path / "search", output_pdbqt,
+                        replicas=effective_exhaustiveness, identity=trace_identity,
+                        receptor=receptor_local.read_bytes(), ligand=ligand_local.read_bytes(),
+                        seed=effective_seed, cpu=int(settings.vina_cpu),
+                        center=effective_center, size=effective_size,
+                        poses_sdf_sha256=hashlib.sha256(output_sdf.read_bytes()).hexdigest(),
+                    )
+
+                parsing_source = "sdf"
+                conversor_estructural = None
+
+                if poses[0].affinity > -3.0:
+                    # PRECAUCION, no nota: por encima de -6 el score de Vina deja
+                    # de discriminar bien entre unir y no unir, y por encima de
+                    # -3 la corrida no sostiene una lectura de unión.
+                    scientific_warnings.append(aviso(
+                        "AFINIDAD_DEBIL", Severidad.PRECAUCION,
+                        "La mejor afinidad es débil (> -3.0 kcal/mol); interpretar como "
+                        "baja evidencia de unión en este setup de docking.",
+                    ))
+
+                # v1.8.1: Afinidad POSITIVA = docking no productivo.
+                # Vina devuelve afinidades positivas cuando NO encuentra ninguna
+                # pose favorable (receptor mal preparado, grid box fuera del sitio
+                # activo, o ligando incompatible con el pocket). Un valor > 0
+                # viola la convención termodinámica (kcal/mol debe ser negativo
+                # para unión favorable) y rompía DockingResult con ValidationError
+                # de Pydantic. Ahora lo tratamos como DockingFailed con un mensaje
+                # accionable para el usuario (caso real: 4EJJ con grid desplazado).
+                if poses[0].affinity > 0.0:
+                    log.warning(
+                        "vina_affinity_positiva",
+                        target_pdb_id=target_pdb_id,
+                        best_affinity=poses[0].affinity,
+                        n_poses=len(poses),
+                        hint="receptor_o_box_probablemente_mal_preparado",
+                    )
+                    raise DockingFailed(
+                        molecule_id=smiles_hash,
+                        target_pdb_id=target_pdb_id,
+                        detail=(
+                            "Vina no produjo poses con afinidad favorable (todas las poses > 0 kcal/mol, "
+                            f"mejor={poses[0].affinity:.2f}). Esto suele indicar que el receptor no está "
+                            "preparado correctamente o que la caja de docking no cubre el sitio activo del "
+                            "target. Verifica la preparación del receptor o selecciona otro target."
+                        ),
+                    )
+
+                stdout_poses = _parse_vina_stdout(stdout)
+                if stdout_poses:
+                    best_delta_pct = _relative_error_pct(poses[0].affinity, stdout_poses[0].affinity)
+                    if best_delta_pct > settings.docking_max_consistency_error_pct:
+                        raise DockingFailed(
+                            molecule_id=smiles_hash,
+                            target_pdb_id=target_pdb_id,
+                            detail=(
+                                "Inconsistencia numérica de afinidad entre parser estructurado y stdout de Vina "
+                                f"({best_delta_pct:.4f}% > {settings.docking_max_consistency_error_pct:.4f}%)."
+                            ),
+                        )
+
+                vina_version, vina_random_seed = _parse_vina_metadata(stdout)
+                if vina_random_seed is not None and vina_random_seed != effective_seed:
+                    # La reproducibilidad de la corrida deja de estar garantizada:
+                    # repetirla con la misma configuración puede dar otras poses.
+                    scientific_warnings.append(aviso(
+                        "SEMILLA_DISCREPANTE", Severidad.PRECAUCION,
+                        "La semilla reportada por Vina difiere de la semilla configurada; "
+                        "revisar reproducibilidad del entorno.",
+                    ))
+
+                # La configuración identifica el cache, no una ejecución.
+                # force_redock nunca debe sobrescribir evidencia ya archivada.
+                artifact_id = f"{cache_fingerprint}/{uuid.uuid4().hex}"
+                poses_path = StoragePath.docking_poses_run(
+                    smiles_hash, target_pdb_id, artifact_id
+                )
+                log_path = StoragePath.docking_log_run(
+                    smiles_hash, target_pdb_id, artifact_id
+                )
+
+                # Sólo se entregan los bytes del SDF validado de Meeko.
+                await write_file(output_sdf, poses_path)
+                await write_text(log_path, output_log.read_text(encoding="utf-8"))
+
+                # --- [NUEVO] Análisis de Hotspots Dinámico ---
+                hotspots_hit: list[str] | None = None
+                if hotspots and poses and poses[0].pdbqt_block:
+                    try:
+                        hotspots_hit = _analyze_hotspot_interactions(
+                            receptor_local,
+                            poses[0].pdbqt_block,
+                            hotspots
+                        )
+                        if hotspots_hit:
+                            log.info("Hotspots hit detectados", hits=hotspots_hit)
+                        else:
+                            scientific_warnings.append(aviso(
+                                "SIN_HOTSPOTS", Severidad.PRECAUCION,
+                                "No se detectaron interacciones con los residuos críticos "
+                                "(hotspots) del receptor.",
+                            ))
+                    except Exception as e:
+                        log.error("Error analizando hotspots", error=str(e))
+                        scientific_warnings.append(aviso(
+                            "HOTSPOTS_ERROR", Severidad.CRITICA,
+                            f"Error en análisis de hotspots: {e}",
+                        ))
+
+                def dependency_version(package: str) -> str | None:
+                    try:
+                        return importlib.metadata.version(package)
+                    except importlib.metadata.PackageNotFoundError:
+                        return None
+
+                execution_provenance = {
+                    "search_trace": recorded_search,
+                    "box_center": [float(v) for v in effective_center],
+                    "box_size": [float(v) for v in effective_size],
+                    "cpu": int(settings.vina_cpu),
+                    "app_version": APP_VERSION,
+                    "git_commit": _source_commit(),
+                    # B-2: la receta con la que se preparó el receptor, para
+                    # saber si esta corrida es comparable con las de hoy.
+                    # `recipe_hash` identifica bytes, no versión de receta. Un
+                    # receptor durable se congeló antes, quizá con otra receta:
+                    # ahí no se afirma ninguna.
+                    "receta_receptor": (
+                        None if _sin_la_receta_del_catalogo(preparation_report) else
+                        RECEPTOR_RECIPE_VERSION if preparation_report is not None else None
+                    ),
+                    "ligand_input_sha256": ligand_input_sha256,
+                    "ligand_input_path": StoragePath.ligand_conformer(smiles_hash),
+                    "ligand_pdbqt_sha256": ligand_pdbqt_sha256,
+                    "ligand_pdbqt_path": ligand_object_path,
+                    "log_path": log_path,
+                    "poses_sha256": hashlib.sha256(output_sdf.read_bytes()).hexdigest(),
+                    "log_sha256": await _sha256_del_objeto(log_path),
+                    "receptor_sha256": receptor_sha256,
+                    "receptor_prep": {
+                        "source": "meeko_report" if preparation_report is not None else "durable_receptor_snapshot",
+                        "recipe_hash": preparation_report.get("recipe_hash") if preparation_report else None,
+                        # None si el informe es anterior al campo o si la
+                        # corrida es durable: nunca se reconstruye aquí.
+                        "species_diff": (
+                            preparation_report.get("species_diff")
+                            if preparation_report else None
+                        ),
+                        "meeko_parameterized_json_sha256": (
+                            preparation_report.get("meeko_parameterized_json_sha256")
+                            if preparation_report else None
+                        ),
+                        "protonation_method": (
+                            preparation_report.get("protonation_method")
+                            if preparation_report else None
+                        ),
+                        "removed_residues": (
+                            preparation_report.get("removed_residues")
+                            if preparation_report else None
+                        ),
+                        "cofactors_outside_site": (
+                            preparation_report.get("cofactors_outside_site")
+                            if preparation_report else None
+                        ),
+                        "truncated_sidechains": (
+                            preparation_report.get("truncated_sidechains")
+                            if preparation_report else None
+                        ),
+                        # `None` = no medido (receptor en caché anterior a este
+                        # campo); `[]` = medido y continuo.
+                        "backbone_gaps": (
+                            preparation_report.get("backbone_gaps")
+                            if preparation_report else None
+                        ),
+                        "cofactor_templates_sha256": (
+                            preparation_report.get("cofactor_templates_sha256")
+                            if preparation_report else None
+                        ),
+                        "chain": target_chain,
+                        # AMP-11: la UNIDAD acoplada, medida sobre los mismos
+                        # bytes que `receptor_sha256`. `chain` es lo que se
+                        # pidió; esto es lo que el PDBQT contiene (en 3F75 la
+                        # cadena A declarada se acopla junto a la P).
+                        "prepared_chains": sorted(
+                            prepared_receptor_chains(receptor_content.decode("utf-8", errors="replace"))
+                        ),
+                        "site_chains": sorted(site_chains) if site_chains else None,
+                        "cofactors_whitelist": sorted(cofactors_whitelist) if cofactors_whitelist else [],
+                        # Sólo un receptor propio lo trae: cómo llegó el archivo, qué modo de
+                        # preparación se aplicó y qué NO se pudo saber (con su motivo). Y
+                        # `deposited_h_removed`, sólo si la preparación retiró hidrógenos del
+                        # depósito que contradecían la estructura (3KK6, 6S1Z). Y `biological_assembly`,
+                        # sólo si se generaron cadenas por simetría (6SXC: la C es la A por BIOMT 3).
+                        **{clave: preparation_report[clave] for clave in (
+                            "modo_de_preparacion", "entrada", "origen", "protonacion_declarada", "prediccion",
+                            "no_disponible", "correspondencia_con_el_origen", "traducciones",
+                            "deposited_h_removed", "biological_assembly",
+                        ) if preparation_report and clave in preparation_report},
+                        **({"modo_de_preparacion": modo_congelado, "modo_de_preparacion_fuente": "perfil del receptor propio"}
+                           if not preparation_report and (modo_congelado := modo_del_receptor_congelado(target_pdb_id))
+                           else {}),
+                    },
+                    "toolchain": {
+                        "vina": vina_version,
+                        "meeko": dependency_version("meeko"),
+                        "rdkit": dependency_version("rdkit"),
+                        "dimorphite_dl": dependency_version("dimorphite_dl"),
+                    },
+                }
+                result = DockingResult(
+                    best_affinity=poses[0].affinity,
+                    poses=poses,
+                    poses_file_path=poses_path,
+                    parsing_source=parsing_source,
+                    conversor_estructural=conversor_estructural,
+                    vina_version=vina_version,
+                    vina_random_seed=vina_random_seed,
+                    # Lo que de verdad se ejecutó. `effective_engine_identity`
+                    # ya distingue el respaldo («vina_fallback_from_qvina2»).
+                    engine_efectivo=effective_engine_identity,
+                    exhaustiveness_efectiva=effective_exhaustiveness,
+                    num_poses_solicitadas=effective_num_poses,
+                    receptor_sha256=receptor_sha256,
+                    receptor_path=receptor_snapshot_path,
+                    execution_provenance=execution_provenance,
+                    scientific_warnings=scientific_warnings,
+                    hotspots_hit=hotspots_hit,
+                )
+                await cache.set_docking_result(
+                    smiles_hash,
+                    target_pdb_id,
+                    result.model_dump(),
+                    cache_fingerprint,
+                )
+
+                log.info(
+                    f"docking completado: smiles_hash={smiles_hash}, target={target_pdb_id}, best_affinity={result.best_affinity}, poses={len(result.poses)}"
+                )
+                return result
+    finally:
+        shutil.rmtree(job_temp_dir, ignore_errors=True)
+
+def _analyze_hotspot_interactions(
+    receptor_path: Path,
+    ligand_pdbqt: str,
+    hotspots: list[dict]
+) -> list[str]:
+    """
+    Analiza si el ligando interactúa con los residuos críticos.
+    Lógica: Distancia mínima < 4.0 Å entre cualquier átomo del ligando
+    y cualquier átomo de la cadena lateral del residuo hotspot.
+    """
+    if not hotspots:
+        return []
+
+    # 1. Extraer coordenadas de los átomos del ligando
+    ligand_coords = []
+    for line in ligand_pdbqt.splitlines():
+        if line.startswith(("ATOM", "HETATM")):
+            try:
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+                ligand_coords.append((x, y, z))
+            except (ValueError, IndexError):
+                continue
+
+    if not ligand_coords:
+        return []
+
+    # 2. Extraer coordenadas del receptor para los residuos hotspot
+    # Formato esperado de hotspot['name']: "MET97", "ASP116", "A:TYR100"
+    hotspot_names_full = {h["name"].upper() for h in hotspots}
+
+    receptor_atoms = {} # name -> list of coords
+
+    with open(receptor_path, "r") as f:
+        for line in f:
+            if line.startswith(("ATOM", "HETATM")):
+                res_name = line[17:20].strip()
+                res_chain = line[21].strip() # Capturar cadena si existe
+                res_seq = line[22:26].strip()
+
+                full_res_no_chain = f"{res_name}{res_seq}"
+                full_res_with_chain = f"{res_chain}:{res_name}{res_seq}" if res_chain else full_res_no_chain
+
+                # Verificar si alguna de las formas está en hotspots
+                matched_id = None
+                if full_res_with_chain in hotspot_names_full:
+                    matched_id = full_res_with_chain
+                elif full_res_no_chain in hotspot_names_full:
+                    matched_id = full_res_no_chain
+
+                if matched_id:
+                    try:
+                        x = float(line[30:38])
+                        y = float(line[38:46])
+                        z = float(line[46:54])
+                        if matched_id not in receptor_atoms:
+                            receptor_atoms[matched_id] = []
+                        receptor_atoms[matched_id].append((x, y, z))
+                    except (ValueError, IndexError):
+                        continue
+
+    # 3. Calcular distancias mínimas
+    hits = []
+    # Aumentamos a 5.0 Å para capturar interacciones hidrofóbicas/apilamiento (stacking)
+    # que son comunes en hotspots y tienen un rango mayor que los H-bonds.
+    THRESHOLD_SQ = 5.0 * 5.0
+
+    for res_name, res_coords in receptor_atoms.items():
+        min_dist_sq = float('inf')
+        for r_coord in res_coords:
+            for l_coord in ligand_coords:
+                d2 = (r_coord[0]-l_coord[0])**2 + (r_coord[1]-l_coord[1])**2 + (r_coord[2]-l_coord[2])**2
+                if d2 < min_dist_sq:
+                    min_dist_sq = d2
+
+        min_dist = min_dist_sq**0.5
+        log.info(f"Hotspot distance: {res_name} -> {min_dist:.2f} A")
+
+        if min_dist_sq < THRESHOLD_SQ:
+            hits.append(res_name)
+
+    return hits

@@ -1,0 +1,78 @@
+on: [push]
+name: "Repo"
+
+jobs:
+  python-tests:
+    name: Tests and Notebooks
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # This is necessary for the conda action. It replaces `conda init` as
+        # the shell does not load ,profile or .bashrc.
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          python-version: 3.14
+          activate-environment: "true"
+      - name: Install NanoVer & dependencies
+        run: uv pip install ./[dev]
+      - name: Parallel tests
+        run: uv run pytest --cov nanover tests -n auto -m 'not serial' --timeout 30
+      - name: Serial tests
+        run: uv run pytest --cov nanover tests -n 1 -m 'serial' --cov-append --timeout 30
+      - name: Jupyter notebooks
+        run: uv run pytest --cov nanover --nbval-lax ./tutorials --nbval-cell-timeout=30 --cov-append
+  python-tests-minimum:
+    name: Tests and Notebooks (minimum versions)
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # This is necessary for the conda action. It replaces `conda init` as
+        # the shell does not load ,profile or .bashrc.
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          python-version: 3.13
+          activate-environment: "true"
+      - name: Install NanoVer & dependencies
+        run: |
+          uv pip install tomli-w
+          uv pip install setuptools
+          python ./.github/minimum-deps.py ./pyproject.toml
+          uv pip install ./[dev]
+      - name: Parallel tests
+        run: pytest tests -n auto -m 'not serial' --timeout 30
+      - name: Serial tests
+        run: pytest tests -n 1 -m 'serial' --timeout 30
+      - name: Jupyter notebooks
+        run: pytest --nbval-lax ./tutorials --nbval-cell-timeout=30
+  analysis:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # This is necessary for the conda action. It replaces `conda init` as
+        # the shell does not load ,profile or .bashrc.
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          python-version: 3.14
+          activate-environment: "true"
+      - name: Install NanoVer & dependencies
+        run: uv pip install ./[dev] ruff mypy ty
+      - name: Ruff lint
+        run: uv run ruff check ./src
+      - name: Ruff format
+        run: uv run ruff format --check ./src
+      - name: mypy types
+        run: uv run mypy ./src
+      - name: ty types
+        run: uv run ty check ./src

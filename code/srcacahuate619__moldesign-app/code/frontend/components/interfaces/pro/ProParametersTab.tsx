@@ -1,0 +1,436 @@
+"use client";
+
+
+import { useLanguage } from "@/context/LanguageContext";
+import React from "react";
+import { LiquidOrb } from "./LiquidOrb";
+import { numeroOGuion } from "../../../lib/formatoNumerico";
+import { etiquetaPPB } from "../../../lib/admetEtiquetas";
+import readingStyles from "./ResultReadingPresentation.module.css";
+import {useResultReading} from "./ResultReadingPresentation";
+import {ResultPropertiesPanel} from "./ResultPropertiesPanel";
+
+interface Props {
+  result: {
+    // Básicos
+    qed?: number | null;
+    sa_score?: number | null;
+    molecular_weight?: number | null;
+    log_p?: number | null;
+    sa_reasons?: string[] | null;
+    // ADMET
+    //
+    // `| null` NO ES DECORACIÓN. El backend, cuando ADMET-AI no está disponible
+    // en el equipo, pone TODOS estos campos a `null` a propósito
+    // (`chem/blood_viability.py::calculate_blood_viability`, rama
+    // `admet_unavailable_skipping`) para no fabricar valores. Este tipo los
+    // declaraba sólo como `boolean | undefined`, así que la comprobación de
+    // «no hay dato» se escribió `=== undefined` y `null` se colaba por la rama
+    // negativa: una aspirina sin predicción salía en rojo como «✗ No permeable»
+    // y «✗ Baja». Eso no es degradar: es afirmar lo contrario de lo que se sabe.
+    blood_viability_score?: number | null;
+    blood_solubility_logs?: number | null;
+    blood_ppb_category?: string | null;
+    blood_hia_permeable?: boolean | null;
+    blood_bbb_permeable?: boolean | null;
+    // Por qué salió ese veredicto de BBB. El booleano solo no distingue «lo dijo
+    // el modelo con p = 0.98» de «lo dijo una regla de polaridad contra el
+    // modelo», y esa diferencia es justo la que el usuario necesita para saber
+    // cuánto fiarse. Ver `backend/chem/bbb_consenso.py`.
+    blood_bbb_motivo?: string | null;
+    blood_cns_mpo?: number | null;
+    blood_systemic_reactivity?: string[] | null;
+    /** "evaluado" | "fallo" | "no_evaluado"; null en evaluaciones anteriores
+     *  al 2026-09-04, en las que TabPFN nunca llego a clasificar. */
+    blood_tabpfn_estado?: string | null;
+    // Drug-likeness
+    lipinski_pass?: boolean | null;
+    veber_pass?: boolean | null;
+    ghose_pass?: boolean | null;
+    egan_pass?: boolean | null;
+    muegge_pass?: boolean | null;
+    muegge_score?: number | null;
+    fsp3?: number | null;
+    is_pains?: boolean | null;
+    pains_matches?: string[] | null;
+    // Propiedades FQ
+    tpsa?: number | null;
+    hbd?: number | null;
+    hba?: number | null;
+    rotatable_bonds?: number | null;
+    heavy_atom_count?: number | null;
+    ring_count?: number | null;
+    ligand_efficiency?: number | null;
+    ligand_lipophilicity_efficiency?: number | null; // LLE: clave del contrato backend
+    affinity_threshold?: number | null;
+    // Contexto de scoring (F-21): modelo usado (target_family y pesos de
+    // stacking YA se renderizan en el DOT de ProEvaluation — no duplicar)
+    model_used?: string | null;
+    engine_used?: string | null;
+  } | null | undefined;
+}
+
+export type EvaluationProperties = NonNullable<Props["result"]>;
+
+export function ProParametersTab({ result, abrirAdmet = 0 }: Props & { abrirAdmet?: number }) {
+  const { t } = useLanguage();
+  const reading=useResultReading();
+  if (!result) {
+    return (
+      <div className="space-y-3 animate-in fade-in duration-200">
+        <div className="text-center text-slate-400 text-sm py-12 font-mono">
+          {t("pn_sin_datos_simulacion")}
+        </div>
+      </div>
+    );
+  }
+
+  // ── ¿Corrió ADMET-AI en este equipo? ─────────────────────────────────────
+  //
+  // El backend no manda una bandera; manda ausencia. Cuando el modelo no está
+  // disponible pone a `null` los cinco campos del bloque a la vez, así que la
+  // señal más fiel a lo que ocurrió es que NINGUNO tenga valor. Con eso se
+  // decide una sola cosa —¿hubo predicción, sí o no?— y todo el bloque se pinta
+  // en consecuencia, en vez de que cada campo invente su propio veredicto.
+  const admetAusente =
+    result.blood_viability_score == null &&
+    result.blood_solubility_logs == null &&
+    result.blood_ppb_category == null &&
+    result.blood_hia_permeable == null &&
+    result.blood_bbb_permeable == null;
+
+  // Si el clasificador de toxicidad llegó a correr. Es una señal PROPIA y no
+  // se deduce de ADMET: son dos modelos distintos y fallan por separado.
+  // `blood_tabpfn_estado` es null en las evaluaciones anteriores al
+  // 2026-09-04, en las que TabPFN de hecho nunca clasificó: null se trata
+  // como «no evaluado», que es lo que fue.
+  const tabpfnNoEvaluo =
+    admetAusente || result.blood_tabpfn_estado !== "evaluado";
+
+  /** Sí / no / no se midió. Nunca convierte la tercera en la segunda. */
+  const booleanoAdmet = (valor: boolean | null | undefined, si: string, no: string) =>
+    valor == null
+      ? { value: t("auto_185e750ee009"), ok: undefined as boolean | undefined, neutral: true }
+      : { value: valor ? si : no, ok: valor, neutral: false };
+
+  const drugRules = [
+    { label: t("pr_param_filtro_lipinski"), passed: result.lipinski_pass },
+    { label: t("pr_param_filtro_veber"), passed: result.veber_pass },
+    { label: t("pr_param_filtro_ghose"), passed: result.ghose_pass },
+    { label: t("pr_param_filtro_egan"), passed: result.egan_pass },
+    { label: t("pr_param_filtro_muegge"), passed: result.muegge_pass, extra: result.muegge_score != null ? `${result.muegge_score}/9` : undefined },
+    { label: t("auto_d7687bae4a5c"), extra: result.fsp3?.toFixed(2), isNeutral: true },
+  ];
+
+  const physicochemical = [
+    { label: t("pr_param_mw"), value: numeroOGuion(result.molecular_weight, 1, " g/mol") },
+    { label: t("pr_param_logp"), value: result.log_p?.toFixed(2) || "—" },
+    { label: t("pr_param_tpsa"), value: numeroOGuion(result.tpsa, 1, " Å²") },
+    { label: t("pr_param_hbd_hba"), value: `${result.hbd ?? "—"} / ${result.hba ?? "—"}` },
+    { label: t("pr_param_rotatable_bonds"), value: result.rotatable_bonds?.toString() || "—" },
+    { label: t("pn_atomos_pesados"), value: result.heavy_atom_count?.toString() || "—" },
+    { label: t("pr_param_rings"), value: result.ring_count?.toString() || "—" },
+    { key: "ligand_efficiency", label: t("pr_param_le"), value: result.ligand_efficiency?.toFixed(3) || "—" },
+    { key: "ligand_lipophilicity_efficiency", label: t("pr_param_lle"), value: result.ligand_lipophilicity_efficiency?.toFixed(2) ?? "—" },
+    { key: "affinity_threshold", label: t("auto_e5d485629017"), value: result.affinity_threshold != null ? `${result.affinity_threshold} kcal/mol` : "—" },
+  ];
+
+  if(reading.enabled)return <ResultPropertiesPanel result={result} physicochemical={physicochemical} drugRules={drugRules} admetAbsent={admetAusente} abrirAdmet={abrirAdmet}/>;
+
+  return (
+    <div className="space-y-5 animate-in fade-in duration-200 font-sans">
+      {/* ─── Header section: QED + SA Score ─── */}
+      <div className="grid grid-cols-2 gap-3 text-sm font-mono">
+        <div className="bg-black/40 p-3.5 rounded-xl border border-white/10 space-y-1">
+          <span className="text-slate-400 block uppercase font-sans font-bold text-sm tracking-wider">{t("auto_a9c8b18d6386")}</span>
+          <span className="text-white text-base font-bold font-mono">{result.qed?.toFixed(3) || "N/A"}</span>
+        </div>
+        <div className="bg-black/40 p-3.5 rounded-xl border border-white/10 space-y-1">
+          <span className="text-slate-400 block uppercase font-sans font-bold text-sm tracking-wider">{t("auto_dec25aafa6fd")}</span>
+          <span className="text-white text-base font-bold font-mono">{result.sa_score?.toFixed(2) || "N/A"}</span>
+        </div>
+      </div>
+
+      {/* ─── Drug-likeness Rules ─── */}
+      <div className="border-t border-white/10 pt-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <h4 className="text-base font-sans font-black uppercase tracking-widest text-slate-300">
+            {t("pn_drug_likeness")}
+          </h4>
+          <span className="text-sm font-mono font-bold px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">
+            {t("pn_filtros_farmacologicos")}
+          </span>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          {drugRules.map((rule) => (
+            <div key={rule.label} className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-white/[0.02] border border-white/5 font-sans text-sm">
+              {rule.isNeutral ? (
+                <span className="text-zinc-400 font-mono">{rule.extra ?? "—"}</span>
+              ) : rule.passed == null ? (
+                <span className="text-zinc-400 text-sm">{t("c_no_registrado")}</span>
+              ) : rule.passed ? (
+                <span className="text-emerald-400 text-sm font-bold">✓</span>
+              ) : (
+                <span className="text-red-400 text-sm font-bold">✗</span>
+              )}
+              <span className="text-white/70">{rule.label}</span>
+              {rule.extra && !rule.isNeutral && (
+                <span className="text-sm font-mono text-zinc-400 ml-auto">{rule.extra}</span>
+              )}
+            </div>
+          ))}
+          {/* PAINS */}
+          <div className="flex items-center gap-2.5 px-3 py-2.5 rounded-lg bg-white/[0.02] border border-white/5 font-sans text-sm">
+            {result.is_pains == null ? (
+              <span className="text-zinc-400 text-sm">{t("c_no_registrado")}</span>
+            ) : result.is_pains ? (
+              <span className="text-red-400 text-sm font-bold">✗</span>
+            ) : (
+              <span className="text-emerald-400 text-sm font-bold">✓</span>
+            )}
+            <span className="text-white/70">{t("pr_param_pains")}</span>
+            {result.is_pains && (
+              <span className="text-sm font-mono text-rose-300 ml-auto">
+                {result.pains_matches?.length ?? 0} {t("pr_param_coincidencias")}
+              </span>
+            )}
+          </div>
+        </div>
+
+        {result.is_pains && result.pains_matches && result.pains_matches.length > 0 && (
+          <div className="px-3 py-2 rounded-lg bg-red-500/5 border border-red-500/10 space-y-1 font-mono text-sm">
+            <span className="text-rose-400 uppercase font-bold block mb-0.5 tracking-wider">{t("auto_874e265d5f11")}</span>
+            {result.pains_matches.map((p, idx) => (
+              <p key={idx} className="text-rose-300 text-base leading-6 font-sans">• {p}</p>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {/* ─── SA Reasons ─── */}
+      {result.sa_reasons && result.sa_reasons.length > 0 && (
+        <div className="bg-black/40 p-4 rounded-xl border border-white/10 text-sm space-y-1.5 font-mono">
+          <span className="text-rose-400 uppercase font-bold block mb-1 tracking-wider text-sm">
+            {t("auto_8a1bd2567fd7")}
+          </span>
+          {result.sa_reasons.map((r, idx) => (
+            <div key={idx} className="text-rose-300 font-medium text-base leading-6 font-sans">• {r}</div>
+          ))}
+        </div>
+      )}
+
+      {/* ─── Propiedades Físico-Químicas ─── */}
+      <div className="border-t border-white/10 pt-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <h4 className="text-base font-sans font-black uppercase tracking-widest text-slate-300">
+            {t("z_propiedades_fq")}
+          </h4>
+          <span className="text-sm font-mono font-bold px-2 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/25">
+            RDKit
+          </span>
+        </div>
+
+        <div className={`${readingStyles.propertiesGrid} grid grid-cols-2 gap-2`}>
+          {physicochemical.map((p) => (
+            <div key={p.label} className={`${readingStyles.propertyRow} flex justify-between items-center px-3 py-2.5 rounded-lg bg-white/[0.02] border border-white/5`}>
+              <span className="text-sm font-medium text-zinc-400 uppercase tracking-wider font-sans">{p.label}</span>
+              <span className="text-sm font-bold font-mono text-white/80">{p.value}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ─── Contexto de Scoring (F-21) ───
+          Solo campos NUEVOS (model_used/engine_used). target_family y los
+          pesos de stacking YA se renderizan en el DOT Pipeline Timeline de
+          ProEvaluation (familia + w= por etapa) — no duplicar (regla 4). */}
+      <div className="border-t border-white/10 pt-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <h4 className="text-base font-sans font-black uppercase tracking-widest text-slate-300">
+            {t("z_contexto_scoring")}
+          </h4>
+          <span className="text-sm font-mono font-bold px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">
+            {t("pr_param_ml_stacking")}
+          </span>
+        </div>
+
+        <div className="grid grid-cols-2 gap-2">
+          {[
+            {
+              label: t("pr_param_modelo_usado"),
+              value:
+                result.model_used === "family"
+                  ? t("auto_946f5d999b58")
+                  : result.model_used === "universal"
+                    ? t("pr_param_modelo_universal")
+                    : "—",
+            },
+            { label: t("c_motor"), value: result.engine_used || "—" },
+          ].map((m) => (
+            <div key={m.label} className="flex justify-between items-center px-3 py-2.5 rounded-lg bg-white/[0.02] border border-white/5">
+              <span className="text-sm font-medium text-zinc-400 uppercase tracking-wider font-sans">{m.label}</span>
+              <span className="text-sm font-bold font-mono text-white/80">{m.value}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* ─── ADMET Pharmacokinetics & MPO Profile ─── */}
+      <div className="border-t border-white/10 pt-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <h4 className="text-base font-sans font-black uppercase tracking-widest text-slate-300">
+            {t("auto_7eb24dc6b19d")}
+          </h4>
+          <span
+            className={`text-sm font-mono font-bold px-2 py-0.5 rounded border ${
+              admetAusente
+                ? "bg-white/[0.04] text-zinc-400 border-white/10"
+                : "bg-indigo-500/20 text-indigo-300 border-indigo-500/30"
+            }`}
+          >
+            {admetAusente ? t("pr_param_admet_no_disponible") : t("pr_param_admet_ai")}
+          </span>
+        </div>
+
+        {/* El hueco se explica UNA vez, arriba, y se dice qué hacer con él.
+            Sin esta línea el usuario ve cinco guiones y no sabe si su molécula
+            salió mal o si el modelo no llegó a correr.
+
+            No se nombra UNA causa: el resultado sólo trae ausencia, y desde
+            aquí no se distingue «el usuario apagó el interruptor de ADMET-AI
+            en Opciones» de «el modelo no se pudo cargar». Afirmar la que no
+            fue sería el mismo error, más pequeño, que el que se está
+            corrigiendo. */}
+        {admetAusente && (
+          <p
+            role="status"
+            className="rounded-lg border border-amber-500/20 bg-amber-500/[0.05] px-3 py-2.5 text-base leading-6 text-amber-100 font-sans"
+          >
+            {t("auto_9a8c2888bccd")}{" "}
+            <strong className="font-semibold">{t("pr_param_no")}</strong> {t("auto_f4fdb640f385")}{" "}
+            {/* Ahora SÍ hay algo que hacer. El párrafo sigue sin nombrar una causa
+                —desde aquí no se distinguen— pero sí la salida: ADMET depende sólo
+                del SMILES, así que se puede calcular sin repetir el acoplamiento. */}
+            <strong className="font-semibold">
+              {t("pn_puedes_calcularlo")}
+            </strong>
+            {t("pn_solo_smiles_no_repite")}
+          </p>
+        )}
+
+        {/* ── Liquid Orbs: Viabilidad (izq) + Solubilidad (der) ── */}
+        <div className="grid grid-cols-2 gap-4 py-2">
+          <div className="flex justify-center">
+            <LiquidOrb
+              value={result.blood_viability_score ?? 0}
+              unavailable={result.blood_viability_score == null}
+              unavailableNote={t("auto_2ab36069225c")}
+              absolute={numeroOGuion(result.blood_viability_score, 0, " / 100")}
+              label={t("z_perfil_sanguineo")}
+              source="ADMET-AI · heurístico"
+            />
+          </div>
+          <div className="flex justify-center">
+            <LiquidOrb
+              value={
+                result.blood_solubility_logs != null
+                  ? Math.max(0, Math.min(100, 50 + result.blood_solubility_logs * 10))
+                  : 0
+              }
+              unavailable={result.blood_solubility_logs == null}
+              unavailableNote={t("auto_2ab36069225c")}
+              absolute={
+                result.blood_solubility_logs != null
+                  ? `${result.blood_solubility_logs.toFixed(2)} logS`
+                  : "—"
+              }
+              label={t("pr_param_solubilidad")}
+              source={t("pr_param_admet_ai")}
+            />
+          </div>
+        </div>
+
+        {/* Métricas ADMET adicionales (PPB, HIA, BBB, SA) */}
+        <div className="grid grid-cols-2 gap-2 mt-2">
+          {([
+            {
+              label: t("pr_param_ppb"),
+              value: etiquetaPPB(result.blood_ppb_category, t) ?? t("auto_185e750ee009"),
+              ok: undefined,
+              neutral: true,
+            },
+            { label: t("pr_param_hia"), ...booleanoAdmet(result.blood_hia_permeable, t("auto_96ebe42068b8"), t("auto_d22dcefc76d7")) },
+            {
+              label: "BBB",
+              ...booleanoAdmet(result.blood_bbb_permeable, t("pr_param_permeable"), t("auto_f7139777c977")),
+            },
+            {
+              label: t("pr_param_cns_mpo"),
+              value: numeroOGuion(result.blood_cns_mpo, 2, " / 6"),
+              ok: (result.blood_cns_mpo ?? 0) >= 4,
+              neutral: true,
+            },
+            {
+              label: "SA Score",
+              value: numeroOGuion(result.sa_score, 1, " / 10"),
+              ok: (result.sa_score ?? 10) <= 3.5,
+              neutral: true,
+            },
+          ] as Array<{ label: string; value: string; ok?: boolean; neutral: boolean }>).map((m) => (
+            <div key={m.label} className="flex items-center justify-between px-3 py-2.5 rounded-lg bg-white/[0.02] border border-white/5">
+              <span className="text-sm font-medium text-zinc-400 font-sans">{m.label}</span>
+              <span className={`text-sm font-bold font-mono ${m.neutral ? "text-zinc-400" : m.ok ? "text-emerald-400" : "text-rose-400"}`}>{m.value}</span>
+            </div>
+          ))}
+        </div>
+
+        {/* Por qué ese veredicto de BBB: la regla que decidió, con sus números */}
+        {result.blood_bbb_motivo ? (
+          <p className="mt-2 px-3 py-2 rounded-lg bg-white/[0.02] border border-white/5 text-base leading-6 text-zinc-300 font-sans">
+            <span className="font-semibold text-zinc-400">BBB — </span>
+            {result.blood_bbb_motivo}
+          </p>
+        ) : null}
+
+        {/* Systemic Reactivity */}
+        <div className="bg-black/40 p-4 rounded-xl border border-white/10 text-sm space-y-1 font-mono">
+          <span className="text-slate-400 uppercase font-sans font-bold block mb-1 text-sm tracking-wider">
+            {t("pn_reactividad_sistemica")}
+          </span>
+          {result.blood_systemic_reactivity && result.blood_systemic_reactivity.length > 0 ? (
+            <div className="space-y-1">
+              {result.blood_systemic_reactivity.map((err, idx) => (
+                <div key={idx} className="text-rose-400 font-semibold font-mono text-sm flex items-start gap-1.5">
+                  <span>⚠</span> <span>{err}</span>
+                </div>
+              ))}
+              <p className="text-base text-rose-300 font-sans mt-1 leading-6">
+                {t("pn_reactividad_tabpfn")}
+              </p>
+            </div>
+          ) : tabpfnNoEvaluo ? (
+            /* Una lista vacía tiene DOS causas y decían lo mismo en verde:
+               «TabPFN miró y no encontró nada» y «TabPFN no llegó a mirar».
+               La segunda no es un visto bueno, y presentarla como tal es la
+               única de las dos que puede hacer daño.
+
+               La distinción se hacía con `admetAusente`, que es la señal
+               EQUIVOCADA: dice si ADMET-AI estuvo disponible, no si el
+               clasificador de toxicidad corrió. Y no corría nunca —leía un
+               campo que no existe, ver `chem/blood_viability.py`—, así que
+               con ADMET vivo esta rama no se tomaba y todo el mundo veía el
+               visto bueno verde. Ahora el backend manda su propio estado. */
+            <p className="text-zinc-300 font-semibold text-base font-sans leading-6">
+              {t("pn_toxicidad_sin_evaluar")}
+            </p>
+          ) : (
+            <p className="text-emerald-400 font-semibold text-base font-sans leading-6">
+              {t("pn_sin_alertas_reactividad")}
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

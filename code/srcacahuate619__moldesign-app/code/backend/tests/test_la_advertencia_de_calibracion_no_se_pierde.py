@@ -1,0 +1,360 @@
+"""SC-9 — la advertencia tiene que sobrevivir a todas las superficies.
+
+El nivel de calibración se calcula en un solo sitio
+(`services/targets/calibracion.py`). Eso resuelve la mitad del problema: que no
+haya cuatro definiciones distintas. La otra mitad es que el dato **llegue**, y
+esa se pierde de una forma muy concreta: alguien añade un campo al contrato, se
+propaga a tres pantallas y se olvida de la cuarta, y esa cuarta presenta un
+score sin decir que el receptor no está calibrado.
+
+Estas pruebas recorren las superficies una a una: preflight (antes de ejecutar),
+resultado (junto al número), catálogo (al elegir receptor), dossier (el
+documento que lee un revisor) y MolChat (donde el chat lanza corridas). Si
+alguien retira el campo de cualquiera de ellas, esto falla.
+
+También vigila la palabra: **«validado» no puede usarse como sinónimo de «está
+en el catálogo»**. Es el punto exacto que un revisor impugnaría.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from services.targets.calibracion import NivelDeCalibracion, estado_de_calibracion
+
+SIN_CALIBRAR = SimpleNamespace(
+    pdb_id="7E2Y",
+    name="5-HT1A",
+    chain="R",
+    structural_family="gpcr",
+    spearman_rho=None,
+    is_prepared=True,
+    hotspots=[{"name": "ASP116", "importance": 1.0}],
+    id="target-1",
+    is_private=False,
+    is_community=False,
+    grid_center_x=None,
+    grid_center_y=None,
+    grid_center_z=None,
+    grid_size_x=None,
+    grid_size_y=None,
+    grid_size_z=None,
+    cofactors_whitelist=[],
+)
+
+
+class TestAntesDeEjecutar:
+    def test_el_preflight_trae_el_control_de_calibracion(self):
+        from services.docking.preflight import build_preflight
+
+        informe = build_preflight(
+            smiles="CC(=O)Oc1ccccc1C(=O)O",
+            target_pdb_id="7E2Y",
+            chain="R",
+            target_origin="catalogo",
+            target_reference="target-1",
+            grid_center=None,
+            grid_size=None,
+            custom_hotspots=None,
+            catalog_grid_center=None,
+            catalog_grid_size=None,
+            catalog_hotspots=[],
+            cofactors_whitelist=[],
+            calibracion=estado_de_calibracion(SIN_CALIBRAR).to_dict(),
+        )
+
+        codigos = {c["code"] for c in informe["controls"]}
+        assert "CALIBRACION_RECEPTOR" in codigos
+        assert "CALIBRACION_RECEPTOR" in informe["warnings"]
+        assert informe["receptor"]["calibracion"]["nivel"] == "curado_estructural"
+
+    def test_no_calibrado_advierte_pero_no_bloquea(self):
+        """Explorar un receptor sin ρ es legítimo; creerse el número, no."""
+        from services.docking.preflight import build_preflight
+
+        informe = build_preflight(
+            smiles="CC(=O)Oc1ccccc1C(=O)O",
+            target_pdb_id="7E2Y",
+            chain="R",
+            target_origin="catalogo",
+            target_reference="target-1",
+            grid_center=None,
+            grid_size=None,
+            custom_hotspots=None,
+            catalog_grid_center=None,
+            catalog_grid_size=None,
+            catalog_hotspots=[],
+            cofactors_whitelist=[],
+            calibracion=estado_de_calibracion(SIN_CALIBRAR).to_dict(),
+        )
+
+        assert "CALIBRACION_RECEPTOR" not in informe["technical_blockers"]
+
+    def test_sin_dato_de_calibracion_se_declara_no_evaluado(self):
+        """No saber qué respaldo hay no es lo mismo que saber que lo hay."""
+        from services.docking.preflight import build_preflight
+
+        informe = build_preflight(
+            smiles="CC(=O)Oc1ccccc1C(=O)O",
+            target_pdb_id="ZZZZ",
+            chain="A",
+            target_origin="desconocido",
+            target_reference=None,
+            grid_center=None,
+            grid_size=None,
+            custom_hotspots=None,
+            catalog_grid_center=None,
+            catalog_grid_size=None,
+            catalog_hotspots=[],
+            cofactors_whitelist=[],
+            calibracion=None,
+        )
+
+        control = next(
+            c for c in informe["controls"] if c["code"] == "CALIBRACION_RECEPTOR"
+        )
+        assert control["state"] == "no_evaluado"
+
+
+class TestJuntoAlResultado:
+    def test_el_contrato_del_resultado_transporta_la_calibracion(self):
+        from core.models import EvaluationResultRead
+
+        assert "target_calibracion" in EvaluationResultRead.model_fields
+
+    def test_el_estado_del_job_congela_la_calibracion_de_la_corrida(self):
+        import inspect
+
+        from services.docking import desktop_job_status
+
+        fuente = inspect.getsource(desktop_job_status)
+        assert "target_calibracion" in fuente
+        assert "estado_de_calibracion" in fuente
+
+
+# Un receptor sin familia ni preparación: la calibración que una corrida pudo congelar al terminar.
+SIN_CURAR = SimpleNamespace(
+    pdb_id="ZZZZ", name="Hoy", structural_family=None, spearman_rho=None, is_prepared=False,
+    hotspots=[], id="target-2", is_private=False, is_community=False,
+)
+
+
+class TestElEstadoConservaLaCalibracionDeLaCorrida:
+    """`GET /evaluation/status` no puede decir hoy lo que la corrida no sabía entonces.
+
+    SC-9 congela `target_calibracion` en el snapshot de la corrida (`Repository`, al
+    terminarla). La ruta de estado la volvía a calcular con el receptor de HOY y pisaba la
+    guardada: una corrida de un receptor promovido o degradado después se explicaba con el
+    respaldo nuevo. `/evaluation/result?task_id=` ya respetaba el snapshot.
+    """
+
+    @staticmethod
+    def _corrida(**extra):
+        from tests.test_report_contract import _canonical_result_payload
+
+        payload = _canonical_result_payload()
+        payload.pop("target_calibracion", None)
+        payload.update(extra)
+        return SimpleNamespace(snapshot_json=payload, status="SUCCESS", task_id="run-A")
+
+    def test_la_calibracion_guardada_por_la_corrida_gana_sobre_la_de_hoy(self):
+        from services.docking.desktop_job_status import _serialize_run_snapshot
+
+        guardada = estado_de_calibracion(SIN_CURAR).to_dict()
+        hoy = estado_de_calibracion(SIN_CALIBRAR).to_dict()
+        # Control: las dos calibraciones difieren, o la prueba no distinguiría nada.
+        assert guardada["nivel"] != hoy["nivel"]
+
+        resultado = _serialize_run_snapshot(
+            self._corrida(target_calibracion=guardada), SimpleNamespace(target=SIN_CALIBRAR)
+        )
+
+        assert resultado.target_calibracion == guardada
+        assert resultado.target_calibracion != hoy
+
+    def test_una_corrida_sin_calibracion_guardada_conserva_la_advertencia_de_hoy(self):
+        from services.docking.desktop_job_status import _serialize_run_snapshot
+
+        resultado = _serialize_run_snapshot(self._corrida(), SimpleNamespace(target=SIN_CALIBRAR))
+
+        # Las corridas anteriores al congelado no pierden la advertencia (sería peor que repetirla).
+        assert resultado.target_calibracion == estado_de_calibracion(SIN_CALIBRAR).to_dict()
+        assert resultado.target_calibracion["requiere_advertencia"] is True
+
+    @pytest.mark.asyncio
+    async def test_el_servicio_de_estado_entrega_la_calibracion_de_la_corrida(self, monkeypatch):
+        import threading
+        from datetime import UTC, datetime
+        from uuid import uuid4
+
+        from services.docking import desktop_job_status as servicio
+        from utils.cache import LocalRuntimeStore
+
+        guardada = estado_de_calibracion(SIN_CURAR).to_dict()
+        run = self._corrida(target_calibracion=guardada)
+        molecula = SimpleNamespace(target=SIN_CALIBRAR)
+
+        class Contexto:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *args):
+                return False
+
+        class Repositorio:
+            async def get_evaluation_run(self, _task_id, _molecule_id=None):
+                return run
+
+            async def get_molecule(self, _molecule_id):
+                return molecula
+
+        monkeypatch.setattr(servicio, "get_db_session", lambda: Contexto())
+        monkeypatch.setattr(servicio, "Repository", lambda _db: Repositorio())
+        ahora = datetime.now(UTC).isoformat()
+        jobs = {"run-A": {"status": "SUCCESS", "progress": 100, "error": None, "started_at": ahora,
+                          "finished_at": ahora, "result": {"molecule_id": str(uuid4())}}}
+
+        estado = await servicio.get_desktop_job_status(
+            "run-A", jobs=jobs, lock=threading.Lock(), cache=LocalRuntimeStore()
+        )
+
+        assert estado.status == "SUCCESS"
+        assert estado.result.target_calibracion == guardada
+
+
+class TestEnElCatalogo:
+    def test_el_receptor_declara_su_respaldo(self):
+        from core.models import Target
+
+        assert "calibracion" in Target.model_fields
+
+    def test_el_listado_lo_calcula_para_cada_receptor(self):
+        import inspect
+
+        from api.routers import targets
+
+        fuente = inspect.getsource(targets.list_targets)
+        assert "estado_de_calibracion" in fuente
+
+
+class TestEnElDossier:
+    def test_la_portada_declara_el_respaldo_del_receptor(self):
+        from services.dossier.model import _respaldo_del_receptor
+
+        texto = _respaldo_del_receptor(SIN_CALIBRAR)
+
+        assert "calibrado" in texto.lower()
+        assert "validado" not in texto.lower()
+
+    def test_la_falta_de_calibracion_es_una_incertidumbre_declarada(self):
+        import inspect
+
+        from services.dossier import model
+
+        fuente = inspect.getsource(model)
+        assert "incertidumbres.insert(0, calibracion.advertencia)" in fuente
+
+
+class TestEnMolChat:
+    def test_la_corrida_lanzada_desde_el_chat_lleva_su_aviso(self):
+        from services.evaluation_submission import CorridaRegistrada
+
+        corrida = CorridaRegistrada(
+            task_id="t-1",
+            target_pdb_id="7E2Y",
+            smiles_hash="h",
+            canonical_smiles="CCO",
+            calibracion=estado_de_calibracion(SIN_CALIBRAR).to_dict(),
+        )
+
+        assert corrida.aviso_de_calibracion
+        assert "⚠️" in corrida.aviso_de_calibracion
+
+    def test_un_receptor_calibrado_no_ensucia_la_respuesta(self, monkeypatch, tmp_path):
+        import json
+        from services.docking.preparer import RECEPTOR_RECIPE_VERSION
+        from services.evaluation_submission import CorridaRegistrada
+        from services.targets import seccion_catalogo as sc
+
+        # SCI-D-001: «calibrado» exige la medida de Verificados, no una ρ suelta.
+        ruta = tmp_path / "verificados.json"
+        ruta.write_text(json.dumps({"verificados": {"7E2Y": {
+            "receta_receptor": RECEPTOR_RECIPE_VERSION, "receptor_sha256": "0" * 64,
+            "pose": {"semillas": 5, "semillas_rmsd_ok": 4, "posebusters_valida": True},
+            "calibracion": {"rho": 0.71, "ic95": [0.4, 0.86], "n": 40, "endpoint": "Ki",
+                            "panel": "CHEMBL0"},
+            "protocolo": {"exhaustiveness": 8, "num_poses": 9, "semilla": 42},
+            "condiciones": [],
+        }}}), encoding="utf-8")
+        monkeypatch.setattr(sc, "RUTA_VERIFICADOS", ruta)
+        sc._leer.cache_clear()
+        calibrado = SimpleNamespace(**{**SIN_CALIBRAR.__dict__, "spearman_rho": None})
+        corrida = CorridaRegistrada(
+            task_id="t-1",
+            target_pdb_id="7E2Y",
+            smiles_hash="h",
+            canonical_smiles="CCO",
+            calibracion=estado_de_calibracion(calibrado).to_dict(),
+        )
+
+        assert corrida.aviso_de_calibracion == ""
+        sc._leer.cache_clear()
+
+    def test_un_receptor_con_rho_suelta_si_avisa(self):
+        """La ρ de la fila no basta para callar la advertencia (SCI-D-001)."""
+        from services.evaluation_submission import CorridaRegistrada
+
+        con_rho = SimpleNamespace(**{**SIN_CALIBRAR.__dict__, "spearman_rho": 0.71})
+        corrida = CorridaRegistrada(
+            task_id="t-1", target_pdb_id="7E2Y", smiles_hash="h", canonical_smiles="CCO",
+            calibracion=estado_de_calibracion(con_rho).to_dict(),
+        )
+        assert corrida.aviso_de_calibracion
+
+    def test_el_mensaje_de_lanzamiento_antepone_el_aviso(self):
+        """LUNA-05: `run_docking` ya no lanza —propone—; el lanzamiento lo hace la
+        aprobación, y es ese mensaje el que tiene que llevar el aviso de calibración."""
+        from services.evaluation import proposals as propuestas_de_docking
+        from services.evaluation_submission import CorridaRegistrada
+
+        corrida = CorridaRegistrada(
+            task_id="t-1",
+            target_pdb_id="7E2Y",
+            smiles_hash="h",
+            canonical_smiles="CCO",
+            calibracion=estado_de_calibracion(SIN_CALIBRAR).to_dict(),
+        )
+        mensaje = propuestas_de_docking.mensaje_de_lanzamiento(corrida)
+
+        assert "⚠️" in mensaje
+        assert mensaje.index("⚠️") < mensaje.index("Todavía no hay afinidad")
+
+    def test_la_propuesta_muestra_la_calibracion_antes_de_aprobar(self):
+        """Y antes de aprobar: el control de calibración del preflight es una
+        advertencia, y la propuesta lista las advertencias para leerlas."""
+        import inspect
+
+        from services.evaluation import proposals as propuestas_de_docking
+
+        fuente = inspect.getsource(propuestas_de_docking._texto_de_la_propuesta)
+        assert '("advertencia",)' in fuente and "no_evaluado" in fuente
+
+
+class TestLaPalabraValidado:
+    @pytest.mark.parametrize(
+        "nivel",
+        [
+            NivelDeCalibracion.PIPELINE_DE_FAMILIA,
+            NivelDeCalibracion.CURADO_ESTRUCTURAL,
+            NivelDeCalibracion.SIN_CURAR,
+        ],
+    )
+    def test_ningun_texto_de_un_receptor_no_calibrado_dice_validado(self, nivel):
+        from services.targets.calibracion import ADVERTENCIA, MOTIVO, RESUMEN
+
+        junto = " ".join((RESUMEN[nivel], ADVERTENCIA[nivel], MOTIVO[nivel])).lower()
+
+        assert "validado" not in junto
+        assert "validad" not in junto, "tampoco «validada», «validados»…"

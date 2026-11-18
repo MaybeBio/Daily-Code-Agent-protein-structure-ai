@@ -1,0 +1,48 @@
+name: OmniSpatial-MultiScale CI/CD
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+
+    - name: Set up Micromamba
+      uses: mamba-org/setup-micromamba@v2 
+      with:
+        environment-file: environment.yaml
+        cache-environment: true
+
+    - name: Run Unit Tests with Coverage
+      shell: micromamba-shell {0}
+      run: |
+        export PYTHONPATH=.
+        pytest tests/ --cov=omniSpatial_multiscale --cov-report=term
+
+  docker-build:
+    runs-on: ubuntu-22.04
+    needs: test # Runs after native tests pass
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Build Docker Image
+      run: |
+        docker build -t omnispatial-multiscale:latest .
+
+    - name: Run Tests in Docker
+      run: 
+        docker run --rm omnispatial-multiscale:latest micromamba run -n omnispatial_env pytest tests/

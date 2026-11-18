@@ -1,0 +1,2913 @@
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+"""
+Core Pipeline class for automated workflow construction.
+
+Manages tool sequencing, environment switching, dependency resolution,
+and script generation for protein modeling pipelines.
+"""
+
+import os
+import sys
+import json
+import getpass
+import inspect
+import shutil
+import subprocess
+import contextvars
+from typing import Dict, List, Any, Optional, Union
+from collections import defaultdict
+from datetime import datetime
+
+from .folders import FolderManager
+from .config_manager import ConfigManager
+from .contract_enforcement import ContractViolation
+from ._layout import INTERNAL_FOLDER
+from .schedulers import get_backend, BATCH_SCHEDULERS, SchedulerBackend
+from .resource_requirements import gpu_warnings as requirement_warnings
+
+# `pip freeze` prints an editable install as the URL it was cloned from, so a clone made with a
+# token in that URL prints the token — into the group-readable output root. Every environment
+# export passes through this first, and the unredacted copy is never kept.
+_REDACT_PATTERNS = (
+    # Any userinfo in a URL, up to the last `@` before the path, so an unencoded `@` in a password cannot leak its tail.
+    "s#://[^/[:space:]]+@#://REDACTED@#g",
+    # GitLab's prefixes are followed by `-`, GitHub's classic ones by `_`. Accept either.
+    "s#(glpat|glrt|ghp|gho|ghu|ghs|ghr)[-_][A-Za-z0-9_.-]+#TOKEN-REDACTED#g",
+    "s#github_pat_[A-Za-z0-9_]+#github_pat_REDACTED#g",
+    "s#(hf_|sk-|pypi-)[A-Za-z0-9_-]{16,}#TOKEN-REDACTED#g",
+    # An anaconda.org channel token sits in the path, not the userinfo.
+    "s#/t/[A-Za-z0-9_.-]{8,}/#/t/REDACTED/#g",
+    # `KEY=value`, `key: value` and `?token=` in any case, the key ending in the secret's name, so `tokenizers==0.15` survives.
+    # Skipped on a conda pin line (`- tiktoken=0.5.1=pypi_0`), where `=` is a version, not a value.
+    "/^[[:space:]]*- [A-Za-z0-9_.-]+=[^=[:space:]]+(=[^[:space:]]*)?[[:space:]]*$/!s#([A-Za-z0-9_]*(password|passwd|token|secret|api[_-]?key|access[_-]?key))([[:space:]]*[:=][[:space:]]*)[^=[:space:]&,][^[:space:]&,]*#\\1\\3REDACTED#gI",
+)
+REDACT_SED = "  sed -E " + " ".join("-e '%s'" % p for p in _REDACT_PATTERNS)
+try:
+    from .base_config import BaseConfig, ToolOutput
+    from .combinatorics import Bundle, Each, Grouped
+    from .entities import *
+except ImportError:
+    # Fallback for direct execution
+    import sys
+    import os
+    sys.path.append(os.path.dirname(__file__))
+    from base_config import BaseConfig, ToolOutput
+    from combinatorics import Bundle, Each, Grouped
+    from entities import *
+
+import re as _re
+
+_IDENTIFIER_RE = _re.compile(r"^[A-Za-z0-9._\-]+$")
+
+
+def _validate_identifier(field: str, value: str) -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field!r} must be a non-empty string, got {value!r}")
+    if not _IDENTIFIER_RE.match(value):
+        raise ValueError(
+            f"{field!r}={value!r} contains characters outside [A-Za-z0-9._-]. "
+            "This value is interpolated into generated shell scripts and file "
+            "paths; restrict it to ASCII letters, digits, '.', '_', '-'."
+        )
+    if value in (".", "..") or value.startswith("-"):
+        raise ValueError(
+            f"{field!r}={value!r} is not allowed: must not be '.' or '..' "
+            "(path traversal) and must not start with '-' (would be parsed "
+            "as a flag by sbatch and other tools)."
+        )
+
+
+# Re-export the shared helper so existing pipeline.py callers keep working.
+# The canonical definition lives in base_config alongside _validate_freeform_string.
+from .base_config import _escape_for_double_quotes  # noqa: F401
+
+# Directive-injection guard; canonical definition lives in schedulers.py.
+from .schedulers import _memory_to_mb, _validate_directive_value
+
+
+# Module-level context variable to track active pipeline for auto-registration
+_active_pipeline: contextvars.ContextVar[Optional['Pipeline']] = contextvars.ContextVar('_active_pipeline', default=None)
+
+class Pipeline:
+    """
+    Main pipeline orchestration class.
+    
+    Manages tools, dependencies, environment switching, and script generation
+    for automated protein modeling workflows.
+    """
+    
+    def __init__(self, project: str, job: str, description: str="Description missing", on_the_fly: Optional[bool]=None, local_output: Optional[bool]=None, config: Optional[str]=None, debug: bool=False, otf: Optional[bool]=None):
+        """
+        Initialize a new pipeline instance.
+
+        Args:
+            project: Name of the folder (used for output folders)
+            job: Name of the specific job (a unique numeric id NNN will be appended to it) (used for output folders)
+            description: Optional description of what this job does
+            on_the_fly: If True, each tool's script is executed immediately when added.
+                        Useful for interactive use in Jupyter notebooks or running locally
+                        with plain Python. Skips SLURM submission on exit.
+                        If None (default), auto-detects: True when running in a Jupyter
+                        notebook (.ipynb), False otherwise.
+            otf: Alias for on_the_fly. If set (not None), takes precedence over on_the_fly.
+            local_output: If True, write output to ./outputs/ (current working
+                        directory) instead of the config-defined path.
+                        If None (default), follows on_the_fly.
+            config: Config variant name (e.g. "cluster", "colab", or any user-defined
+                        site name matching `config.<variant>.yaml`). If None (default),
+                        auto-detects: "colab" when running inside Google Colab,
+                        otherwise "cluster". Must be set before any folders or
+                        environments are resolved.
+            debug: If True, save() prints per-tool outputs and the pipeline emits
+                        a runtime snapshot under ``<output>/_debug_capture/``
+                        (mamba env exports, pip freeze, system info) when
+                        ``BIOPIPELINES_DEBUG=1`` is set in the script. Defaults
+                        to False.
+        """
+        if ' ' in job: job=job.replace(' ','_') #It will create issues at runtime otherwise
+
+        _validate_identifier("project", project)
+        _validate_identifier("job", job)
+
+        # Apply config variant before any ConfigManager-dependent code runs
+        # (FolderManager, environment loading, etc. all read through ConfigManager).
+        ConfigManager(variant=config)
+
+        self.project = project
+        self.job = job
+        self.description = description
+        self.debug = bool(debug)
+
+        if otf is not None:
+            on_the_fly = otf
+
+        if on_the_fly is None:
+            if os.environ.get("BIOPIPELINES_OTF") == "1":
+                on_the_fly = True
+            else:
+                on_the_fly = self._detect_notebook()
+        self.on_the_fly = on_the_fly
+
+        if local_output is None:
+            local_output = self._default_local_output(on_the_fly)
+        self.local_output = local_output
+
+        self.folder_manager = FolderManager(project, job, local_output=local_output)
+        self.folders = self.folder_manager.get_folders()
+        # Include resolved container paths as container:<ToolName> keys
+        for tool_name, container_path in self.folder_manager.get_containers().items():
+            self.folders[f"container:{tool_name}"] = container_path
+        # Expose bind mounts for container prefix construction
+        self.folders["__container_binds__"] = self.folder_manager.get_container_binds()
+        
+        # Tool management
+        self.tools = []
+        self.tool_outputs = []
+        # One record per (producing tool, stream) a tool consumed; see _record_input_edges.
+        self.dataflow_edges = []  # type: List[Dict[str, Any]]
+        self.execution_order = 0      # all tools, real run order
+        self.public_step_order = 0    # public tools only, drives public folder/script names
+        self.internal_order = 0       # internal tools only, drives .internal layout + ".NNN" names
+
+        # Suffix for tool folder naming
+        self.current_suffix = ""
+
+        # Stack of public subfolder names pushed by the Folder() context manager.
+        self._folder_stack = []
+
+        # Script generation
+        self.pipeline_script = ""
+        self.job_script = ""
+        self.scripts_generated = False
+
+        # Batch and resource management
+        self.batch_resources = []  # List of resource dicts, one per batch
+        self.batch_start_indices = []  # Tool indices where each batch starts
+        self.current_batch = -1  # Current batch index (-1 means no Resources() called yet)
+        # Per-batch parent indices for the dependency DAG. batch_parents[i]
+        # is the list of batch indices that batch i depends on (afterok).
+        # The chain default is [i-1] for i>0 and [] for i=0; the Parallel
+        # context manager populates this with multi-parent or shared-parent
+        # values to express fan-out / fan-in.
+        self.batch_parents = []  # type: List[List[int]]
+        # Parallel list of "after" (started, not afterok) parents per batch.
+        # Populated only by a Service block: the batch after the block waits
+        # for the service daemon to START, not finish (afterok would mean
+        # "wait for the long-running server to exit"). Emitted as a separate
+        # `after:` term in the same --dependency line.
+        self.batch_after_parents = []  # type: List[List[int]]
+
+        # Parallel-block state. Set by `with Parallel():`; consumed by the
+        # next Resources() call inside (sibling-with-shared-parent) and the
+        # next Resources() call after the block exits (fan-in).
+        self._parallel_anchor = None         # type: Optional[int]
+        self._parallel_siblings = []         # type: List[int]
+        self._parallel_after_anchor = None   # type: Optional[int]
+        self._pending_post_parents = None    # type: Optional[List[int]]
+
+        # Packed-Parallel state. In a `with Parallel(pack=N):` block the
+        # siblings are job steps inside ONE batch rather than separate jobs,
+        # so they are collected here instead of in batch_parents.
+        self._parallel_pack = None           # type: Optional[int]
+        self._pack_runs = None               # type: Optional[List[dict]]
+        self._active_run = None
+        self._packed_resources_seen = False
+        # batch index -> {"pack": N, "runs": [...]}; consumed at emission.
+        self._packed_batches = {}            # type: Dict[int, dict]
+
+        # Service-block state. Set on `with Service():` exit to the daemon's
+        # batch index; consumed by the NEXT Resources() call, which records it
+        # as an `after:` parent so that batch starts once the daemon is running.
+        self._service_anchor = None          # type: Optional[int]
+        self._pending_after_parent = None    # type: Optional[int]
+
+        # External job dependencies
+        self.external_dependencies = []  # List of external scheduler job IDs to depend on
+
+        # Context manager state
+        self._explicit_save_called = False  # Track if Save() was explicitly called
+
+        # In on_the_fly mode, activate the pipeline context immediately
+        # so tools can auto-register across notebook cells without requiring
+        # the `with` statement. Replace any previously active pipeline.
+        if self.on_the_fly:
+            _active_pipeline.set(self)
+
+    @staticmethod
+    def _default_local_output(on_the_fly: bool) -> bool:
+        """Whether results go to ``./outputs/`` when the caller did not say.
+
+        Three rules, in order. ``BIOPIPELINES_LOCAL_OUTPUT`` wins outright, because a single-node container backend (Modal, RunPod, a plain Docker GPU box) repoints ``biopipelines_output`` at a persistent mount and must not have results diverted to a cwd that dies with the container. Otherwise an interactive or notebook run defaults to local, since it usually has no shared storage. The exception is Colab, where the config deliberately points ``biopipelines_output`` at mounted Drive for persistence, so forcing local output would replace it with an ephemeral cwd lost on runtime recycle -- there the config wins.
+        """
+        override = os.environ.get("BIOPIPELINES_LOCAL_OUTPUT")
+        if override is not None:
+            return override == "1"
+        return on_the_fly and ConfigManager().get_scheduler() != "colab"
+
+    @staticmethod
+    def _detect_notebook() -> bool:
+        """
+        Detect whether the pipeline is being run from a Jupyter notebook.
+
+        Checks the call stack for IPython's interactiveshell module,
+        which is present when code executes inside a Jupyter notebook.
+
+        Returns:
+            True if running inside a Jupyter notebook, False otherwise.
+        """
+        try:
+            from IPython import get_ipython
+            shell = get_ipython()
+            if shell is not None:
+                if (shell.__class__.__name__ == 'ZMQInteractiveShell'
+                        or shell.__class__.__module__ == 'google.colab._shell'):
+                    return True
+        except (ImportError, NameError):
+            pass
+        return False
+
+    def __enter__(self):
+        """
+        Enter context manager - set this pipeline as the active context.
+
+        Returns:
+            self (Pipeline instance)
+
+        Raises:
+            RuntimeError: If a different pipeline context is already active
+                         (nested contexts not allowed, unless on_the_fly already
+                         set this pipeline as active)
+        """
+        current_pipeline = _active_pipeline.get()
+        if current_pipeline is not None and current_pipeline is not self:
+            raise RuntimeError(
+                f"Cannot nest Pipeline contexts. "
+                f"Pipeline '{current_pipeline.project}' is already active."
+            )
+        _active_pipeline.set(self)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Exit context manager - generate job scripts or keep context alive.
+
+        In normal mode: clears the active pipeline and generates the batch
+        job scripts. In on_the_fly mode: keeps the pipeline active so
+        subsequent notebook cells can continue adding tools.
+
+        Args:
+            exc_type: Exception type if an exception occurred
+            exc_val: Exception value if an exception occurred
+            exc_tb: Exception traceback if an exception occurred
+
+        Returns:
+            False (don't suppress exceptions)
+        """
+        if self.on_the_fly:
+            # Keep the pipeline active for subsequent notebook cells
+            return False
+
+        try:
+            # Only generate scripts if no exception and Save() wasn't explicitly called
+            if exc_type is None and not self._explicit_save_called:
+                self.generate_job_scripts()
+        finally:
+            # Clear the active pipeline context
+            _active_pipeline.set(None)
+
+        return False  # Don't suppress exceptions
+
+    @staticmethod
+    def get_active_pipeline() -> Optional['Pipeline']:
+        """
+        Get the currently active pipeline context, if any.
+
+        Returns:
+            Pipeline instance if within a context manager, None otherwise
+        """
+        return _active_pipeline.get()
+
+    def set_suffix(self, suffix: str = ""):
+        """
+        Set suffix for subsequent tool folder names.
+        
+        Args:
+            suffix: Suffix to append to tool folder names (e.g., "single_point")
+                   Empty string clears the suffix.
+        
+        Example:
+            pipeline.set_suffix("single_point")
+            # Next tools will create folders like: 004_MutationComposer_single_point/
+        """
+        self.current_suffix = suffix
+    
+    def _assign_step_context(self, tool_config: BaseConfig):
+        """Bump counters, create the step folder, and set the tool's pipeline context."""
+        self.execution_order += 1
+        if tool_config.internal:
+            self.internal_order += 1
+            folder_name = f"{self.internal_order:03d}_{tool_config.TOOL_NAME}"
+            tool_output_folder = os.path.join(self.folders["output"], INTERNAL_FOLDER, folder_name)
+            os.makedirs(os.path.join(self.folders["runtime"], INTERNAL_FOLDER), exist_ok=True)
+            os.makedirs(os.path.join(self.folders["logs"], INTERNAL_FOLDER), exist_ok=True)
+            public_step, internal_order = None, self.internal_order
+        else:
+            self.public_step_order += 1
+            if self.current_suffix:
+                folder_name = f"{self.public_step_order:03d}_{tool_config.TOOL_NAME}_{self.current_suffix}"
+            else:
+                folder_name = f"{self.public_step_order:03d}_{tool_config.TOOL_NAME}"
+            tool_output_folder = os.path.join(self.folders["output"], *self._folder_stack, folder_name)
+            public_step, internal_order = self.public_step_order, None
+        os.makedirs(tool_output_folder, exist_ok=True)
+        tool_config.set_pipeline_context(
+            self, self.execution_order, tool_output_folder, self.current_suffix,
+            public_step=public_step, internal_order=internal_order
+        )
+
+    def _record_input_edges(self, tool_config: BaseConfig):
+        """Record the dataflow edges into ``tool_config``, read off its stored inputs.
+
+        Central recovery is the point: ``input_sources`` has always been the designed home for this, and 2 of 92 tools ever populated it. ``ToolOutput.output`` stamps every object it hands out with its producing config, so the consuming tool's own attributes carry the edge and the framework can read it without asking tool authors for anything.
+        """
+        from .base_config import recover_input_edges
+
+        try:
+            recovered = recover_input_edges(tool_config)
+        except Exception as e:
+            print(f"Warning: could not recover input edges for {tool_config.TOOL_NAME}: {e}")
+            return
+
+        for edge in recovered:
+            producer = edge["producer"]
+            record = {
+                "from_step": producer.execution_order,
+                "from_tool": producer.TOOL_NAME,
+                "from_internal": bool(getattr(producer, "internal", False)),
+                "to_step": tool_config.execution_order,
+                "to_tool": tool_config.TOOL_NAME,
+                "to_internal": bool(getattr(tool_config, "internal", False)),
+                "stream": edge["stream"],
+                "shape": edge["shape"],
+                "arguments": list(edge["arguments"]),
+            }
+            self.dataflow_edges.append(record)
+            if isinstance(getattr(tool_config, "input_sources", None), dict):
+                key = f"{edge['stream'] or 'output'}_from_step_{producer.execution_order}"
+                tool_config.input_sources.setdefault(key, record)
+
+    def add(self, tool_config: BaseConfig, **kwargs):
+        """
+        Add a tool to the pipeline.
+
+        Args:
+            tool_config: Configured tool instance (e.g., RFdiffusion())
+            **kwargs: Additional pipeline-specific options
+
+        Returns:
+            ToolAwareOutput object with standardized output interface and .tool access
+        """
+        # Ensure Resources() has been called before adding tools
+        if self.current_batch == -1:
+            raise RuntimeError(
+                "Resources() must be called before adding tools. "
+                "Use: with Pipeline(...): Resources(...); tool = Tool(...)"
+            )
+
+        # Merge current batch resources with tool resources
+        current_resources = self.batch_resources[self.current_batch]
+        for key, value in current_resources.items():
+            # A declined GPU is a decision, not a missing value, so the key survives the merge.
+            if value is not None or key == "gpu":
+                tool_config.resources[key] = value
+
+        # Set execution order and create step-numbered folder immediately
+        self._assign_step_context(tool_config)
+
+        # Configure inputs immediately so tool outputs are properly set
+        tool_config.configure_inputs(self.folders)
+        self._record_input_edges(tool_config)
+        
+        # Add to pipeline
+        self.tools.append(tool_config)
+        
+        # Create and configure output object
+        tool_output = ToolOutput(tool_config)
+
+        # Immediately populate expected outputs using pure path construction
+        try:
+            expected_outputs = tool_config.get_output_files()
+            # Materialize the full sub-layout (configuration/, execution/,
+            # tables/, _extras/, and one folder per declared stream) so
+            # tool authors never need to mkdir anything themselves. Runs
+            # once per tool at config time; idempotent.
+            tool_config._materialize_output_layout(expected_outputs)
+            tool_output.update_outputs(expected_outputs)
+        except ContractViolation:
+            # A promoted check must reach the user, not degrade to empty outputs.
+            raise
+        except Exception as e:
+            # If get_output_files fails, tool may need dependencies resolved first
+            # We'll populate it later during script generation
+            print(f"Warning: Could not immediately populate outputs for {tool_config.TOOL_NAME}: {e}")
+
+        self.tool_outputs.append(tool_output)
+
+        return tool_output.output
+
+    def _auto_register(self, tool_config: BaseConfig) -> ToolOutput:
+        """
+        Internal method for auto-registering tools created within a Pipeline context.
+
+        This is called automatically when a tool is instantiated within a
+        'with Pipeline() as pipeline:' context. It performs the same operations
+        as add() but is designed to be called from BaseConfig.__new__.
+
+        Args:
+            tool_config: Configured tool instance
+
+        Returns:
+            ToolOutput object for the registered tool
+        """
+        # Ensure Resources() has been called before adding tools.
+        # Resource specs (gpu/memory/time/cpus) are only meaningful for batch
+        # schedulers that consume them (slurm/lsf/pbs). In on-the-fly mode, or
+        # when the active config uses a non-batch scheduler (colab / none), we
+        # auto-initialize an empty resource batch so users don't have to
+        # type Resources() for local or Colab runs.
+        if self.current_batch == -1:
+            scheduler = ConfigManager().get_scheduler()
+            if self.on_the_fly or scheduler not in BATCH_SCHEDULERS:
+                self.resources()
+            else:
+                raise RuntimeError(
+                    "Resources() must be called before adding tools. "
+                    "Use: with Pipeline(...): Resources(...); tool = Tool(...)"
+                )
+
+        # If a Parallel() block has just exited, the next tool addition
+        # implicitly opens a new fan-in batch. Inherit the most-recent batch
+        # resources (per user spec: "default to the resources of the
+        # previous one"). _pending_post_parents is consumed inside
+        # self.resources() so the new batch's parents are the siblings
+        # rather than the chain default.
+        if self._pending_post_parents is not None:
+            self.resources()  # inherits from self.batch_resources[-1]
+
+        # Merge current batch resources with tool resources
+        current_resources = self.batch_resources[self.current_batch]
+        for key, value in current_resources.items():
+            # A declined GPU is a decision, not a missing value, so the key survives the merge.
+            if value is not None or key == "gpu":
+                tool_config.resources[key] = value
+
+        # Set execution order and create step-numbered folder
+        self._assign_step_context(tool_config)
+
+        # Configure inputs immediately
+        tool_config.configure_inputs(self.folders)
+        self._record_input_edges(tool_config)
+
+        # Add to pipeline
+        self.tools.append(tool_config)
+
+        # Create and configure output object
+        tool_output = ToolOutput(tool_config)
+
+        # Populate expected outputs and materialize the on-disk sub-layout
+        # (canonical sub-dirs + one folder per declared stream). Tools
+        # never need to mkdir anything themselves.
+        try:
+            expected_outputs = tool_config.get_output_files()
+            tool_config._materialize_output_layout(expected_outputs)
+            tool_output.update_outputs(expected_outputs)
+        except ContractViolation:
+            raise
+        except Exception as e:
+            print(f"Warning: Could not immediately populate outputs for {tool_config.TOOL_NAME}: {e}")
+
+        self.tool_outputs.append(tool_output)
+
+        # On-the-fly execution: generate and run the tool's script immediately
+        if self.on_the_fly:
+            self._execute_tool_on_the_fly(tool_config)
+
+        return tool_output
+
+    def _execute_tool_on_the_fly(self, tool_config: BaseConfig):
+        """
+        Generate and immediately execute a tool's bash script.
+
+        Called during on_the_fly mode after a tool is registered. Streams
+        stdout/stderr in real-time so output is visible in notebooks and terminals.
+
+        Args:
+            tool_config: The tool to execute
+
+        Raises:
+            RuntimeError: If the tool's script exits with a non-zero code
+        """
+        tool_script_path = os.path.join(self.folders["runtime"], f"{tool_config.script_basename}.sh")
+        log_path = os.path.join(self.folders["logs"], f"{tool_config.script_basename}.log")
+
+        # Generate the tool script
+        script_content = tool_config.generate_script(tool_script_path)
+        with open(tool_script_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(script_content)
+        os.chmod(tool_script_path, 0o755)
+
+        print(f"\n{'='*60}")
+        print(f"Running {tool_config.TOOL_NAME} (step {tool_config.execution_order})")
+        print(f"{'='*60}")
+
+        # Execute the script, streaming output in real-time
+        tool_folder_log_path = os.path.join(tool_config.output_folder, "_log")
+        with open(log_path, 'w') as log_file, open(tool_folder_log_path, 'w') as tool_folder_log:
+            process = subprocess.Popen(
+                ['bash', tool_script_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1  # Line-buffered
+            )
+            for line in process.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                log_file.write(line)
+                log_file.flush()
+                tool_folder_log.write(line)
+                tool_folder_log.flush()
+            process.wait()
+
+        if process.returncode != 0:
+            raise RuntimeError(
+                f"{tool_config.TOOL_NAME} failed with exit code {process.returncode}. "
+                f"See log: {log_path}"
+            )
+
+        print(f"{'='*60}")
+        print(f"{tool_config.TOOL_NAME} completed")
+        print(f"{'='*60}\n")
+
+        # On-the-fly has no end: __exit__ returns early so later notebook cells can keep adding tools. Refreshing here keeps the page current after every step instead of it never being written at all.
+        try:
+            # The page reads its per-step inventory from ToolOutputs/, which only save() writes; without this every card on an on-the-fly page shows the missing-inventory placeholder.
+            self._export_tool_outputs()
+            self._write_pipeline_page()
+        except Exception as exc:
+            print(f"Note: could not refresh the run page: {exc}")
+
+    def validate_pipeline(self) -> bool:
+        """
+        Validate entire pipeline for consistency and compatibility.
+
+        Only runs the deeper dependency / fan-out checks when the pipeline was
+        constructed with ``debug=True``; in normal (non-debug) usage we just
+        confirm the pipeline is non-empty.
+
+        Returns:
+            True if pipeline is valid
+
+        Raises:
+            ValueError: If pipeline has issues
+        """
+        if not self.tools:
+            raise ValueError("Pipeline is empty")
+        if not self.debug: return
+        
+        # Check tool dependencies
+        for i, tool in enumerate(self.tools):
+            for dep in tool.dependencies:
+                if isinstance(dep, BaseConfig):
+                    if dep not in self.tools[:i]:
+                        raise ValueError(
+                            f"Tool {tool.TOOL_NAME} depends on {dep.TOOL_NAME} "
+                            f"which hasn't been added yet"
+                        )
+
+        return True
+    
+    def save(self) -> str:
+        """
+        Generate and save pipeline execution script.
+
+        Set ``debug=True`` on the ``Pipeline(...)`` constructor to print per-tool
+        outputs here and to embed the runtime debug-capture block in the
+        generated bash.
+
+        Returns:
+            Path to generated pipeline script
+        """
+        if not self.tools:
+            raise ValueError("Cannot save empty pipeline")
+
+        # Suppress auto-submit on context exit: calling save() directly inside
+        # a `with Pipeline(...)` block is an explicit save just like Save().
+        self._explicit_save_called = True
+
+        if self.debug:
+            # Print tool outputs with execution order
+            for i, tool_output in enumerate(self.tool_outputs, 1):
+                print("="*30+f"{i}.{tool_output.config.TOOL_NAME}"+"="*30)
+                print(tool_output.output)
+
+            print("="*30+"Pipeline"+"="*30)
+        self.validate_pipeline()
+
+        # Generate pipeline script
+        script_path = os.path.join(
+            self.folders["runtime"],
+            "pipeline.sh"
+        )
+
+        script_content = self._generate_pipeline_script()
+        with open(script_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(script_content)
+        os.chmod(script_path, 0o755)
+
+        self.pipeline_script = script_path
+        self.scripts_generated = True
+
+        # Unconditional: the question "what produced this" is asked after the run, not before it.
+        from . import manifest as _manifest
+        if _manifest.write(self) is None:
+            # Silence here reads downstream as "this run predates the manifest", which sends the
+            # reader looking for a version problem instead of the real failure.
+            print("Warning: could not write manifest.json; this run has no provenance record "
+                  f"({_manifest.write.last_error})")
+
+        # Snapshot active config + per-tool inventory for forensic reproducibility
+        if self.debug:
+            self._write_debug_capture_python_artifacts()
+
+        # Export tool outputs for potential reuse with Load
+        self._export_tool_outputs()
+
+        # Self-contained HTML record of the pipeline's shape, wiring and outputs
+        self._write_pipeline_page()
+
+        # Save the original pipeline Python script to runtime folder
+        self._save_original_pipeline_script()
+
+        print(f"Pipeline saved to: {script_path}")
+        return script_path
+    
+    def _page_refresh_lines(self) -> list:
+        """Bash that refreshes RunTime/pipeline.html once the run has produced outputs.
+
+        save() writes the page at configuration time, when no completion marker exists and every node reads "pending". Without this the page stays a plan, and on a cluster nobody is there to regenerate it by hand.
+
+        It has to run under the framework environment: the job shell has only `module load miniforge3` applied, whose bare `python` has no pandas, so an unqualified interpreter imports nothing and the refresh never happens. A failure is reported rather than swallowed, because a silently unrefreshed page is indistinguishable from a run that produced no outputs.
+        """
+        repo = self.folders.get("biopipelines", "")
+        runtime = self.folders["runtime"]
+        if not repo or not self.tools:
+            return []
+        code = ("import sys; sys.path.insert(0, %r); "
+                "from biopipelines.pipeline import regenerate_pipeline_page as r; r(%r)" % (repo, runtime))
+        return [
+            "# Refresh the run page now that outputs and completion markers exist.",
+            "# A subshell, because the job shell's bare `python` has no pandas and the activation must not leak.",
+            "(",
+            self.tools[-1].activate_environment(name="biopipelines"),
+            f'python -c {code!r} || echo "WARNING: run page not refreshed; the pre-run plan page is still in place"',
+            ")",
+        ]
+
+
+    def _kill_trap_lines(self, tools) -> list:
+        """Bash that records a scheduler kill, which no other guard can see.
+
+        The PIPESTATUS guard needs the step to return, and the marker count needs the step to have written something. A SLURM TIMEOUT or a `scancel` kills the job mid-step, so neither happens: the step keeps whatever it had, and no marker at all reads as "not run yet" -- a dead step and a queued one look identical on the page, which is the defect the marker work set out to close.
+
+        SLURM sends SIGTERM before SIGKILL on both timeout and scancel, so trapping it is enough to leave a record. An OOM kill is SIGKILL and cannot be trapped; that case is still only visible in `sacct`.
+
+        A killed step is marked FAILED rather than given a state of its own: the page, the marker count and the exit path already handle FAILED, and the echo says which it was.
+        """
+        if not tools:
+            return []
+        pairs = []
+        for tool in tools:
+            markers = self._completion_marker_paths(tool)
+            pairs.append(f'"{markers["completed"]}|{markers["failed"]}"')
+        return [
+            f"BP_STEP_MARKERS=({' '.join(pairs)})",
+            "_bp_on_kill() {",
+            '  echo "Job signalled by the scheduler (timeout or scancel); marking unfinished steps FAILED."',
+            '  for _pair in "${BP_STEP_MARKERS[@]}"; do',
+            '    _done="${_pair%%|*}"; _fail="${_pair##*|}"',
+            '    [ -f "$_done" ] || [ -f "$_fail" ] || touch "$_fail"',
+            "  done",
+            *self._page_refresh_lines(),
+            "  exit 1",
+            "}",
+            "trap _bp_on_kill TERM XCPU",
+        ]
+
+    def _step_failure_guard(self, tool, indent: str = "", exit_on_failure: bool = False, successors=None) -> list:
+        """Bash that refuses to let a step's failure pass unrecorded.
+
+        A step is run as ``step.sh 2>&1 | tee log``, whose exit status is tee's and therefore always 0, so a tool that exited non-zero left the job COMPLETED and the pipeline carried on into steps whose inputs were never produced. ``${PIPESTATUS[0]}`` is the step's own status and has to be read on the very next command.
+
+        The marker matters as much as the status: a tool that exits from inside its own bash never reaches the block that writes COMPLETED or FAILED, so the step stayed unmarked -- which the run page and every downstream check read as "not run yet", indistinguishable from a step still queued.
+        """
+        markers = self._completion_marker_paths(tool)
+        lines = [
+            f'{indent}if [ ${{PIPESTATUS[0]}} -ne 0 ]; then',
+            f'{indent}  [ -f "{markers["completed"]}" ] || touch "{markers["failed"]}"',
+            f'{indent}  echo "ERROR: {tool.TOOL_NAME} exited non-zero; wrote {os.path.basename(markers["failed"])}"',
+        ]
+        # Exiting here skips the rest of this task, and an unmarked step reads as "still queued".
+        for later in successors or []:
+            later_markers = self._completion_marker_paths(later)
+            lines.append(f'{indent}  [ -f "{later_markers["completed"]}" ] || touch "{later_markers["failed"]}"')
+        if exit_on_failure:
+            lines.append(f"{indent}  exit 1")
+        else:
+            lines.append(f"{indent}  BP_FAILED_STEPS=$((BP_FAILED_STEPS + 1))")
+        lines.append(f"{indent}fi")
+        return lines
+
+    def _failed_step_exit_lines(self, tools=None) -> list:
+        """Bash that makes the scheduler agree with the markers, run after the page refresh so a failed run still gets its page.
+
+        Two different failures have to be counted. A tool that exits non-zero is caught by the per-step guard. A tool that runs to the end and finds its outputs missing writes its own FAILED marker and still exits 0 -- measured on AlphaFold, whose upstream binary died while its wrapper completed normally -- so the markers are counted as well, or that job also reports COMPLETED.
+
+        ``tools`` scopes the marker count to those steps. Every batch runs this block, and sibling batches under ``Parallel()`` share one afterok parent and so run at the same time -- a count over the whole output root made each sibling fail on the others' markers and cancel its own successors. The paths come from :meth:`_completion_marker_paths`, so the count cannot drift from where the marker is actually written.
+        """
+        if tools is None:
+            tools = self.tools
+        markers = [self._completion_marker_paths(t)["failed"] for t in tools]
+        if not markers:
+            lines = ["BP_FAILED_MARKERS=0"]
+        else:
+            array = " ".join(f'"{m}"' for m in markers)
+            lines = [
+                f"BP_MY_MARKERS=({array})",
+                "BP_FAILED_MARKERS=0",
+                'for _m in "${BP_MY_MARKERS[@]}"; do',
+                '  [ -f "$_m" ] && BP_FAILED_MARKERS=$((BP_FAILED_MARKERS + 1))',
+                "done",
+            ]
+        return lines + [
+            'if [ "${BP_FAILED_STEPS:-0}" -ne 0 ] || [ "${BP_FAILED_MARKERS:-0}" -ne 0 ]; then',
+            '  echo "Batch finished with $BP_FAILED_STEPS step(s) exiting non-zero and $BP_FAILED_MARKERS FAILED marker(s)."',
+            "  exit 1",
+            "fi",
+        ]
+
+    def _resolve_tool_outputs_and_write_configs(self):
+        """Settle every tool's inputs and outputs, then write ``RunTime/config.sh``.
+
+        Runs before any script text is built, and in order, because a tool's inputs are resolved against the outputs of the tools before it -- a later tool asked first would see nothing. A tool whose outputs cannot be determined yet is left empty rather than failed: the files do not exist until execution, so absence here is expected and not an error.
+        """
+        # Process tools in order, setting up outputs for dependencies first
+        for i, tool in enumerate(self.tools, 1):
+            # Ensure all previous tools have their outputs set up
+            for j in range(i):  # 0 to i-1 (all previous tools)
+                prev_tool = self.tools[j]
+                prev_tool_output = self.tool_outputs[j]
+                
+                # Update previous tool outputs if not already done
+                if not prev_tool_output._output_files:
+                    try:
+                        expected_outputs = prev_tool.get_output_files()
+                        prev_tool_output.update_outputs(expected_outputs)
+                    except ContractViolation:
+                        raise
+                    except Exception as e:
+                        # If we can't get outputs, create empty ones so dependencies don't fail
+                        print(f"Warning: Could not get outputs from {prev_tool.TOOL_NAME}: {e}")
+                        prev_tool_output.update_outputs({})
+            
+            # Now configure this tool's inputs (dependencies should have outputs now)
+            tool.configure_inputs(self.folders)
+            
+            # Set up this tool's outputs
+            try:
+                expected_outputs = tool.get_output_files()
+                self.tool_outputs[i-1].update_outputs(expected_outputs)
+            except ContractViolation:
+                raise
+            except Exception as e:
+                # If we can't get outputs yet, leave empty for now
+                print(f"Warning: Could not get outputs from {tool.TOOL_NAME} during pipeline setup: {e}")
+        
+        # Generate configuration display
+        config_lines = [
+            f'echo "Pipeline: {self.project}"',
+            f'echo "Job name: {self.job}"',
+            f'echo "Description: {_escape_for_double_quotes(self.description)}"',
+            'echo'
+        ]
+        
+        # Add tool configurations
+        for tool in self.tools:
+            if tool.internal:
+                label = f"Internal {tool.internal_order:03d}: {tool.TOOL_NAME}"
+            else:
+                label = f"Step {tool.public_step:03d}: {tool.TOOL_NAME}"
+            config_lines.extend([
+                f'echo "{label}"',
+                f'echo "  Environments: {tool.environments}"'
+            ])
+            
+            # Add tool-specific parameters (will be implemented in each tool)
+            tool_config = tool.get_config_display()
+            for config_line in tool_config:
+                config_lines.append(f'echo "  {config_line}"')
+            
+            config_lines.append('echo')
+        
+        # Create config script
+        config_script = os.path.join(self.folders["runtime"], "config.sh")
+        with open(config_script, 'w', encoding='utf-8', newline='\n') as f:
+            f.write("#!/bin/bash\n")
+            f.write("\n".join(config_lines))
+        os.chmod(config_script, 0o755)
+        return config_script
+    def _generate_pipeline_script(self) -> str:
+        """Generate unified pipeline script following notebook pattern."""
+        # Pipeline folders already created during initialization
+        # Just need to configure tools and generate scripts
+        
+        config_script = self._resolve_tool_outputs_and_write_configs()
+        
+        # Build main pipeline script
+        cfg = ConfigManager()
+        scheduler_init_lines = cfg.get_scheduler_init()
+        module_load = cfg.get_module_load_line()
+        script_lines = [
+            "#!/bin/bash",
+            f"# Generated pipeline: {self.project}",
+            f"# Tools: {', '.join([t.TOOL_NAME for t in self.tools])}",
+            "",
+            "umask 002  # Make all files group-writable by default",
+            "",
+        ]
+        if scheduler_init_lines:
+            # Initialise the host's shell environment (sourcing lmod's
+            # profile, etc.) so 'module' and any other host primitives
+            # exist when this script is executed standalone (i.e. outside
+            # the slurm.sh wrapper, which would have done it itself).
+            script_lines.append("# Scheduler init (machine.scheduler.init)")
+            script_lines.extend(scheduler_init_lines)
+            script_lines.append("")
+        if module_load:
+            # Needed when pipeline.sh is executed directly (outside the
+            # slurm.sh wrapper) on hosts where mamba/conda are behind an
+            # environment-module system (e.g. S3IT's miniforge3 module).
+            script_lines += [
+                "# Load cluster modules that expose the env manager on PATH",
+                module_load,
+                "",
+            ]
+        shell_hook = cfg.get_shell_hook_command()
+        if shell_hook:
+            script_lines += [
+                "# Initialize environment manager (machine.env_manager.init)",
+                shell_hook,
+                "",
+            ]
+
+        environment_capture = self._generate_environment_capture_block()
+        if environment_capture:
+            script_lines.append(environment_capture)
+            script_lines.append("")
+
+        if self.debug:
+            script_lines.append('export BIOPIPELINES_DEBUG=1')
+            script_lines.append(self._generate_debug_capture_block())
+            script_lines.append("")
+
+        script_lines += [
+            "BP_FAILED_STEPS=0",
+            *self._kill_trap_lines(self.tools),
+            "echo Configuration",
+            f"{config_script} | tee {os.path.join(self.folders['output'], f'{self.project}_config.txt')}",
+            "echo"
+        ]
+
+        # Tool scripts are written for every tool; only the invocation lines
+        # differ when the batch is a packed Parallel block.
+        packed = self._packed_batches.get(0) if len(self.batch_resources) == 1 else None
+        for tool in self.tools:
+            # Generate tool-specific script
+            tool_script_path = os.path.join(self.folders["runtime"], f"{tool.script_basename}.sh")
+            tool_script_content = tool.generate_script(tool_script_path)
+            
+            # Write tool script
+            with open(tool_script_path, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(tool_script_content)
+            os.chmod(tool_script_path, 0o755)
+            
+            # Update tool output files now that paths are correct
+            try:
+                expected_outputs = tool.get_output_files()
+                # Find the corresponding ToolOutput and update it
+                for tool_output in self.tool_outputs:
+                    if tool_output.config == tool:
+                        tool_output.update_outputs(expected_outputs)
+                        break
+            except ContractViolation:
+                raise
+            except Exception as e:
+                # Continue if output files can't be determined yet
+                # This is expected - files don't exist until execution
+                print(f"Debug: Could not determine output files for {tool.TOOL_NAME} during script generation: {e}")
+            
+            if packed:
+                continue  # invocation emitted per-task below
+
+            # Add tool execution following notebook pattern
+            log_file = os.path.join(self.folders["logs"], f"{tool.script_basename}.log")
+            tool_folder_log = os.path.join(tool.output_folder, "_log")
+            script_lines.extend([
+                f"echo {tool.TOOL_NAME}",
+                f"{self._edf_prefix(tool)}{tool_script_path} 2>&1 | tee {log_file} {tool_folder_log}",
+                *self._step_failure_guard(tool),
+                "echo"
+            ])
+
+        if packed:
+            script_lines.extend(self._packed_body_lines(packed, self.batch_resources[0]))
+
+        # Final steps
+        script_lines.extend([
+            "echo",
+            "echo Job done",
+            f"echo Results in:",
+            f"echo {self.folders['output']}"
+        ])
+        script_lines.extend(self._page_refresh_lines())
+        script_lines.extend(self._failed_step_exit_lines())
+        
+        return "\n".join(script_lines)
+
+    def _iter_pipeline_envs(self):
+        """Unique environment names referenced by tools in this pipeline.
+
+        Order is first-seen across self.tools so the export block is
+        deterministic and easy to diff between runs.
+        """
+        seen = set()
+        ordered = []
+        for tool in self.tools:
+            for env in getattr(tool, "environments", []) or []:
+                if env and env not in seen:
+                    seen.add(env)
+                    ordered.append(env)
+        return ordered
+
+    def _iter_pipeline_containers(self):
+        """List of (tool_name, image_path) for tools that use a container."""
+        result = []
+        for tool in self.tools:
+            try:
+                if tool.uses_container():
+                    image = self.folders.get(f"container:{tool.TOOL_NAME}", "")
+                    result.append((tool.TOOL_NAME, image))
+            except Exception:
+                continue
+        return result
+
+    def _generate_debug_capture_block(self) -> str:
+        """Bash that snapshots the runtime onto disk under <output>/_debug_capture/.
+
+        Runs on the node that executes the pipeline script (login when
+        on_the_fly, compute under SLURM), so the captured GPU/driver/scheduler
+        info reflects the actual execution context. Each command is wrapped
+        so missing binaries (no nvidia-smi on a CPU node, no sinfo off SLURM,
+        etc.) write a stub instead of failing the run.
+        """
+        cm = ConfigManager()
+        env_manager = cm.get_env_manager()
+        scheduler = cm.get_scheduler()
+        try:
+            container_executor = cm.get_container_executor()
+        except Exception:
+            container_executor = ""
+
+        capture_root = os.path.join(self.folders["output"], "_debug_capture")
+        envs_dir = os.path.join(capture_root, "environments")
+        sys_dir = os.path.join(capture_root, "system")
+
+        envs = self._iter_pipeline_envs()
+        containers = self._iter_pipeline_containers()
+
+        lines = [
+            '# === BioPipelines debug capture ===',
+            # Defined again here: the unconditional capture block is skipped entirely when the
+            # pipeline names no environment, and this block must not depend on having run.
+            'bp_redact() {',
+            REDACT_SED,
+            '}',
+            'if [ "$BIOPIPELINES_DEBUG" = "1" ]; then',
+            f'  mkdir -p "{envs_dir}" "{sys_dir}"',
+            f'  echo "Capturing runtime environment to {capture_root}"',
+            '',
+            '  # System info (best-effort: missing binaries write a stub)',
+            f'  ( uname -a ) > "{sys_dir}/uname.txt" 2>&1 || echo "uname not available" > "{sys_dir}/uname.txt"',
+            f'  ( command -v nvidia-smi >/dev/null && nvidia-smi ) > "{sys_dir}/nvidia-smi.txt" 2>&1 || echo "nvidia-smi not available" > "{sys_dir}/nvidia-smi.txt"',
+            f'  ( {env_manager} --version ) > "{sys_dir}/env_manager.txt" 2>&1 || echo "{env_manager} not available" > "{sys_dir}/env_manager.txt"',
+        ]
+
+        if scheduler == "slurm":
+            lines.append(f'  ( command -v sinfo >/dev/null && sinfo -V ) > "{sys_dir}/scheduler.txt" 2>&1 || echo "sinfo not available" > "{sys_dir}/scheduler.txt"')
+        else:
+            lines.append(f'  echo "scheduler={scheduler}" > "{sys_dir}/scheduler.txt"')
+
+        if containers and container_executor:
+            lines.append(f'  ( {container_executor} --version ) > "{sys_dir}/containers.txt" 2>&1 || echo "{container_executor} not available" > "{sys_dir}/containers.txt"')
+        else:
+            lines.append(f'  echo "no containers configured for any tool in this pipeline" > "{sys_dir}/containers.txt"')
+
+        lines.append('')
+        lines.append('  # Per-environment exports (one section per unique env across tools)')
+
+        # Same redaction as the unconditional capture: `pip freeze` prints an editable install as
+        # its remote URL, token included when the clone carries one.
+        if env_manager == "pip":
+            lines.append(f'  ( set -o pipefail; ( pip freeze ) 2>&1 | bp_redact > "{envs_dir}/pip.txt" ) || echo "pip not available" > "{envs_dir}/pip.txt"')
+        elif env_manager == "venv":
+            for env in envs:
+                env_py = f'{cm.get_venv_path(env)}/bin/python'
+                lines.append(f'  ( set -o pipefail; ( "{env_py}" -m pip freeze ) 2>&1 | bp_redact > "{envs_dir}/{env}.pip.txt" ) || echo "pip freeze failed for {env}" > "{envs_dir}/{env}.pip.txt"')
+        else:
+            for env in envs:
+                env_yaml = f'{envs_dir}/{env}.yaml'
+                env_pip = f'{envs_dir}/{env}.pip.txt'
+                lines.append(f'  ( set -o pipefail; ( {env_manager} env export --no-builds -n {env} ) 2>&1 | bp_redact > "{env_yaml}" ) || echo "env export failed for {env}" > "{env_yaml}"')
+                lines.append(f'  ( set -o pipefail; ( {env_manager} run -n {env} pip freeze ) 2>&1 | bp_redact > "{env_pip}" ) || echo "pip freeze failed for {env}" > "{env_pip}"')
+
+        lines.append('  echo "Debug capture complete."')
+        lines.append('fi')
+        lines.append('# === end debug capture ===')
+        return "\n".join(lines)
+
+    def _generate_environment_capture_block(self) -> str:
+        """Bash that records which environment actually ran, on the node that ran it.
+
+        The debug capture exports with ``--no-builds``, which is right for a portable environment file and wrong for identity: two different builds of the same versions export identically. This keeps the build strings and digests the result, so an environment rebuilt between two runs shows up as a different environment instead of an identical one. One export and one ``pip freeze`` per unique env, against a run measured in minutes.
+
+        The digest, not the export, is what the manifest compares. The export is kept beside it because a digest tells you two runs differ and never tells you how.
+        """
+        cm = ConfigManager()
+        env_manager = cm.get_env_manager()
+        envs = self._iter_pipeline_envs()
+        if not envs:
+            return ""
+
+        envs_dir = os.path.join(self.folders["output"], "environments")
+        lines = [
+            '# === BioPipelines environment capture ===',
+            f'mkdir -p "{envs_dir}"',
+            'bp_digest() {',
+            '  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d" " -f1',
+            '  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d" " -f1',
+            '  else echo "unavailable"; fi',
+            '}',
+            # `pip freeze` prints an editable install as its remote URL, and a clone made with a
+            # token in the URL therefore prints the token. The output root is group-readable.
+            'bp_redact() {',
+            REDACT_SED,
+            '}',
+        ]
+        for env in envs:
+            export = f'{envs_dir}/{env}.txt'
+            digest = f'{envs_dir}/{env}.sha256'
+            # Only a successful export is digested. Hashing the failure text would produce a
+            # stable value indistinguishable from an environment identity, so two runs that both
+            # failed to export would compare as identical.
+            # A private temp file: the unredacted capture must never sit in the group-readable output root.
+            raw = '$bp_raw'
+            lines.append('bp_raw=$( umask 077; mktemp "${TMPDIR:-/tmp}/bp_env.XXXXXX" )')
+            if env_manager == "venv":
+                # The venv's own interpreter. A bare `pip freeze` is the job shell's, so every
+                # environment on a venv site would digest identically and to the wrong thing.
+                capture = (f'( "{cm.get_venv_path(env)}/bin/python" -m pip freeze ) '
+                           f'> "{raw}" 2>/dev/null')
+            elif env_manager == "pip":
+                capture = f'( pip freeze ) > "{raw}" 2>/dev/null'
+            else:
+                capture = f'( {env_manager} env export -n {env} ) > "{raw}" 2>/dev/null'
+            lines += [
+                f'if {capture}; then',
+                *([f'  ( {env_manager} run -n {env} pip freeze ) >> "{raw}" 2>/dev/null || true']
+                  if env_manager not in ("pip", "venv") else []),
+                # Only the redacted file is ever kept. A redaction that fails leaves no export at
+                # all: an unredacted one can carry the token a `pip freeze` of an editable install
+                # prints, and the output root is group-readable.
+                f'  if bp_redact < "{raw}" > "{export}" 2>/dev/null; then',
+                f'    bp_digest "{export}" > "{digest}" 2>/dev/null || rm -f "{digest}"',
+                '  else',
+                f'    echo "export withheld for {env}: could not redact credentials" > "{export}"',
+                f'    rm -f "{digest}"',
+                '  fi',
+                f'  rm -f "{raw}"',
+                'else',
+                f'  rm -f "{raw}"',
+                f'  echo "export unavailable for {env}" > "{export}"',
+                f'  rm -f "{digest}"',
+                'fi',
+            ]
+        lines.append('# === end environment capture ===')
+        return "\n".join(lines)
+
+    def _write_debug_capture_python_artifacts(self):
+        """Write Python-side debug artifacts at save() time.
+
+        The bash block captures runtime state on the execution node; this
+        writes the static, configuration-time artifacts (active config copy,
+        per-tool inventory) immediately so they exist even if the pipeline
+        is never actually executed.
+        """
+        capture_root = os.path.join(self.folders["output"], "_debug_capture")
+        os.makedirs(capture_root, exist_ok=True)
+
+        cm = ConfigManager()
+        variant = cm.get_variant()
+
+        # Snapshot the active config file
+        try:
+            src = cm._get_config_path()
+            dst = os.path.join(capture_root, f"config.{variant}.yaml")
+            shutil.copy2(src, dst)
+        except Exception as e:
+            with open(os.path.join(capture_root, "config_snapshot_error.txt"), "w") as f:
+                f.write(f"Could not copy active config: {e}\n")
+
+        # Per-tool inventory
+        try:
+            scheduler = cm.get_scheduler()
+        except Exception:
+            scheduler = "unknown"
+        try:
+            container_executor = cm.get_container_executor()
+        except Exception:
+            container_executor = ""
+
+        tools_inventory = []
+        for tool in self.tools:
+            entry = {
+                "tool_name": getattr(tool, "TOOL_NAME", tool.__class__.__name__),
+                "tool_version": getattr(tool, "TOOL_VERSION", None),
+                "class": tool.__class__.__name__,
+                "environments": list(getattr(tool, "environments", []) or []),
+                "container_image": "",
+            }
+            try:
+                if tool.uses_container():
+                    entry["container_image"] = self.folders.get(
+                        f"container:{tool.TOOL_NAME}", ""
+                    )
+            except Exception:
+                pass
+            tools_inventory.append(entry)
+
+        try:
+            from . import __version__ as _bp_version
+        except Exception:
+            _bp_version = "unknown"
+
+        inventory = {
+            "project": self.project,
+            "job": self.job,
+            "variant": variant,
+            "biopipelines_version": _bp_version,
+            "env_manager": cm.get_env_manager() if hasattr(cm, "get_env_manager") else "",
+            "scheduler": scheduler,
+            "container_executor": container_executor,
+            "tools": tools_inventory,
+        }
+        with open(os.path.join(capture_root, "tools.json"), "w") as f:
+            json.dump(inventory, f, indent=2)
+
+        # README
+        readme = (
+            "BioPipelines debug capture\n"
+            "==========================\n"
+            "Static artifacts written at save() time when Pipeline(debug=True):\n"
+            "  - config.<variant>.yaml: copy of the active config file\n"
+            "  - tools.json: biopipelines version, per-tool wrapper version,\n"
+            "    environments, container images, scheduler\n"
+            "Runtime artifacts written by the pipeline script when executed:\n"
+            "  - environments/<env>.yaml + <env>.pip.txt: env exports per unique env\n"
+            "  - system/{uname,nvidia-smi,env_manager,scheduler,containers}.txt\n"
+            "Captures runtime state on the executing node (login if on_the_fly,\n"
+            "compute under SLURM); not guaranteed to reinstall elsewhere.\n"
+        )
+        with open(os.path.join(capture_root, "README.txt"), "w") as f:
+            f.write(readme)
+
+    def generate_job_scripts(self, email: str = "auto"):
+        """
+        Generate batch job submission script(s) for the active scheduler.
+
+        If multiple batches exist (multiple Resources() calls), generates:
+        - Separate batch script for each batch
+        - Dependency placeholders so the submit wrapper chains them
+
+        Args:
+            email: Email for job notifications. Options:
+                - "auto": Automatically detect email from current username (default)
+                - "": No email notifications
+                - specific email: Use provided email address
+
+        Returns:
+            None (prints submission instructions)
+        """
+        if not self.scripts_generated:
+            self.save()
+
+        # Validate that Resources() was called
+        if self.current_batch == -1:
+            raise RuntimeError("Resources() must be called before generating job scripts")
+
+        # Handle auto email detection
+        if email == "auto":
+            email = ConfigManager().get_email()
+            if email:
+                print(f"Auto-detected email: {email}")
+            else:
+                print("Warning: No email configured. Disabling email notifications.")
+                print("Set the 'machine.email' field in your config file.")
+
+        backend = self._backend()
+        # Batch header only: job steps inherit the allocation's account.
+        email_line = (backend.email_directive(email)
+                      + backend.account_directive(ConfigManager().get_billing_account()))
+
+        num_batches = len(self.batch_resources)
+
+        # Determine if single batch or multiple batches
+        if num_batches == 1:
+            self._generate_single_batch(email_line)
+        else:
+            self._generate_multi_batch(email_line, num_batches)
+
+    def _edf_prefix(self, tool) -> str:
+        """``srun --environment=`` prefix running a tool's script in a container.
+
+        Empty unless the config maps this tool to an EDF. The whole tool script
+        is wrapped, not just its python call: the CSCS Container Engine defines
+        a *job step*, so an inner prefix would leave the env activation outside
+        the container it is meant to apply to. No ``-A`` here — the step
+        inherits the batch job's account.
+        """
+        # An install step's venv binds to its tool's image python, so it builds in that container.
+        name = getattr(tool, "_parent_tool_name", None) or tool.TOOL_NAME
+        edf = ConfigManager().get_edf(name)
+        if not edf:
+            return ""
+        return f"srun --environment={edf} "
+
+    def _register_packed_batch(self, pack: int, runs: List[dict]):
+        """Record a `Parallel(pack=N)` block's tasks against its batch."""
+        self._packed_batches[self.current_batch] = {"pack": pack, "runs": runs}
+        self._packed_resources_seen = False
+
+    def _pack_step_prefix(
+        self,
+        tool,
+        cpus: Optional[int],
+        gpus: int,
+        memory_mb: Optional[int],
+        memory_per_cpu_mb: Optional[int],
+    ) -> str:
+        """``srun`` prefix for one tool as a job step inside a packed batch.
+
+        Every tool gets a step, not just containerized ones: the step is what
+        carries the task's slice of the node. ``--exclusive`` makes concurrent
+        steps partition rather than collide, while ``--exact`` prevents each
+        step from claiming all CPUs left in the allocation.  An explicit
+        ``--cpus-per-task`` is what stops each step getting a single core.
+        Nesting a container step inside an outer task step fails to bind CPUs,
+        so the container flag goes on this same step (see skills/biopipelines/references/daint_backend.md).
+        """
+        # --nodes=1: without it a single-task step inherits the allocation's
+        # node count and warns "can't run 1 processes on N nodes".
+        parts = ["srun --exclusive --exact --nodes=1 --ntasks=1"]
+        # A zero-valued --gpus-per-task does not override an allocation-level
+        # GRES request on Slurm: the step inherits every GPU instead.  Explicitly
+        # suppress GRES for CPU-only siblings so GPU steps can start beside them.
+        parts.append(f"--gpus-per-task={gpus}" if gpus else "--gres=none")
+        if cpus:
+            parts.append(f"--cpus-per-task={cpus}")
+        if memory_mb:
+            parts.append(f"--mem={memory_mb}M")
+        elif memory_per_cpu_mb:
+            parts.append(f"--mem-per-cpu={memory_per_cpu_mb}M")
+        name = getattr(tool, "_parent_tool_name", None) or tool.TOOL_NAME
+        edf = ConfigManager().get_edf(name)
+        if edf:
+            parts.append(f"--environment={edf}")
+        return " ".join(parts) + " "
+
+    def _packed_task_cpus(self, pack: int, override: Optional[int]) -> int:
+        """Per-task CPU share: explicit, else the node's cores divided by pack.
+
+        Never returns None: a step emitted without ``--cpus-per-task`` silently
+        gets one core, so an unresolvable share must fail loudly instead.
+        """
+        if override:
+            return override
+        cores = ConfigManager().get_cores_per_node()
+        if not cores:
+            raise RuntimeError(
+                "Cannot size a packed task: machine.cores_per_node is unset and no "
+                "Run(cpus=) was given. Emitting the step without --cpus-per-task would "
+                "silently give it a single core."
+            )
+        return max(1, cores // pack)
+
+    def _packed_body_lines(self, packed: dict, resources: dict) -> List[str]:
+        """Emit a packed batch: one backgrounded subshell per task.
+
+        Tools inside a task run in sequence (each ``srun`` blocks); tasks run
+        concurrently. Exit codes are collected rather than left to `wait`, so
+        one failed task neither takes the batch down nor passes silently.
+        """
+        pack = packed["pack"]
+        runs = packed["runs"]
+        total_memory_mb = _memory_to_mb(resources.get("memory", ""))
+        cores_per_node = ConfigManager().get_cores_per_node()
+        memory_per_cpu_mb = (
+            max(1, total_memory_mb // cores_per_node)
+            if total_memory_mb and cores_per_node
+            else None
+        )
+        lines = [
+            f"# Packed Parallel block: {len(runs)} tasks, {pack} per node",
+            "_pack_pids=()",
+            "_pack_names=()",
+            "",
+        ]
+        for idx, run in enumerate(runs):
+            cpus = self._packed_task_cpus(pack, run["cpus"])
+            names = "+".join(t.TOOL_NAME for t in run["tools"])
+            lines.append(f"# task {idx + 1}/{len(runs)}: {names}")
+            lines.append("(")
+            for tool_idx, tool in enumerate(run["tools"]):
+                tool_script_path = os.path.join(self.folders["runtime"], f"{tool.script_basename}.sh")
+                log_file = os.path.join(self.folders["logs"], f"{tool.script_basename}.log")
+                tool_folder_log = os.path.join(tool.output_folder, "_log")
+                prefix = self._pack_step_prefix(
+                    tool,
+                    cpus,
+                    run["gpus"],
+                    _memory_to_mb(run["memory"]) if run["memory"] else None,
+                    memory_per_cpu_mb,
+                )
+                lines.append(f"  echo {tool.TOOL_NAME}")
+                lines.append(f"  {prefix}{tool_script_path} 2>&1 | tee {log_file} {tool_folder_log}")
+                # Exit the subshell so `wait` sees the failure; the pack's own counter takes it from there.
+                lines.extend(self._step_failure_guard(tool, indent="  ", exit_on_failure=True, successors=run["tools"][tool_idx + 1:]))
+            lines.append(") &")
+            lines.append("_pack_pids+=($!)")
+            lines.append(f'_pack_names+=("{names}")')
+            lines.append("")
+        lines.extend([
+            "_pack_failed=0",
+            'for _i in "${!_pack_pids[@]}"; do',
+            '  if ! wait "${_pack_pids[$_i]}"; then',
+            '    echo "Task failed: ${_pack_names[$_i]}"',
+            "    _pack_failed=$((_pack_failed + 1))",
+            "  fi",
+            "done",
+            'if [ "$_pack_failed" -gt 0 ]; then',
+            '  echo "$_pack_failed of ${#_pack_pids[@]} packed tasks failed"',
+            # Fold into the counter rather than exiting here: the page refresh and the exit check are
+            # appended after this body, so exiting skipped both and left the pre-run plan page.
+            '  BP_FAILED_STEPS=$((BP_FAILED_STEPS + _pack_failed))',
+            "fi",
+            "echo",
+        ])
+        return lines
+
+    def _packed_header(self, batch_idx: int) -> str:
+        """``--nodes``/``--ntasks`` directives for a packed batch, else "".
+
+        The node count is derived, not requested: ``pack`` is tasks per node,
+        so 10 tasks at pack=4 spread 4/4/2 over 3 nodes. GPUs are asked for as
+        ``--gpus-per-task`` rather than a total, which would let the scheduler
+        satisfy the count with a different node spread.
+        """
+        packed = self._packed_batches.get(batch_idx)
+        if not packed or self._backend().name != "slurm":
+            return ""
+        pack = packed["pack"]
+        runs = packed["runs"]
+        ntasks = len(runs)
+        nodes = -(-ntasks // pack)  # ceil
+        gpus = max(r["gpus"] for r in runs)
+        cm = ConfigManager()
+        per_node = cm.get_gpus_per_node()
+        lines = [
+            f"#SBATCH --nodes={nodes}",
+            f"#SBATCH --ntasks={ntasks}",
+            f"#SBATCH --ntasks-per-node={min(pack, ntasks)}",
+        ]
+        # --gpus-per-task multiplies by task count, so packing more tasks than the
+        # node has GPUs is rejected outright — a CPU-only task alongside four GPU
+        # ones asks for five. On a node-exclusive site the whole node is allocated
+        # anyway, so request its GPUs once and let each step claim what it needs.
+        if gpus and cm.get_node_exclusive() and per_node:
+            lines.append(f"#SBATCH --gres=gpu:{per_node}")
+        else:
+            lines.append(f"#SBATCH --gpus-per-task={gpus}")
+        # Pin the default so a site-level change can't turn 4/4/2 into 4/3/3.
+        lines.append("#SBATCH --distribution=block")
+        return "\n" + "\n".join(lines)
+
+    def _backend(self):
+        """Scheduler backend used for script generation.
+
+        For a batch scheduler (slurm/lsf/pbs) this is its own backend. For
+        non-batch schedulers (colab/none) we still emit an inert script (the
+        submission step is skipped, and printing is suppressed) — fall back to
+        the SLURM backend so that script keeps its historical #SBATCH form.
+        """
+        name = ConfigManager().get_scheduler()
+        if name in BATCH_SCHEDULERS:
+            return get_backend(name)
+        return get_backend("slurm")
+
+    def _is_batch_scheduler(self) -> bool:
+        return ConfigManager().get_scheduler() in BATCH_SCHEDULERS
+
+    def _scheduler_options_key(self) -> str:
+        """Resource-dict key for extra directive kwargs of the active scheduler.
+
+        ``slurm_options`` / ``lsf_options`` / ``pbs_options``. Falls back to
+        ``slurm_options`` for non-batch schedulers (where it is never read).
+        """
+        if self._is_batch_scheduler():
+            return self._backend().options_key
+        return "slurm_options"
+
+    def _batch_script_name(self, batch_idx: Optional[int] = None) -> str:
+        """Generated script filename, stemmed by the active scheduler.
+
+        SLURM keeps the historical ``slurm.sh`` / ``slurm_batch{n}.sh`` names;
+        LSF/PBS use ``lsf.sh`` / ``pbs_batch{n}.sh`` etc. The submit wrapper
+        globs the matching stem per scheduler. Non-batch schedulers
+        (colab/none) reuse the ``slurm`` stem for their inert scripts.
+        """
+        name = ConfigManager().get_scheduler()
+        stem = name if name in BATCH_SCHEDULERS else "slurm"
+        if batch_idx is None:
+            return f"{stem}.sh"
+        return f"{stem}_batch{batch_idx + 1}.sh"
+
+    def _requirement_warnings(self, batch_idx: int, tools) -> List[str]:
+        """What the tools of one batch declare in RESOURCE_REQUIREMENTS that the batch's GPU request does not meet, once per tool."""
+        request = self.batch_resources[batch_idx]["gpu"]
+        inventory = ConfigManager().get_gpu_models()
+        # A whole-node site is also the single-GPU-type case here: both mean the scheduler picks the model.
+        single_gpu_type = ConfigManager().get_node_exclusive()
+        messages: List[str] = []
+        declarations = {}
+        for tool in tools:
+            declarations.setdefault(tool.TOOL_NAME, getattr(tool, "RESOURCE_REQUIREMENTS", {}))
+        for name, declared in declarations.items():
+            messages.extend(requirement_warnings(name, request, declared, inventory, single_gpu_type))
+        return messages
+
+    def _generate_single_batch(self, email_line):
+        """Generate single batch script for the active scheduler."""
+        backend = self._backend()
+        resources = self.batch_resources[0]
+        _validate_directive_value("memory", resources["memory"])
+        _validate_directive_value("time", resources["time"])
+        gpu_line, gpu_warnings = backend.gpu_directive(resources["gpu"], resources.get("gpus", 1),
+                                                  single_gpu_type=ConfigManager().get_node_exclusive())
+        gpu_setup = backend.gpu_setup(resources["gpu"])
+        extra_directives = backend.extra_options(resources.get(backend.options_key, {}))
+        header = backend.header_directives(resources["memory"], resources["time"], "job.out")
+        dependency_line = backend.dependency_directive(list(self.external_dependencies), [])
+        cm = ConfigManager()
+        scheduler_init = cm.get_scheduler_init_block()
+        module_load = cm.get_module_load_line()
+
+        packed_header = self._packed_header(0)
+        if packed_header:
+            gpu_line = ""  # --gpus-per-task supersedes the batch-level --gpus
+
+        job_content = f"""#!/usr/bin/bash
+{gpu_line}
+{header}{extra_directives}{packed_header}{dependency_line}
+{email_line}
+
+# Make all files group-writable by default
+umask 002
+# Scheduler init (machine.scheduler.init): runs first so 'module' and
+# any other host-level shell primitives are available before module load.
+{scheduler_init}
+{gpu_setup}
+{module_load}
+
+# Execute pipeline
+{self.pipeline_script}
+"""
+        job_path = os.path.join(self.folders["runtime"], self._batch_script_name())
+        with open(job_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write(job_content)
+        os.chmod(job_path, 0o755)
+        self.job_script = job_path
+
+        # Batch scripts are meaningless without a real scheduler (Colab) — skip printing.
+        if not self._is_batch_scheduler():
+            return
+
+        for w in gpu_warnings + self._requirement_warnings(0, self.tools):
+            print(f"Warning: {w}")
+        print(f"Job script saved to: {job_path}")
+        print("="*30+"Job"+"="*30)
+        print(f"{self.project}: {self.job} ({self.folder_manager.job_id})")
+        print("="*30+"Job Script"+"="*30)
+        for line in job_content.split('\n'):
+            if line != "":
+                print(line)
+
+    def _generate_multi_batch(self, email_line, num_batches):
+        """Generate chained batch scripts with <JOBID_BATCH_NNN> dependency placeholders (one per parent in the DAG)."""
+        backend = self._backend()
+        cm = ConfigManager()
+        scheduler_init = cm.get_scheduler_init_block()
+        module_load = cm.get_module_load_line()
+        warnings: List[str] = []
+
+        # Determine batch ranges
+        batch_ranges = []
+        for batch_idx in range(num_batches):
+            start_idx = self.batch_start_indices[batch_idx]
+            end_idx = self.batch_start_indices[batch_idx + 1] if batch_idx + 1 < num_batches else len(self.tools)
+            batch_ranges.append((start_idx, end_idx))
+
+        # Generate pipeline scripts for each batch
+        for batch_idx, (start_idx, end_idx) in enumerate(batch_ranges):
+            batch_script_content = self._generate_batch_script(batch_idx, start_idx, end_idx)
+            batch_script_path = os.path.join(self.folders["runtime"], f"pipeline_batch{batch_idx + 1}.sh")
+            with open(batch_script_path, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(batch_script_content)
+            os.chmod(batch_script_path, 0o755)
+
+        # Generate per-batch scheduler scripts
+        for batch_idx in range(num_batches):
+            resources = self.batch_resources[batch_idx]
+            _validate_directive_value("memory", resources["memory"])
+            _validate_directive_value("time", resources["time"])
+            gpu_line, gpu_warnings = backend.gpu_directive(resources["gpu"], resources.get("gpus", 1),
+                                                  single_gpu_type=ConfigManager().get_node_exclusive())
+            warnings.extend(gpu_warnings)
+            warnings.extend(self._requirement_warnings(batch_idx, self.tools[batch_ranges[batch_idx][0]:batch_ranges[batch_idx][1]]))
+            gpu_setup = backend.gpu_setup(resources["gpu"])
+            extra_directives = backend.extra_options(resources.get(backend.options_key, {}))
+            header = backend.header_directives(resources["memory"], resources["time"], f"job_batch{batch_idx + 1}.out")
+
+            # Dependency directive for batch 2+ (internal DAG) and batch 1 (external).
+            # Internal: emit one <JOBID_BATCH_NNN> placeholder per parent batch.
+            # The submit script captures every batch's job id keyed by its
+            # 1-based number and substitutes each placeholder when the dependent
+            # batch is submitted (parents always have lower numbers, so they are
+            # already in the captured map by the time we substitute).
+            parents = self.batch_parents[batch_idx] if batch_idx < len(self.batch_parents) else []
+            after_parents = self.batch_after_parents[batch_idx] if batch_idx < len(self.batch_after_parents) else []
+            if parents or after_parents:
+                afterok = [f"<JOBID_BATCH_{p + 1:03d}>" for p in parents]
+                # Service: start once the daemon is RUNNING (after:), not finished.
+                after = [f"<JOBID_BATCH_{p + 1:03d}>" for p in after_parents]
+                dependency_line = backend.dependency_directive(afterok, after)
+            elif batch_idx == 0 and self.external_dependencies:
+                dependency_line = backend.dependency_directive(list(self.external_dependencies), [])
+            else:
+                dependency_line = ""
+
+            packed_header = self._packed_header(batch_idx)
+            if packed_header:
+                gpu_line = ""  # --gpus-per-task supersedes the batch-level --gpus
+
+            batch_job_content = f"""#!/usr/bin/bash
+{gpu_line}
+{header}{extra_directives}{packed_header}{dependency_line}
+{email_line}
+
+# Make all files group-writable by default
+umask 002
+# Scheduler init (machine.scheduler.init): runs first so 'module' and
+# any other host-level shell primitives are available before module load.
+{scheduler_init}
+{gpu_setup}
+{module_load}
+
+# Execute pipeline batch {batch_idx + 1}
+{os.path.join(self.folders["runtime"], f"pipeline_batch{batch_idx + 1}.sh")}
+"""
+            batch_job_path = os.path.join(self.folders["runtime"], self._batch_script_name(batch_idx))
+            with open(batch_job_path, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(batch_job_content)
+            os.chmod(batch_job_path, 0o755)
+
+        self.job_script = os.path.join(self.folders["runtime"], self._batch_script_name(0))
+
+        # Batches are meaningless without a real scheduler (Colab) — skip printing.
+        if not self._is_batch_scheduler():
+            return
+
+        for w in warnings:
+            print(f"Warning: {w}")
+        # Print summary
+        print(f"Generated {num_batches} batch job(s) with dependencies")
+        print("="*30+"Job Batches"+"="*30)
+        print(f"{self.project}: {self.job} ({self.folder_manager.job_id})")
+        for batch_idx in range(num_batches):
+            start_idx, end_idx = batch_ranges[batch_idx]
+            batch_tools = self.tools[start_idx:end_idx]
+            res = self.batch_resources[batch_idx]
+            print(f"Batch {batch_idx + 1}: Tools {start_idx + 1}-{end_idx} ({', '.join(t.TOOL_NAME for t in batch_tools)}) | GPU: {res['gpu']}, Mem: {res['memory']}, Time: {res['time']}")
+        print("="*30+"Manual Submission"+"="*30)
+        print("# Submit batches manually (replace each <JOBID_BATCH_NNN> placeholder with the captured job ID for batch NNN):")
+        for batch_idx in range(num_batches):
+            print(f"# {os.path.join(self.folders['runtime'], self._batch_script_name(batch_idx))}")
+        print("="*30+"Automatic Submission"+"="*30)
+        print(f"# Use submit script to automatically chain submissions")
+
+    def _generate_batch_script(self, batch_idx: int, start_tool_idx: int, end_tool_idx: int) -> str:
+        """Generate pipeline script for a specific batch of tools."""
+        batch_tools = self.tools[start_tool_idx:end_tool_idx]
+
+        # Build configuration display
+        config_lines = [
+            "#!/bin/bash",
+            f'echo "Pipeline: {self.project}"',
+            f'echo "Job: {self.job}"',
+            f'echo "Batch: {batch_idx + 1}"',
+            f'echo "Description: {_escape_for_double_quotes(self.description)}"',
+            'echo',
+            f'echo "Tools in this batch: {len(batch_tools)}"',
+            'echo'
+        ]
+
+        for tool in batch_tools:
+            if tool.internal:
+                label = f"Internal {tool.internal_order:03d}: {tool.TOOL_NAME}"
+            else:
+                label = f"Step {tool.public_step:03d}: {tool.TOOL_NAME}"
+            config_lines.extend([
+                f'echo "{label}"',
+                f'echo "  Environments: {tool.environments}"'
+            ])
+            tool_config = tool.get_config_display()
+            for config_line in tool_config:
+                config_lines.append(f'echo "  {config_line}"')
+            config_lines.append('echo')
+
+        # Create batch-specific config script
+        config_script = os.path.join(self.folders["runtime"], f"config_batch{batch_idx + 1}.sh")
+        with open(config_script, 'w', encoding='utf-8', newline='\n') as f:
+            f.write("#!/bin/bash\n")
+            f.write("\n".join(config_lines))
+        os.chmod(config_script, 0o755)
+
+        # Build batch pipeline script
+        cfg = ConfigManager()
+        scheduler_init_lines = cfg.get_scheduler_init()
+        module_load = cfg.get_module_load_line()
+        script_lines = [
+            "#!/bin/bash",
+            f"# Generated pipeline batch {batch_idx + 1}: {self.project}",
+            f"# Tools: {', '.join([t.TOOL_NAME for t in batch_tools])}",
+            "",
+            "umask 002  # Make all files group-writable by default",
+            "",
+        ]
+        if scheduler_init_lines:
+            script_lines.append("# Scheduler init (machine.scheduler.init)")
+            script_lines.extend(scheduler_init_lines)
+            script_lines.append("")
+        if module_load:
+            script_lines += [
+                "# Load cluster modules that expose the env manager on PATH",
+                module_load,
+                "",
+            ]
+        shell_hook = cfg.get_shell_hook_command()
+        if shell_hook:
+            script_lines += [
+                "# Initialize environment manager (machine.env_manager.init)",
+                shell_hook,
+                "",
+            ]
+
+        # A multi-batch run executes these, never RunTime/pipeline.sh, so the capture has to be
+        # here too or every mixed GPU/CPU campaign records no environment at all.
+        if batch_idx == 0:
+            environment_capture = self._generate_environment_capture_block()
+            if environment_capture:
+                script_lines.append(environment_capture)
+                script_lines.append("")
+
+        if self.debug and batch_idx == 0:
+            script_lines.append('export BIOPIPELINES_DEBUG=1')
+            script_lines.append(self._generate_debug_capture_block())
+            script_lines.append("")
+
+        packed = self._packed_batches.get(batch_idx)
+        packed_tools = [t for run in (packed["runs"] if packed else []) for t in run["tools"]]
+
+        script_lines += [
+            "BP_FAILED_STEPS=0",
+            *self._kill_trap_lines(packed_tools or batch_tools),
+            "echo Configuration",
+            f"{config_script} | tee -a {os.path.join(self.folders['output'], f'{self.project}_config.txt')}",
+            "echo"
+        ]
+
+        if packed:
+            script_lines.extend(
+                self._packed_body_lines(packed, self.batch_resources[batch_idx])
+            )
+        else:
+            # Add each tool execution (each tool handles its own environment activation)
+            for tool in batch_tools:
+                # Tool script path
+                tool_script_path = os.path.join(self.folders["runtime"], f"{tool.script_basename}.sh")
+                log_file = os.path.join(self.folders["logs"], f"{tool.script_basename}.log")
+                tool_folder_log = os.path.join(tool.output_folder, "_log")
+
+                script_lines.extend([f"echo {tool.TOOL_NAME}", f"{self._edf_prefix(tool)}{tool_script_path} 2>&1 | tee {log_file} {tool_folder_log}", *self._step_failure_guard(tool), "echo"])
+
+        # Final steps
+        script_lines.extend(["echo", f"echo Batch {batch_idx + 1} done"])
+        if batch_idx == len(self.batch_resources) - 1:  # Last batch
+            script_lines.extend(["echo", "echo All jobs complete", f"echo Results in:", f"echo {self.folders['output']}"])
+        # Every batch, not only the last: a batch that fails now exits non-zero, which cancels its
+        # afterok successors, and a run that ends there still deserves a page of what it did produce.
+        script_lines.extend(self._page_refresh_lines())
+        script_lines.extend(self._failed_step_exit_lines(packed_tools or batch_tools))
+
+        return "\n".join(script_lines)
+
+    def set_dependencies(self, job_ids: Union[str, List[str]]):
+        """
+        Set external scheduler job dependencies.
+
+        The first batch of this pipeline will wait for these jobs to complete
+        successfully before starting.
+
+        Args:
+            job_ids: Single job ID string or list of job ID strings
+                    e.g., "12345678" or ["12345678", "12345679"]
+        """
+        if isinstance(job_ids, str):
+            job_ids = [job_ids]
+        self.external_dependencies.extend(job_ids)
+
+
+    def _batch_parent_edges(self):
+        """The dependency edges the batch being opened inherits, as ``(afterok_parents, after_parents)``.
+
+        Two edge kinds are computed independently and may coexist, which is why this is not one branch: siblings of a Parallel block that follows a Service get both.
+
+        ``after_parents`` (SLURM ``after:``) means the batch waits for a Service daemon to *start* rather than finish, so that daemon must never also be an afterok parent -- hence the exclusion below. ``new_parents`` (SLURM ``afterok:``) takes the first that applies: a fan-in pending from a Parallel block that just exited, else the anchor batch when inside a Parallel block, else the previous batch.
+        """
+        after_parents = []
+        if self._parallel_anchor is not None:
+            if self._parallel_after_anchor is not None:
+                after_parents = [self._parallel_after_anchor]
+        elif self._pending_after_parent is not None:
+            after_parents = [self._pending_after_parent]
+            self._pending_after_parent = None
+
+        if self._pending_post_parents is not None:
+            new_parents = list(self._pending_post_parents)
+            self._pending_post_parents = None
+        elif self._parallel_anchor is not None:
+            self._parallel_siblings.append(self.current_batch)
+            if self._parallel_anchor >= 0 and self._parallel_anchor not in after_parents:
+                new_parents = [self._parallel_anchor]
+            else:
+                new_parents = []
+        elif after_parents:
+            # A plain batch after a Service: the daemon is its only predecessor, via after:.
+            new_parents = []
+        else:
+            new_parents = [self.current_batch - 1] if self.current_batch > 0 else []
+        return new_parents, after_parents
+    def resources(self, gpu: str = None, memory: str = None, time: str = None, cpus: int = None, gpus: int = None, **scheduler_options):
+        """
+        Configure computational resources and start a new batch.
+
+        First call: Initializes batch 0 with specified resources.
+        Subsequent calls: Start new batch, inheriting unspecified resources from previous batch.
+
+        Args:
+            gpu: GPU specification. Options:
+                - Specific models: "L4", "V100", "A100", "H100", "H200"
+                - Memory-based: "24GB", "32GB", "80GB", "96GB", "32GB|80GB|96GB" (uses --constraint)
+                - Generic: "gpu" (any available GPU)
+                - High-memory: "high-memory" (equivalent to "32GB|80GB|96GB")
+                - Exclusion: "!L4", "!V100", etc. (exclude specific model)
+                - None: Inherits from previous batch (or no GPU if first batch)
+            memory: RAM allocation (e.g., "16GB", "32GB", "64GB")
+                - None: Inherits from previous batch (or "15GB" if first batch)
+            time: Wall time limit in HH:MM:SS format (e.g., "24:00:00", "48:00:00")
+            cpus: CPUs per task → #SBATCH --cpus-per-task=<cpus>.
+                - None: Inherits from previous batch (omitted on first batch)
+            gpus: Number of GPUs → #SBATCH --gpus=<gpus> (combined with any
+                gpu= model/memory constraint). Default behaviour (None) is 1 GPU
+                whenever a gpu spec is set. Use gpus=2 to request two GPUs.
+            **scheduler_options: Additional native directive parameters for the
+                active scheduler, stored under its options key (slurm_options /
+                lsf_options / pbs_options). On SLURM:
+                - nodes=1 → #SBATCH --nodes=1
+                - ntasks_per_node=1 → #SBATCH --ntasks-per-node=1
+                - partition="gpu" → #SBATCH --partition=gpu
+                On LSF/PBS the key/value is emitted as the scheduler's native
+                flag (e.g. LSF q="normal" → #BSUB -q normal).
+
+        Examples:
+            # Specific GPU model
+            pipeline.resources(gpu="A100", memory="32GB", time="24:00:00")
+
+            # Memory-based GPU selection (uses SLURM constraints)
+            pipeline.resources(gpu="80GB", memory="16GB", time="12:00:00")
+
+            # Multiple memory options
+            pipeline.resources(gpu="32GB|80GB", memory="32GB", time="48:00:00")
+
+            # High-memory GPUs
+            pipeline.resources(gpu="high-memory", memory="64GB", time="24:00:00")
+
+            # Exclude T4 GPUs (get V100, A100, or H100)
+            pipeline.resources(gpu="!T4", memory="32GB", time="24:00:00")
+
+            # CPU-only with multiple cores and nodes
+            pipeline.resources(gpu="none", memory="128GB", time="24:00:00", cpus=32, nodes=1)
+
+            # GPU with specific CPU allocation
+            pipeline.resources(gpu="V100", memory="32GB", time="12:00:00", cpus=16)
+        """
+        # Extra kwargs are native directive knobs for the active scheduler;
+        # store them under that scheduler's options key (slurm/lsf/pbs_options)
+        # so the matching backend emits them. Defaults to slurm_options for
+        # non-batch schedulers (colab/none), where it is never read.
+        options_key = self._scheduler_options_key()
+
+        # Reject newline/CR before anything else — these would inject extra
+        # directive lines at script generation time.
+        _validate_directive_value("gpu", gpu)
+        _validate_directive_value("memory", memory)
+        _validate_directive_value("time", time)
+        _validate_directive_value("cpus", cpus)
+        for opt_key, opt_value in scheduler_options.items():
+            _validate_directive_value(f"{options_key}[{opt_key!r}]", opt_value)
+
+        if gpus is not None and (not isinstance(gpus, int) or gpus < 1):
+            raise ValueError(f"gpus must be a positive integer, got {gpus!r}")
+
+        # An integer gpu= is a count, so zero or negative would emit a directive asking for no GPU.
+        gpu_as_count = SchedulerBackend.gpu_count(gpu) if gpu is not None else None
+        if gpu_as_count is not None and gpu_as_count < 1:
+            raise ValueError(
+                f"gpu must be a positive count when given as an integer, got {gpu!r}. "
+                f"Use gpu=None or gpu='none' for a CPU-only batch."
+            )
+
+        # Start new batch
+        self.current_batch += 1
+        self.batch_start_indices.append(len(self.tools))
+
+        if self._parallel_pack is not None:
+            if self._packed_resources_seen:
+                raise RuntimeError(
+                    "Parallel(pack=N) takes a single Resources() call: it describes the "
+                    "one allocation the tasks share. Per-task resources go on Run()."
+                )
+            self._packed_resources_seen = True
+
+        new_parents, after_parents = self._batch_parent_edges()
+        self.batch_parents.append(new_parents)
+        self.batch_after_parents.append(after_parents)
+
+        # Fold first-class cpus into the options dict (maps to --cpus-per-task
+        # on SLURM; passed through verbatim on other schedulers).
+        if cpus is not None:
+            scheduler_options = {**scheduler_options, "cpus": cpus}
+
+        # Determine resources for this batch
+        if self.current_batch == 0:
+            # First batch: use provided values or defaults
+            batch_res = {
+                "gpu": gpu if gpu is not None else None,
+                "gpus": gpus if gpus is not None else 1,
+                "memory": memory if memory is not None else "15GB",
+                "time": time if time is not None else "24:00:00",
+                options_key: scheduler_options if scheduler_options else {}
+            }
+        else:
+            # Subsequent batches: inherit from previous if not specified
+            prev_res = self.batch_resources[self.current_batch - 1]
+            prev_opts = prev_res.get(options_key, {})
+            if scheduler_options:
+                merged_opts = {**prev_opts, **scheduler_options}
+            else:
+                merged_opts = prev_opts
+            batch_res = {
+                "gpu": gpu if gpu is not None else prev_res["gpu"],
+                "gpus": gpus if gpus is not None else prev_res.get("gpus", 1),
+                "memory": memory if memory is not None else prev_res["memory"],
+                "time": time if time is not None else prev_res["time"],
+                options_key: merged_opts
+            }
+
+        self.batch_resources.append(batch_res)
+
+        if self.current_batch > 0:
+            print(f"Starting batch {self.current_batch + 1} with resources: gpu={batch_res['gpu']}, memory={batch_res['memory']}, time={batch_res['time']}")
+    
+    def get_tool_outputs(self, tool_type: str = None) -> List[ToolOutput]:
+        """
+        Get outputs from tools in pipeline.
+        
+        Args:
+            tool_type: Filter by tool type (optional)
+            
+        Returns:
+            List of ToolOutput objects
+        """
+        if tool_type is None:
+            return self.tool_outputs
+        return [out for out in self.tool_outputs if out.tool_type == tool_type]
+    
+    def summary(self) -> str:
+        """Get pipeline summary."""
+        summary = [
+            f"Pipeline: {self.project}",
+            f"Tools: {len(self.tools)}",
+            ""
+        ]
+
+        for tool in self.tools:
+            n = tool.internal_order if tool.internal else tool.public_step
+            tag = f".{n:03d}" if tool.internal else f"{n:03d}"
+            summary.append(
+                f"{tag}. {tool.TOOL_NAME} ({tool.environments}) -> {tool.job_name}"
+            )
+
+        return "\n".join(summary)
+    
+    def _export_tool_outputs(self):
+        """
+        Export tool output metadata to JSON files for potential reuse with Load.
+        
+        Creates a tool_outputs/ directory with JSON files for each tool containing
+        complete output structure, configuration, and execution metadata.
+        """
+        from datetime import datetime
+        
+        # Create tool_outputs directory
+        tool_outputs_dir = os.path.join(self.folders["output"], "ToolOutputs")
+        os.makedirs(tool_outputs_dir, exist_ok=True)
+        
+        exported_count = 0
+        
+        for tool, tool_output in zip(self.tools, self.tool_outputs):
+            try:
+                # Get current output structure
+                output_structure = tool.get_output_files()
+
+                # Convert DataStream objects to dictionaries for JSON serialization
+                from .datastream import DataStream
+                from .base_config import TableInfo
+
+                for key, value in list(output_structure.items()):
+                    if isinstance(value, DataStream):
+                        output_structure[key] = value.to_dict()
+
+                # Convert TableInfo objects to dictionaries for JSON serialization
+                if 'tables' in output_structure:
+                    serializable_tables = {}
+                    for name, table_info in output_structure['tables'].items():
+                        if isinstance(table_info, TableInfo):
+                            serializable_tables[name] = table_info.to_dict()
+                        else:
+                            serializable_tables[name] = table_info
+                    output_structure['tables'] = serializable_tables
+                
+                # Build complete tool metadata
+                tool_metadata = {
+                    "tool_name": tool.TOOL_NAME,
+                    "tool_class": tool.__class__.__name__,
+                    "job_name": tool.job_name,
+                    "execution_order": tool.execution_order,
+                    "internal": tool.internal,
+                    "environments": tool.environments,
+                    "output_structure": output_structure,
+                    "configuration": {
+                        "tool_parameters": tool.to_dict(),
+                        "resources": tool.resources.copy(),
+                        "pipeline_context": {
+                            "pipeline_name": self.project,
+                            "pipeline_job_name": self.job,
+                            "pipeline_description": self.description
+                        }
+                    },
+                    "export_metadata": {
+                        "export_time": datetime.now().isoformat(),
+                        "pipeline_version": "1.0",
+                        "exported_by": "pipeline.save()"
+                    }
+                }
+                
+                # Add execution metadata placeholder (will be filled at runtime)
+                tool_metadata["execution_metadata"] = {
+                    "completion_time": None,
+                    "execution_success": None,
+                    "log_files": [],
+                    "runtime_notes": "Execution metadata will be available after pipeline execution"
+                }
+                
+                # Filename mirrors the tool's script basename (internal tools nest under .internal/)
+                output_path = os.path.join(tool_outputs_dir, f"{tool.script_basename}.json")
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+                # Save to JSON file with custom serialization
+                with open(output_path, 'w') as f:
+                    json.dump(tool_metadata, f, indent=2, default=self._json_serializer)
+                
+                exported_count += 1
+                
+            except ContractViolation:
+                raise
+            except Exception as e:
+                print(f"Warning: Could not export output metadata for {tool.TOOL_NAME}: {e}")
+                continue
+        
+        if exported_count > 0:
+            print(f"Exported {exported_count} tool output metadata files to: {tool_outputs_dir}")
+        else:
+            print("Warning: No tool output metadata could be exported")
+    
+    def _batch_of_tool_index(self, tool_index: int) -> int:
+        """Batch index owning ``tool_index``, or -1 when no batch has opened yet."""
+        batch = -1
+        for i, start in enumerate(self.batch_start_indices):
+            if start <= tool_index:
+                batch = i
+            else:
+                break
+        return batch
+
+    def _completion_marker_paths(self, tool) -> Dict[str, str]:
+        """The COMPLETED/FAILED marker paths ``pipe_check_completion`` writes for a step."""
+        folder_name = os.path.basename(tool.output_folder)
+        parent_dir = os.path.dirname(tool.output_folder)
+        if '_' in folder_name and folder_name.split('_')[0].isdigit():
+            stem = f"{folder_name.split('_')[0]}_{tool.TOOL_NAME}"
+        else:
+            stem = tool.TOOL_NAME
+        return {
+            "completed": os.path.join(parent_dir, f"{stem}_COMPLETED"),
+            "failed": os.path.join(parent_dir, f"{stem}_FAILED"),
+        }
+
+    def build_pipeline_graph(self) -> Dict[str, Any]:
+        """Serializable record of this pipeline's shape: batches, steps, and dataflow edges.
+
+        Everything here is already known to the framework at save time. The per-step output inventory is NOT duplicated: each step points at the ``ToolOutputs/<basename>.json`` that ``_export_tool_outputs`` already writes, and the page reads it from there.
+        """
+        output_root = self.folders["output"]
+
+        batches = []
+        for i, resources in enumerate(self.batch_resources):
+            start = self.batch_start_indices[i] if i < len(self.batch_start_indices) else 0
+            end = (self.batch_start_indices[i + 1]
+                   if i + 1 < len(self.batch_start_indices) else len(self.tools))
+            batches.append({
+                "index": i,
+                "resources": dict(resources),
+                "parents": list(self.batch_parents[i]) if i < len(self.batch_parents) else [],
+                "after_parents": (list(self.batch_after_parents[i])
+                                  if i < len(self.batch_after_parents) else []),
+                "packed": i in self._packed_batches,
+                "start_tool_index": start,
+                "n_tools": max(0, end - start),
+            })
+
+        steps = []
+        for index, tool in enumerate(self.tools):
+            markers = self._completion_marker_paths(tool)
+            basename = getattr(tool, "script_basename", tool.TOOL_NAME)
+            steps.append({
+                "execution_order": tool.execution_order,
+                "public_step": getattr(tool, "public_step", None),
+                "internal_order": getattr(tool, "internal_order", None),
+                "internal": bool(tool.internal),
+                "tool": tool.TOOL_NAME,
+                "tool_class": type(tool).__name__,
+                "tool_version": str(getattr(tool, "TOOL_VERSION", "") or ""),
+                "job_name": tool.job_name,
+                "suffix": getattr(tool, "suffix", ""),
+                "script_basename": basename,
+                "batch": self._batch_of_tool_index(index),
+                "output_folder": tool.output_folder,
+                "resources": dict(tool.resources),
+                "environments": list(tool.environments) if tool.environments else [],
+                "script_file": os.path.join(self.folders["runtime"], f"{basename}.sh"),
+                "log_file": os.path.join(self.folders["logs"], f"{basename}.log"),
+                "completed_marker": markers["completed"],
+                "failed_marker": markers["failed"],
+                "tool_outputs_json": os.path.join(output_root, "ToolOutputs", f"{basename}.json"),
+            })
+
+        return {
+            "schema": 1,
+            "pipeline": {
+                "project": self.project,
+                "job": self.job,
+                "description": self.description,
+                "config_variant": ConfigManager().get_variant(),
+                "scheduler": ConfigManager().get_scheduler(),
+                "on_the_fly": bool(self.on_the_fly),
+                "output_folder": output_root,
+                "runtime_folder": self.folders["runtime"],
+                "logs_folder": self.folders["logs"],
+                "saved_at": datetime.now().isoformat(timespec="seconds"),
+                "biopipelines_version": self._framework_version(),
+                "python_version": sys.version.split()[0],
+                "host": __import__("socket").gethostname(),
+            },
+            # Recorded at save time rather than resolved at render time: a page regenerated in a bare
+            # process may auto-detect a different variant than the one the pipeline actually ran under.
+            "machine": self._machine_snapshot(),
+            "batches": batches,
+            "steps": steps,
+            "edges": [dict(e) for e in self.dataflow_edges],
+        }
+
+    @staticmethod
+    def _framework_version() -> Optional[str]:
+        try:
+            from . import __version__
+            return __version__
+        except Exception:
+            return None
+
+    @staticmethod
+    def _machine_snapshot() -> Dict[str, Any]:
+        """The machine block of the active config, minus anything host-specific enough to be noise."""
+        try:
+            machine = dict((ConfigManager()._config or {}).get("machine") or {})
+        except Exception:
+            return {}
+        keep = ("scheduler", "env_manager", "modules", "partition", "account", "container_runtime",
+                "gpu", "cpus", "memory", "time_limit", "venv_root", "conda_env_root", "scratch")
+        snapshot = {}
+        for key in keep:
+            value = machine.get(key)
+            if isinstance(value, dict):
+                value = value.get("name", value)
+            if value not in (None, "", [], {}):
+                snapshot[key] = value
+        return snapshot
+
+    def _write_pipeline_page(self) -> Optional[str]:
+        """Write ``RunTime/pipeline_graph.json`` and the self-contained ``RunTime/pipeline.html``.
+
+        Failure here must never lose a saved pipeline, so everything is caught and reported as a warning.
+        """
+        graph_path = os.path.join(self.folders["runtime"], "pipeline_graph.json")
+        try:
+            graph = self.build_pipeline_graph()
+            with open(graph_path, 'w', encoding="utf-8") as f:
+                json.dump(graph, f, indent=2, default=self._json_serializer)
+        except Exception as e:
+            print(f"Warning: could not write pipeline graph: {e}")
+            return None
+
+        try:
+            page_path = render_pipeline_page(graph, os.path.join(self.folders["runtime"], "pipeline.html"))
+        except Exception as e:
+            print(f"Warning: could not write pipeline page: {e}")
+            return None
+        print(f"Pipeline page written to: {page_path}")
+        return page_path
+
+    def _json_serializer(self, obj):
+        """Custom JSON serializer for ToolOutput and other non-serializable objects."""
+        if hasattr(obj, 'to_dict'):
+            return obj.to_dict()
+        elif hasattr(obj, '__dict__'):
+            return obj.__dict__
+        else:
+            return str(obj)
+
+    def _save_original_pipeline_script(self):
+        """
+        Save the original Python pipeline script to the runtime folder.
+
+        This copies the calling script (e.g., example_pipeline.py) to the runtime
+        folder for reproducibility and debugging purposes.
+        """
+        try:
+            # Get the calling script path using inspect
+            # We need to go up the call stack to find the original script
+            current_frame = inspect.currentframe()
+            calling_frame = current_frame
+
+            # Walk up the stack to find the first frame outside this module
+            while calling_frame:
+                calling_frame = calling_frame.f_back
+                if calling_frame is None:
+                    break
+
+                frame_filename = calling_frame.f_code.co_filename
+
+                # Skip frames from this module and built-in modules
+                if (not frame_filename.endswith('pipeline.py') and
+                    not frame_filename.startswith('<') and
+                    frame_filename.endswith('.py')):
+
+                    # Found the original calling script
+                    original_script_path = os.path.abspath(frame_filename)
+
+                    if os.path.exists(original_script_path):
+                        # Get just the filename
+                        script_filename = os.path.basename(original_script_path)
+
+                        # Copy to runtime folder
+                        runtime_script_path = os.path.join(self.folders["runtime"], script_filename)
+                        shutil.copy2(original_script_path, runtime_script_path)
+
+                        print(f"Original pipeline script copied to: {runtime_script_path}")
+                        return runtime_script_path
+
+            # If we couldn't find the calling script automatically, try to find it from sys.argv
+            import sys
+            if len(sys.argv) > 0 and sys.argv[0].endswith('.py'):
+                original_script_path = os.path.abspath(sys.argv[0])
+                if os.path.exists(original_script_path):
+                    script_filename = os.path.basename(original_script_path)
+                    runtime_script_path = os.path.join(self.folders["runtime"], script_filename)
+                    shutil.copy2(original_script_path, runtime_script_path)
+                    print(f"Original pipeline script copied to: {runtime_script_path}")
+                    return runtime_script_path
+
+            print("Warning: Could not automatically detect original pipeline script")
+
+        except Exception as e:
+            print(f"Warning: Could not save original pipeline script: {e}")
+
+        return None
+
+
+def _load_page_renderer():
+    """Load ``renderers/pipeline_report.py`` by path, the way stream renderers are loaded."""
+    import importlib.util
+
+    # The renderers live inside the package, so this resolves the same from a
+    # clone and from site-packages.
+    package_dir = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(package_dir, "renderers", "pipeline_report.py")
+    if not os.path.isfile(script):
+        raise FileNotFoundError(f"page renderer not found: {script}")
+    spec = importlib.util.spec_from_file_location("bp_pipeline_report", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def render_pipeline_page(graph: Dict[str, Any], out_path: str,
+                         allow_external: bool = False) -> str:
+    """Render ``graph`` to a self-contained HTML page at ``out_path`` and return the path.
+
+    The 3D viewers come from the vendored py3Dmol copy and need no network. ``allow_external=True`` only matters for renderer output that fetches from the network, including the CDN fallback used when that vendored copy is absent.
+    """
+    return _load_page_renderer().render_page(graph, out_path, allow_external=allow_external)
+
+
+def regenerate_pipeline_page(runtime_folder: str, allow_external: bool = False) -> str:
+    """Rebuild ``<runtime_folder>/pipeline.html`` from the graph saved beside it.
+
+    Run this after the pipeline has executed: the page reads the same ``ToolOutputs/*.json`` and on-disk outputs, so a page written at save time (everything pending) and one written afterwards (outputs rendered) come from one code path.
+    """
+    graph_path = os.path.join(runtime_folder, "pipeline_graph.json")
+    if not os.path.isfile(graph_path):
+        raise FileNotFoundError(
+            f"No pipeline_graph.json in {runtime_folder}. It is written by "
+            f"pipeline.save(); regeneration needs it to know the pipeline's shape."
+        )
+    with open(graph_path, encoding="utf-8") as f:
+        graph = json.load(f)
+    return render_pipeline_page(graph, os.path.join(runtime_folder, "pipeline.html"),
+                               allow_external=allow_external)
+
+
+# Module-level convenience functions for use within Pipeline context
+def Resources(**kwargs):
+    """
+    Set global resources for all tools in the active pipeline.
+
+    Must be called within a Pipeline context manager.
+
+    Args:
+        gpu: GPU memory ("T4", "L4", "V100", "A100", "H100", "H200", "16GB", "24GB", "32GB", "80GB", "96GB", "32GB|80GB|96GB", "!L4", "gpu", "high-memory", None))
+        memory: System RAM (e.g., "16GB", "32GB")
+        time: Wall time limit (e.g., "24:00:00", "2:00:00", "1-00:00:00")
+        cpus: CPUs per task (SLURM --cpus-per-task; translated per scheduler)
+
+    Example:
+        with Pipeline("Test", "Job", "Description"):
+            Resources(gpu="32GB", memory="16GB", time="24:00:00", cpus=8)
+            tool1 = SomeTool(...)
+
+    Raises:
+        RuntimeError: If called outside a Pipeline context
+    """
+    pipeline = Pipeline.get_active_pipeline()
+    if pipeline is None:
+        raise RuntimeError(
+            "Resources() must be called within a Pipeline context. "
+            "Use: with Pipeline(...): Resources(...)"
+        )
+    pipeline.resources(**kwargs)
+
+
+def Suffix(suffix: str = ""):
+    """
+    Set suffix for subsequent tool folder names in the active pipeline.
+
+    Must be called within a Pipeline context manager.
+
+    Args:
+        suffix: Suffix to append to tool folder names (e.g., "001", "batch1")
+               Empty string clears the suffix.
+
+    Example:
+        with Pipeline("Test", "Job", "Description"):
+            Suffix("001")
+            tool1 = SomeTool(...)  # Creates folder like: 001_SomeTool_001
+
+            Suffix("002")
+            tool2 = OtherTool(...)  # Creates folder like: 002_OtherTool_002
+
+    Raises:
+        RuntimeError: If called outside a Pipeline context
+    """
+    pipeline = Pipeline.get_active_pipeline()
+    if pipeline is None:
+        raise RuntimeError(
+            "Suffix() must be called within a Pipeline context. "
+            "Use: with Pipeline(...): Suffix('...')"
+        )
+    pipeline.set_suffix(suffix)
+
+
+def Save():
+    """
+    Save pipeline configuration without generating job scripts.
+
+    Must be called within a Pipeline context manager. Useful if you want
+    to save the pipeline but not submit it immediately.
+
+    Example:
+        with Pipeline("Test", "Job", "Description"):
+            tool1 = SomeTool(...)
+            Save()  # Saves but doesn't submit
+
+    Note: Calling Save() prevents auto-submission on context exit.
+
+    Raises:
+        RuntimeError: If called outside a Pipeline context
+    """
+    pipeline = Pipeline.get_active_pipeline()
+    if pipeline is None:
+        raise RuntimeError(
+            "Save() must be called within a Pipeline context. "
+            "Use: with Pipeline(...): Save()"
+        )
+    # save() itself sets _explicit_save_called so auto-submit is suppressed.
+    pipeline.save()
+
+
+def Dependencies(job_ids: Union[str, List[str]]):
+    """
+    Set external scheduler job dependencies for the active pipeline.
+
+    The first batch of this pipeline will wait for the specified jobs to
+    complete successfully before starting.
+
+    Must be called within a Pipeline context manager.
+
+    Args:
+        job_ids: Single job ID string or list of job ID strings
+                e.g., "12345678" or ["12345678", "12345679"]
+
+    Example:
+        with Pipeline("Test", "Job", "Description"):
+            Dependencies("12345678")  # Wait for job 12345678
+            Resources(gpu="A100", memory="16GB", time="24:00:00")
+            tool1 = SomeTool(...)
+
+        # Or with multiple dependencies:
+        with Pipeline("Test", "Job", "Description"):
+            Dependencies(["12345678", "12345679"])
+            Resources(gpu="A100", memory="16GB", time="24:00:00")
+            tool1 = SomeTool(...)
+
+    Raises:
+        RuntimeError: If called outside a Pipeline context
+    """
+    pipeline = Pipeline.get_active_pipeline()
+    if pipeline is None:
+        raise RuntimeError(
+            "Dependencies() must be called within a Pipeline context. "
+            "Use: with Pipeline(...): Dependencies(...)"
+        )
+    if pipeline._parallel_anchor is not None:
+        raise RuntimeError(
+            "Dependencies() cannot be called inside a `with Parallel():` "
+            "block. The block's structural rules already determine "
+            "intra-block (sibling-with-shared-parent) and post-block "
+            "(fan-in) dependencies; an explicit Dependencies() call would "
+            "be ambiguous. Move the Dependencies() call outside the block."
+        )
+    if pipeline._service_anchor is not None:
+        raise RuntimeError(
+            "Dependencies() cannot be called inside a `with Service():` block."
+        )
+    pipeline.set_dependencies(job_ids)
+
+
+class Parallel:
+    """Context manager that runs the batches inside it as parallel siblings.
+
+    Use it to express a fan-out / fan-in pattern. Every Resources() call
+    inside the block opens a batch whose only dependency is the
+    batch that was current immediately before the block (the "anchor"),
+    so the sibling batches run in parallel rather than chained. The first
+    Resources() call after the block exits opens a fan-in batch that
+    waits for all siblings to finish. If the block sits at the top of the
+    pipeline (no batch before it), the siblings simply have no upstream
+    dependency.
+
+    Each iteration MUST call Resources() to open its own sibling batch.
+    Tools (including entity tools used as kwargs, e.g. Ligand("LIG")
+    inside BoltzGen(ligand=Ligand("LIG"), ...)) then land in that batch.
+
+    Example
+    -------
+    Run RFdiffusion 10 times in parallel and gather the outputs with Pool::
+
+        with Pipeline(...):
+            Resources(...)
+            PreLoopTool(...)                  # batch 1
+            runs = []
+            with Parallel():
+                for i in range(10):
+                    Resources(gpu="A100")     # batches 2..11, all depend on batch 1
+                    runs.append(RFdiffusion(...))
+            Resources(...)                    # batch 12, depends on batches 2..11
+            combined = Pool(runs=runs)        # 100 dense ids + pool.path
+
+    Notes
+    -----
+    * Dependencies() inside the block raises — the structural rules
+      already determine all dependencies.
+    * Nesting Parallel() blocks is not supported in this version.
+
+    Packing (``pack=N``)
+    -------------------
+    On a machine whose nodes are allocated whole (``machine.node_exclusive``,
+    e.g. CSCS Daint), one sibling per job wastes the rest of the node. ``pack=N``
+    instead emits ONE job whose siblings are concurrent job steps, N per node::
+
+        with Parallel(pack=4):
+            Resources(gpu="gh", time="06:00:00")   # the allocation
+            for lig in ligands:
+                with Run():                        # one task in it
+                    Boltz2(ligand=lig, ...)
+
+    ``N`` is tasks per node, so the node count is derived: 10 iterations at
+    ``pack=4`` gives ``--nodes=3 --ntasks=10 --ntasks-per-node=4`` (4/4/2).
+    Each ``Run()`` becomes a backgrounded subshell and each tool inside it its
+    own ``srun`` step, so per-tool container selection still applies and a
+    ``Run()`` may mix containerized and plain tools.
+
+    Inside a packed block ``Resources()`` describes the allocation and is
+    called ONCE; ``Run()`` delimits a task. See skills/biopipelines/references/daint_backend.md for the probes
+    that fixed this shape.
+
+    Packing requires ``machine.node_exclusive``, a positive
+    ``machine.cores_per_node``, and — for GPU tasks — ``machine.gpus_per_node``,
+    on a SLURM scheduler. Each is checked as the block opens, so a machine that
+    cannot pack says so at config time rather than after the allocation lands.
+    """
+
+    def __init__(self, pack: Optional[int] = None):
+        if pack is not None:
+            if not isinstance(pack, int) or isinstance(pack, bool) or pack < 1:
+                raise ValueError(
+                    f"Parallel(pack=) must be a positive integer (tasks per node), got {pack!r}."
+                )
+        self.pack = pack
+
+    def _validate_machine_supports_packing(self, pipeline):
+        """Refuse ``pack=`` unless the machine declares the geometry it needs.
+
+        Packing only pays off where a job is billed for a whole node anyway,
+        and a step with no ``--cpus-per-task`` silently gets ONE core — so an
+        undeclared ``cores_per_node`` would run correctly and ~N times too
+        slowly. Both are config-time errors rather than post-submission ones.
+        """
+        cm = ConfigManager()
+        scheduler = cm.get_scheduler()
+        if scheduler != "slurm":
+            raise RuntimeError(
+                f"Parallel(pack=N) emits srun job steps, which are SLURM-specific, "
+                f"but this config's scheduler is '{scheduler}'. Use a plain Parallel() block."
+            )
+        if not cm.get_node_exclusive():
+            raise RuntimeError(
+                "Parallel(pack=N) requires machine.node_exclusive: true — packing tasks "
+                "onto a node only pays off where the scheduler bills whole nodes. "
+                "Use a plain Parallel() block instead."
+            )
+        cores = cm.get_cores_per_node()
+        if not cores or cores < 1:
+            raise RuntimeError(
+                "Parallel(pack=N) requires machine.cores_per_node (a positive integer): "
+                "it is what divides the node between the tasks. Without it every job step "
+                "silently gets a single core."
+            )
+
+    def _validate_gpu_geometry(self, pipeline, runs):
+        """A packed block asking for GPUs needs the node's GPU count declared.
+
+        Checked on exit, since what the tasks request is only known once the
+        ``Run()`` blocks have closed.
+        """
+        if not any(r["gpus"] for r in runs):
+            return
+        cm = ConfigManager()
+        per_node = cm.get_gpus_per_node()
+        if not per_node or per_node < 1:
+            raise RuntimeError(
+                "Parallel(pack=N) with GPU tasks requires machine.gpus_per_node "
+                "(a positive integer): on a node-exclusive machine the node's GPUs are "
+                "requested once for the allocation, so the count must be known."
+            )
+
+    def __enter__(self):
+        pipeline = Pipeline.get_active_pipeline()
+        if pipeline is None:
+            raise RuntimeError(
+                "Parallel() must be used within a Pipeline context. "
+                "Use: with Pipeline(...): with Parallel(): ..."
+            )
+        if pipeline._parallel_anchor is not None:
+            raise RuntimeError(
+                "Nested Parallel() blocks are not supported."
+            )
+        if self.pack is not None:
+            self._validate_machine_supports_packing(pipeline)
+        pipeline._parallel_anchor = pipeline.current_batch
+        pipeline._parallel_siblings = []
+        pipeline._parallel_pack = self.pack
+        pipeline._pack_runs = [] if self.pack else None
+        # If this block immediately follows a Service, every sibling waits for
+        # the daemon to START via after: (not afterok on the anchor). Absorb
+        # the single-use service edge so all siblings share it.
+        pipeline._parallel_after_anchor = pipeline._pending_after_parent
+        pipeline._pending_after_parent = None
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pipeline = Pipeline.get_active_pipeline()
+        if pipeline is None:
+            return False
+        if self.pack is not None:
+            runs = pipeline._pack_runs or []
+            pipeline._parallel_pack = None
+            pipeline._pack_runs = None
+            pipeline._parallel_anchor = None
+            pipeline._parallel_siblings = []
+            after_anchor = pipeline._parallel_after_anchor
+            pipeline._parallel_after_anchor = None
+            if not runs:
+                if after_anchor is not None:
+                    pipeline._pending_after_parent = after_anchor
+                return False
+            if exc_type is None:
+                self._validate_gpu_geometry(pipeline, runs)
+            # One batch, not N: the siblings are job steps inside it, so the
+            # chain default already makes the next batch depend on it.
+            pipeline._register_packed_batch(self.pack, runs)
+            return False
+        siblings = list(pipeline._parallel_siblings)
+        after_anchor = pipeline._parallel_after_anchor
+        pipeline._parallel_anchor = None
+        pipeline._parallel_siblings = []
+        pipeline._parallel_after_anchor = None
+        if siblings:
+            pipeline._pending_post_parents = siblings
+        else:
+            # Empty block: a transparent no-op. Restore the pending service
+            # after: edge it absorbed in __enter__ so the next batch still
+            # waits for the daemon. Otherwise fall back to chain default.
+            if after_anchor is not None:
+                pipeline._pending_after_parent = after_anchor
+        return False  # don't suppress exceptions
+
+
+class Run:
+    """Context manager delimiting one task inside a ``Parallel(pack=N)`` block.
+
+    Every tool in the block becomes its own ``srun`` job step, run in sequence
+    inside a backgrounded subshell. Tasks therefore run concurrently with each
+    other while the tools within a task stay ordered, and per-tool container
+    selection is preserved — a ``Run()`` may freely mix containerized and
+    plain tools.
+
+    ``cpus`` overrides the per-task CPU share, which otherwise divides the
+    node's cores by ``pack``. ``memory`` overrides the proportional memory
+    share derived from the allocation. This matters for asymmetric layouts
+    such as a large in-memory database server beside smaller GPU workers.
+
+    Example
+    -------
+    ::
+
+        with Parallel(pack=4):
+            Resources(gpu="gh", time="06:00:00")
+            for lig in ligands:
+                with Run():
+                    poses = Boltz2(ligand=lig, ...)
+                    PoseBusters(structures=poses)
+    """
+
+    def __init__(
+        self,
+        cpus: Optional[int] = None,
+        gpus: int = 1,
+        memory: Optional[str] = None,
+    ):
+        if memory is not None:
+            _validate_directive_value("memory", memory)
+            if _memory_to_mb(memory) is None:
+                raise ValueError(
+                    f"Run(memory=) must be a memory value such as '20GB', got {memory!r}."
+                )
+        # Both reach an srun directive verbatim, so a bad value would surface only
+        # after the allocation is granted. bool is an int subclass: `gpus=True`
+        # would otherwise format as `--gpus-per-task=True`.
+        if cpus is not None and (not isinstance(cpus, int) or isinstance(cpus, bool) or cpus < 1):
+            raise ValueError(
+                f"Run(cpus=) must be a positive integer (CPUs for the task), got {cpus!r}."
+            )
+        if not isinstance(gpus, int) or isinstance(gpus, bool) or gpus < 0:
+            raise ValueError(
+                f"Run(gpus=) must be a non-negative integer (0 declines GPUs), got {gpus!r}."
+            )
+        self.cpus = cpus
+        self.gpus = gpus
+        self.memory = memory
+
+    def __enter__(self):
+        pipeline = Pipeline.get_active_pipeline()
+        if pipeline is None:
+            raise RuntimeError(
+                "Run() must be used within a Pipeline context."
+            )
+        if getattr(pipeline, "_parallel_pack", None) is None:
+            raise RuntimeError(
+                "Run() is only valid inside a `with Parallel(pack=N):` block — "
+                "a task has no meaning without an allocation to sit in. "
+                "Use Resources() to open a normal batch instead."
+            )
+        if pipeline._active_run is not None:
+            raise RuntimeError("Nested Run() blocks are not supported.")
+        if pipeline.current_batch < 0 or not pipeline._packed_resources_seen:
+            raise RuntimeError(
+                "Parallel(pack=N) needs a Resources() call before the first Run(): "
+                "it describes the allocation the tasks share."
+            )
+        pipeline._active_run = self
+        self._start_idx = len(pipeline.tools)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pipeline = Pipeline.get_active_pipeline()
+        if pipeline is None:
+            return False
+        pipeline._active_run = None
+        if exc_type is not None:
+            return False
+        tools = pipeline.tools[self._start_idx:]
+        if not tools:
+            raise RuntimeError("Run() block added no tools.")
+        pipeline._pack_runs.append(
+            {
+                "tools": tools,
+                "cpus": self.cpus,
+                "gpus": self.gpus,
+                "memory": self.memory,
+            }
+        )
+        return False
+
+
+class Service:
+    """Context manager that launches its single batch as a detached daemon.
+
+    Use it for a long-running service (e.g. an MSA server) that a later step
+    consumes while it is still running. The block must contain exactly one
+    batch (one ``Resources()`` + the daemon tool). That batch keeps its normal
+    upstream ``afterok`` dependency, but it is NOT waited on by the chain: the
+    first batch AFTER the block gets an ``after:`` dependency on it (SLURM
+    naming; translated per scheduler) — "start once the daemon is RUNNING",
+    not "after it finishes". ``afterok``
+    would be wrong here, since the daemon only exits on its own idle-timeout.
+
+    This removes the scheduling race where a separately-submitted server sits
+    queued behind low priority while the client's allocation wall-clock runs
+    out: with ``after:`` the client is not scheduled until the server is up.
+
+    Example
+    -------
+    ::
+
+        with Pipeline(...):
+            Resources(...)
+            seqs = LigandMPNN(...)            # batch A
+            with Service():
+                Resources(memory="900GB", cpus=32, time="24:00:00")
+                MMseqs2Server(mode="cpu")     # batch B (daemon), afterok:A
+            Resources(memory="16GB")
+            msas = MMseqs2(sequences=seqs)    # batch C, after:B
+            Resources(gpu="A100")
+            Boltz2(..., msas=msas)            # batch D, afterok:C
+
+    Notes
+    -----
+    * Exactly one batch inside the block (one ``Resources()`` + daemon tool).
+    * The daemon is fully detached: nothing ``afterok``-waits on it, so the
+      pipeline's success never hinges on its exit code. It self-terminates via
+      its own idle-timeout once the consuming step has drained its queue.
+    * Cannot be nested, cannot contain ``Dependencies()``, and cannot be used
+      inside a ``Parallel()`` block.
+    """
+
+    def __enter__(self):
+        pipeline = Pipeline.get_active_pipeline()
+        if pipeline is None:
+            raise RuntimeError(
+                "Service() must be used within a Pipeline context. "
+                "Use: with Pipeline(...): with Service(): ..."
+            )
+        if pipeline._service_anchor is not None:
+            raise RuntimeError("Nested Service() blocks are not supported.")
+        if pipeline._parallel_anchor is not None:
+            raise RuntimeError("Service() cannot be used inside a Parallel() block.")
+        # Remember how many batches existed on entry, to enforce exactly one.
+        pipeline._service_anchor = pipeline.current_batch
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pipeline = Pipeline.get_active_pipeline()
+        if pipeline is None:
+            return False
+        anchor = pipeline._service_anchor
+        pipeline._service_anchor = None
+        if exc_type is not None:
+            return False  # don't mask an in-block exception
+        opened = pipeline.current_batch - anchor
+        if opened != 1:
+            raise RuntimeError(
+                "A Service() block must contain exactly one batch (one "
+                f"Resources() + the daemon tool); it opened {opened}."
+            )
+        # The daemon is the batch opened inside the block; the next batch
+        # after the block gets an after: edge to it.
+        pipeline._pending_after_parent = pipeline.current_batch
+        return False  # don't suppress exceptions
+
+
+class Folder:
+    """Context manager that nests public tool outputs under a named subfolder.
+
+    Purely organizational: it prepends a path segment to the output folder of
+    every public tool created inside the block, leaving execution order,
+    resources, batching, and dependencies untouched. The global step counter
+    keeps running, so numbers still reflect true execution order::
+
+        with Pipeline(...):
+            Resources()
+            Tool1()                 # 001_Tool1/
+            with Folder("group"):
+                Tool2()             # group/002_Tool2/
+            Tool3()                 # 003_Tool3/
+
+    Blocks nest (``with Folder("a"): with Folder("b"):`` -> ``a/b/...``).
+    Internal tools ignore the stack; they always land under .internal/.
+
+    In on-the-fly / Colab runs the block can be bound and zipped for download::
+
+        with Folder("Results") as results:
+            ...tools...
+        results.download()   # zips Results/ and triggers a Colab download
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self.path = None
+
+    def __enter__(self):
+        pipeline = Pipeline.get_active_pipeline()
+        if pipeline is None:
+            raise RuntimeError(
+                "Folder() must be used within a Pipeline context. "
+                "Use: with Pipeline(...): with Folder('...'): ..."
+            )
+        _validate_identifier("Folder name", self.name)
+        if self.name == INTERNAL_FOLDER:
+            raise ValueError(f"{INTERNAL_FOLDER!r} is reserved for framework-internal tools.")
+        # Absolute path of this folder, including any enclosing Folder() blocks.
+        self.path = os.path.join(pipeline.folders["output"], *pipeline._folder_stack, self.name)
+        self._on_the_fly = pipeline.on_the_fly
+        pipeline._folder_stack.append(self.name)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pipeline = Pipeline.get_active_pipeline()
+        if pipeline is not None and pipeline._folder_stack:
+            pipeline._folder_stack.pop()
+        return False  # don't suppress exceptions
+
+    def download(self) -> str:
+        """Zip this folder and trigger a browser download in Colab.
+
+        Meaningful only in on-the-fly / Colab runs, where tools execute as they
+        are added so the folder already holds real files when the block exits.
+        Returns the path to the created .zip. Outside Colab the archive is still
+        written and its path printed.
+        """
+        if not self._on_the_fly:
+            raise RuntimeError(
+                "Folder.download() is only available in on-the-fly / Colab runs; "
+                "in submit mode the outputs do not exist yet at this point."
+            )
+        if not os.path.isdir(self.path):
+            raise FileNotFoundError(f"Folder {self.path!r} has no outputs to download.")
+        archive = shutil.make_archive(self.path, "zip", self.path)
+        try:
+            from google.colab import files
+            files.download(archive)
+        except ImportError:
+            print(f"Not running in Colab; archive written to {archive}")
+        return archive

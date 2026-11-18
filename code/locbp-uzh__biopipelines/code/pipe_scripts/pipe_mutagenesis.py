@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+# Authors (2026): G. Quargnali & P. Rivera-Fuentes @ LOCBP (https://www.locbp.com/) University of Zurich Switzerland
+#
+# Licensed under the MIT License. See LICENSE file in the project root for details.
+
+"""
+Mutagenesis helper script for generating amino acid substitutions.
+
+This script generates systematic amino acid substitutions at specified positions
+using various class-based strategies for mutagenesis studies.
+
+Usage:
+    python pipe_mutagenesis.py --sequences MAP_TABLE_CSV --position POS
+           --mode MODE [--mutate-to AAS] --include-original [true|false]
+           --exclude EXCLUDE --output OUTPUT_CSV
+
+    python pipe_mutagenesis.py --sequences MAP_TABLE_CSV --selection TABLE_REF
+           --mode MODE [--mutate-to AAS] --include-original [true|false]
+           --exclude EXCLUDE --output OUTPUT_CSV
+
+Arguments:
+    --sequences: Path to map_table CSV with id and sequence columns
+    --position: Position for mutagenesis (1-indexed). Mutually exclusive with --selection.
+    --selection: TABLE_REFERENCE string for per-row position lookups (e.g.,
+        TABLE_REFERENCE:/path/to/table.csv:L1). Mutually exclusive with --position.
+    --mode: Mutagenesis mode (specific, saturation, hydrophobic, charged, etc.)
+    --mutate-to: Target amino acid(s) for specific mode (e.g., "A" or "AV")
+    --include-original: Whether to include original amino acid (true/false)
+    --exclude: Amino acids to exclude (single string, e.g., "CEFGL")
+    --output: Output CSV file path
+
+Output:
+    CSV file with columns: id, sequence, mutations, mutation_positions, original_aa, new_aa
+"""
+
+import sys
+import os
+import itertools
+import pandas as pd
+import argparse
+from typing import List, Dict, Optional
+
+# Add repo root to path so biopipelines package is importable
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from biopipelines.biopipelines_io import load_table, lookup_table_value
+
+
+# Amino acid classifications
+AMINO_ACID_CLASSES = {
+    "saturation": "ACDEFGHIKLMNPQRSTVWY",  # All 20 amino acids
+    "hydrophobic": "AFILMVWY",
+    "hydrophilic": "DEHKNQRST",
+    "charged": "DEHKR",
+    "polar": "CDEHKNQRSTY",
+    "nonpolar": "AFGILMPVW",
+    "aromatic": "FHWY",
+    "aliphatic": "AGILV",
+    "positive": "HKR",
+    "negative": "DE"
+}
+
+
+def parse_positions_selection(selection_str: str) -> List[int]:
+    """
+    Parse PyMOL-style position selection string into list of positions.
+
+    Args:
+        selection_str: Selection string like "141+143+145+147-149"
+                      '+' separates individual positions or ranges
+                      '-' indicates a range (e.g., "147-149" means 147, 148, 149)
+
+    Returns:
+        Sorted list of positions (1-indexed)
+    """
+    positions = []
+    parts = selection_str.split('+')
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        if '-' in part and not part.startswith('-'):
+            range_parts = part.split('-')
+            if len(range_parts) == 2:
+                start = int(range_parts[0])
+                end = int(range_parts[1])
+                positions.extend(range(start, end + 1))
+            else:
+                positions.append(int(part))
+        else:
+            positions.append(int(part))
+
+    return sorted(set(positions))
+
+
+def load_sequences_from_map_table(file_path: str) -> List[Dict]:
+    """
+    Load sequences from a map_table CSV (id-value DataStream).
+
+    Supports chaining: if the CSV has 'mutations' and 'mutation_positions'
+    columns (from a previous Mutagenesis), these are preserved and accumulated.
+
+    Args:
+        file_path: Path to map_table CSV with id and sequence columns
+
+    Returns:
+        List of dicts with keys: id, sequence, prior_mutations, prior_positions
+    """
+    df = pd.read_csv(file_path)
+    if len(df) == 0:
+        raise ValueError("Empty sequences file")
+
+    results = []
+    for _, row in df.iterrows():
+        seq_id = str(row['id'])
+        sequence = str(row['sequence']).upper()
+
+        # Get prior mutations/positions if chaining from a previous Mutagenesis
+        prior_mutations = ""
+        prior_positions = ""
+        if 'mutations' in df.columns and pd.notna(row['mutations']):
+            prior_mutations = str(row['mutations'])
+        if 'mutation_positions' in df.columns and pd.notna(row['mutation_positions']):
+            prior_positions = str(row['mutation_positions'])
+
+        results.append({
+            'id': seq_id,
+            'sequence': sequence,
+            'prior_mutations': prior_mutations,
+            'prior_positions': prior_positions
+        })
+
+    return results
+
+
+def generate_mutants(sequence: str, sequence_id: str, position: int, mode: str,
+                    include_original: bool, exclude: str,
+                    mutate_to: str = "",
+                    prior_mutations: str = "",
+                    prior_positions: str = "") -> List[Dict]:
+    """
+    Generate mutant sequences based on specified parameters.
+
+    Args:
+        sequence: Original protein sequence
+        sequence_id: Identifier for the sequence
+        position: Position for mutagenesis (1-indexed)
+        mode: Mutagenesis mode
+        include_original: Whether to include original amino acid
+        exclude: Amino acids to exclude
+        mutate_to: Target amino acid(s) for "specific" mode
+        prior_mutations: Comma-separated prior mutations (from chaining)
+        prior_positions: Plus-separated prior positions in PyMOL format (from chaining)
+
+    Returns:
+        List of dictionaries with mutant information
+    """
+    # Validate inputs
+    if position <= 0 or position > len(sequence):
+        raise ValueError(f"Position {position} is out of range for sequence of length {len(sequence)}")
+
+    if mode == "specific":
+        if not mutate_to:
+            raise ValueError("mutate_to is required when mode is 'specific'")
+        amino_acids = mutate_to.upper()
+    elif mode in AMINO_ACID_CLASSES:
+        amino_acids = AMINO_ACID_CLASSES[mode]
+    else:
+        raise ValueError(f"Unknown mode: {mode}. Available modes: ['specific'] + {list(AMINO_ACID_CLASSES.keys())}")
+
+    # Remove excluded amino acids
+    if exclude:
+        amino_acids = ''.join(aa for aa in amino_acids if aa not in exclude.upper())
+
+    # Get original amino acid at position
+    original_aa = sequence[position - 1]
+
+    # Remove original amino acid unless include_original=True
+    if not include_original and original_aa in amino_acids:
+        amino_acids = amino_acids.replace(original_aa, '')
+
+    if not amino_acids:
+        raise ValueError("No amino acids left after applying exclusions and original filtering")
+
+    # Generate mutants
+    mutants = []
+    for new_aa in amino_acids:
+        # Create mutant sequence
+        mutant_sequence = sequence[:position-1] + new_aa + sequence[position:]
+
+        # Generate mutant ID
+        mutant_id = f"{sequence_id}_{position}{new_aa}"
+
+        # Create mutation description (standard notation: OrigPosNew)
+        this_mutation = f"{original_aa}{position}{new_aa}"
+
+        # Accumulate mutations and positions from prior rounds
+        if prior_mutations:
+            mutations = f"{prior_mutations},{this_mutation}"
+        else:
+            mutations = this_mutation
+
+        if prior_positions:
+            mutation_positions = f"{prior_positions}+{position}"
+        else:
+            mutation_positions = str(position)
+
+        mutants.append({
+            'id': mutant_id,
+            'original.id': sequence_id,
+            'sequence': mutant_sequence,
+            'mutations': mutations,
+            'mutation_positions': mutation_positions,
+            'original_aa': original_aa,
+            'new_aa': new_aa
+        })
+
+    return mutants
+
+
+def get_target_amino_acids(mode: str, mutate_to: str, exclude: str) -> str:
+    """
+    Determine the target amino acid set based on mode, mutate_to, and exclude.
+
+    Returns:
+        String of amino acid single-letter codes.
+    """
+    if mode == "specific":
+        if not mutate_to:
+            raise ValueError("mutate_to is required when mode is 'specific'")
+        amino_acids = mutate_to.upper()
+    elif mode in AMINO_ACID_CLASSES:
+        amino_acids = AMINO_ACID_CLASSES[mode]
+    else:
+        raise ValueError(f"Unknown mode: {mode}. Available modes: ['specific'] + {list(AMINO_ACID_CLASSES.keys())}")
+
+    if exclude:
+        amino_acids = ''.join(aa for aa in amino_acids if aa not in exclude.upper())
+
+    return amino_acids
+
+
+def generate_combinatorial_mutants(sequence: str, sequence_id: str,
+                                   positions: List[int], mode: str,
+                                   include_original: bool, exclude: str,
+                                   mutate_to: str = "",
+                                   prior_mutations: str = "",
+                                   prior_positions: str = "") -> (List[Dict], List[Dict]):
+    """
+    Generate combinatorial mutants across multiple positions (cartesian product).
+
+    For positions [57, 58] with amino acids "AS", generates all combinations:
+    _57A_58A, _57A_58S, _57S_58A, _57S_58S (minus excluded originals).
+
+    Args:
+        sequence: Original protein sequence
+        sequence_id: Identifier for the sequence
+        positions: List of positions for mutagenesis (1-indexed)
+        mode: Mutagenesis mode
+        include_original: Whether to include original amino acid
+        exclude: Amino acids to exclude
+        mutate_to: Target amino acid(s) for "specific" mode
+        prior_mutations: Comma-separated prior mutations (from chaining)
+        prior_positions: Plus-separated prior positions (from chaining)
+
+    Returns:
+        Tuple of (mutants list, missing list)
+    """
+    base_amino_acids = get_target_amino_acids(mode, mutate_to, exclude)
+
+    # For each position, determine the set of AAs (full set and filtered set)
+    per_position_aas = []       # AAs after exclude + include_original filtering
+    per_position_aas_full = []  # AAs after exclude only (for missing computation)
+    original_aas = []
+
+    for pos in positions:
+        if pos <= 0 or pos > len(sequence):
+            raise ValueError(f"Position {pos} is out of range for sequence of length {len(sequence)}")
+        orig_aa = sequence[pos - 1]
+        original_aas.append(orig_aa)
+
+        # Full set includes original (used for computing missing)
+        full_set = base_amino_acids
+        if orig_aa not in full_set:
+            full_set_with_orig = full_set + orig_aa
+        else:
+            full_set_with_orig = full_set
+        per_position_aas_full.append(full_set_with_orig)
+
+        # Filtered set excludes original unless include_original=True
+        filtered = base_amino_acids
+        if not include_original and orig_aa in filtered:
+            filtered = filtered.replace(orig_aa, '')
+        per_position_aas.append(filtered)
+
+    if any(len(aas) == 0 for aas in per_position_aas):
+        raise ValueError("No amino acids left after applying exclusions and original filtering at one or more positions")
+
+    # Generate cartesian product of AAs across positions
+    mutants = []
+    for combo in itertools.product(*per_position_aas):
+        # Apply all mutations simultaneously
+        mutant_seq = list(sequence)
+        id_suffix_parts = []
+        mutation_parts = []
+
+        for i, (pos, new_aa) in enumerate(zip(positions, combo)):
+            orig_aa = original_aas[i]
+            mutant_seq[pos - 1] = new_aa
+            id_suffix_parts.append(f"_{pos}{new_aa}")
+            mutation_parts.append(f"{orig_aa}{pos}{new_aa}")
+
+        mutant_id = sequence_id + ''.join(id_suffix_parts)
+        mutant_sequence = ''.join(mutant_seq)
+
+        this_mutations = ','.join(mutation_parts)
+        this_positions = '+'.join(str(p) for p in positions)
+        this_orig_aa = ''.join(original_aas)
+        this_new_aa = ''.join(combo)
+
+        # Accumulate with prior mutations
+        if prior_mutations:
+            mutations = f"{prior_mutations},{this_mutations}"
+        else:
+            mutations = this_mutations
+
+        if prior_positions:
+            mutation_positions = f"{prior_positions}+{this_positions}"
+        else:
+            mutation_positions = this_positions
+
+        mutants.append({
+            'id': mutant_id,
+            'original.id': sequence_id,
+            'sequence': mutant_sequence,
+            'mutations': mutations,
+            'mutation_positions': mutation_positions,
+            'original_aa': this_orig_aa,
+            'new_aa': this_new_aa
+        })
+
+    # Compute missing entries: combinations from the full set that were excluded
+    missing = []
+    if not include_original:
+        actual_ids = {m['id'] for m in mutants}
+        for combo in itertools.product(*per_position_aas_full):
+            id_suffix_parts = [f"_{pos}{aa}" for pos, aa in zip(positions, combo)]
+            candidate_id = sequence_id + ''.join(id_suffix_parts)
+            if candidate_id not in actual_ids:
+                combo_desc = ', '.join(f"{original_aas[i]}{positions[i]}{combo[i]}" for i in range(len(positions)))
+                missing.append({
+                    'id': candidate_id,
+                    'cause': f'Original amino acid excluded from mutagenesis ({combo_desc})'
+                })
+
+    return mutants, missing
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Generate mutants')
+    parser.add_argument('--sequences', required=True,
+                       help='Path to map_table CSV with id and sequence columns')
+    parser.add_argument('--position', default=None,
+                       help='Position(s) for mutagenesis (1-indexed). '
+                            'Single int or PyMOL-style selection (e.g., "141+143+145-149"). '
+                            'Mutually exclusive with --selection.')
+    parser.add_argument('--selection', default=None,
+                       help='TABLE_REFERENCE string for per-row position lookups')
+    parser.add_argument('--mode', required=True,
+                       help='Mutagenesis mode')
+    parser.add_argument('--mutate-to', default='',
+                       help='Target amino acid(s) for specific mode (e.g., "A" or "AV")')
+    parser.add_argument('--include-original', type=str, choices=['true', 'false'], default='false',
+                       help='Whether to include original amino acid')
+    parser.add_argument('--exclude', default='',
+                       help='Amino acids to exclude (single string)')
+    parser.add_argument('--combinatorial', action='store_true', default=False,
+                       help='Generate combinatorial (cartesian product) mutants across positions')
+    parser.add_argument('--missing-output', default=None,
+                       help='Output CSV path for missing/excluded entries')
+    parser.add_argument('--missing-step', default='Mutagenesis',
+                       help='Step/tool name for the removed_by column in missing.csv')
+    parser.add_argument('--output', required=True,
+                       help='Output CSV file path')
+
+    args = parser.parse_args()
+
+    try:
+        # Validate mutually exclusive args
+        if args.position is None and args.selection is None:
+            parser.error("Either --position or --selection must be provided")
+        if args.position is not None and args.selection is not None:
+            parser.error("--position and --selection are mutually exclusive")
+
+        include_original = args.include_original.lower() == 'true'
+
+        # Load all sequences from map_table
+        sequences = load_sequences_from_map_table(args.sequences)
+
+        # Load selection table if using --selection mode
+        selection_table = None
+        selection_column = None
+        if args.selection:
+            selection_table, selection_column = load_table(args.selection)
+            print(f"Loaded selection table with column '{selection_column}'")
+
+        # Generate mutants for all input sequences
+        all_mutants = []
+        all_missing = []
+        for seq_info in sequences:
+            sequence = seq_info['sequence']
+            sequence_id = seq_info['id']
+
+            print(f"Processing sequence: {sequence_id}")
+            print(f"  Sequence length: {len(sequence)}")
+
+            if seq_info['prior_mutations']:
+                print(f"  Prior mutations: {seq_info['prior_mutations']}")
+
+            if args.selection:
+                # Selection mode: look up per-row positions from table
+                # --sequences IS the input stream's map_table, so it carries the
+                # provenance that relates a renamed id to the selection table.
+                selection_value = lookup_table_value(
+                    selection_table, sequence_id, selection_column,
+                    map_table_paths=[args.sequences]
+                )
+
+                # Empty selection (NaN): no positions to mutate — pass through original
+                if pd.isna(selection_value) or str(selection_value).strip() == '':
+                    print(f"  No selection positions — passing through unchanged")
+                    all_mutants.append({
+                        'id': sequence_id,
+                        'original.id': sequence_id,
+                        'sequence': sequence,
+                        'mutations': seq_info['prior_mutations'],
+                        'mutation_positions': seq_info['prior_positions'],
+                        'original_aa': '',
+                        'new_aa': ''
+                    })
+                    continue
+
+                positions = parse_positions_selection(str(selection_value))
+                print(f"  Selection positions: {positions}")
+            else:
+                # Fixed position mode (single int or multi-position string)
+                positions = parse_positions_selection(str(args.position))
+                print(f"  Position(s): {positions}")
+
+            # Combinatorial mode: generate cartesian product across all positions
+            if args.combinatorial and len(positions) > 1:
+                print(f"  Combinatorial mode across {len(positions)} positions")
+                mutants, missing = generate_combinatorial_mutants(
+                    sequence=sequence,
+                    sequence_id=sequence_id,
+                    positions=positions,
+                    mode=args.mode,
+                    include_original=include_original,
+                    exclude=args.exclude,
+                    mutate_to=args.mutate_to,
+                    prior_mutations=seq_info['prior_mutations'],
+                    prior_positions=seq_info['prior_positions']
+                )
+                all_mutants.extend(mutants)
+                all_missing.extend(missing)
+                print(f"    Generated {len(mutants)} combinatorial mutants")
+            else:
+                # Independent single-point mutants per position
+                for position in positions:
+                    print(f"  Position {position}: original AA = {sequence[position-1]}")
+                    mutants = generate_mutants(
+                        sequence=sequence,
+                        sequence_id=sequence_id,
+                        position=position,
+                        mode=args.mode,
+                        include_original=include_original,
+                        exclude=args.exclude,
+                        mutate_to=args.mutate_to,
+                        prior_mutations=seq_info['prior_mutations'],
+                        prior_positions=seq_info['prior_positions']
+                    )
+                    all_mutants.extend(mutants)
+                    print(f"    Generated {len(mutants)} mutants at position {position}")
+
+                    # Track missing for non-combinatorial mode
+                    if not include_original:
+                        orig_aa = sequence[position - 1]
+                        base_amino_acids = get_target_amino_acids(args.mode, args.mutate_to, args.exclude)
+                        if orig_aa in base_amino_acids:
+                            missing_id = f"{sequence_id}_{position}{orig_aa}"
+                            all_missing.append({
+                                'id': missing_id,
+                                'cause': f'Original amino acid ({orig_aa}) excluded from mutagenesis at position {position}'
+                            })
+
+        print(f"\nTotal mutants generated: {len(all_mutants)}")
+
+        # Create output dataframe
+        df = pd.DataFrame(all_mutants)
+
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(args.output), exist_ok=True)
+
+        # Save to CSV
+        df.to_csv(args.output, index=False)
+
+        print(f"Mutants saved to: {args.output}")
+
+        # Generate missing.csv
+        if args.missing_output:
+            if all_missing:
+                for entry in all_missing:
+                    entry['removed_by'] = args.missing_step
+                    entry['kind'] = 'filter'
+                missing_df = pd.DataFrame(all_missing, columns=['id', 'removed_by', 'kind', 'cause'])
+            else:
+                missing_df = pd.DataFrame(columns=['id', 'removed_by', 'kind', 'cause'])
+            missing_df.to_csv(args.missing_output, index=False)
+            print(f"Missing table saved to: {args.missing_output} ({len(all_missing)} entries)")
+
+        # Print summary
+        print(f"\nSummary:")
+        print(f"  Mode: {args.mode}")
+        if args.selection:
+            print(f"  Selection: {args.selection}")
+        else:
+            print(f"  Position: {args.position}")
+        print(f"  Input sequences: {len(sequences)}")
+        print(f"  Total mutants: {len(all_mutants)}")
+        if all_mutants:
+            print(f"  Example mutations: {', '.join([m['mutations'] for m in all_mutants[:5]])}")
+            if len(all_mutants) > 5:
+                print(f"  ... and {len(all_mutants) - 5} more")
+
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

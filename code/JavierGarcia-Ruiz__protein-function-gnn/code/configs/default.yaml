@@ -1,0 +1,32 @@
+# Configuration for Protein Function Prediction on 3D Residue Graphs (DeepFRI EC Benchmark)
+
+seed: 42
+
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  split_file: "data/raw/ec_pdb_splits.csv"
+  contact_threshold: 10.0  # Angstrom C-alpha distance cutoff
+  max_neighbors: 30        # k-NN maximum graph degree
+  num_rbf: 16              # Number of radial basis distance functions
+  num_ec_classes: 25       # Top 25 fine-grained & hierarchical EC classes
+
+model:
+  name: "gat"              # "cnn_baseline", "gcn", "gat"
+  d_node_in: 26            # 20 (AA one-hot) + 6 (sin/cos dihedral backbone angles)
+  d_edge_in: 17            # 16 (RBF distances) + 1 (normalized sequence separation)
+  d_hidden: 128
+  num_layers: 4
+  num_heads: 4
+  dropout: 0.2
+  pooling: "attention"     # "mean", "max", "attention"
+
+training:
+  epochs: 10
+  batch_size: 32
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  patience: 3
+  amp: true
+

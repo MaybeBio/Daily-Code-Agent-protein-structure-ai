@@ -1,0 +1,50 @@
+[experiment]
+hypothesis = """
+C3 fix (commit 678c9cb): adding angular momentum conservation to the SETTLE
+R-step in settle_langevin eliminates the systematic T_rot drain and brings
+mean NVT T within 300±5 K for 895-water TIP3P at gamma=10 ps^-1.
+
+Root cause identified: dp = mass*(x_con - x_unc)/half_dt carries net angular
+momentum per step (both delta_L_SETTLE_pos and delta_L_R contributions),
+draining T_rot toward T_mech ~ 229-267 K. Fix adds
+_r_step_conserve_angular_momentum after each A+SETTLE+R block — computes
+L_target = L(r_unc, p_pre_a) per water, then corrects momentum via
+Cramer's-rule rigid-body impulse to restore L_target.
+
+Prior diagnostic result (B1 run, job 15458955, 5 seeds, gamma=10):
+  mean T = 293.97 +/- 0.77 K (target 300 K)
+  T_trans = 304.8 K, T_rot = 283.6 K (imbalance ~21 K)
+
+Expected outcome after C3 fix:
+  T_trans ≈ T_rot ≈ 300 K (within ±5 K each)
+  mean T within 300±5 K → gate_pass = 1
+"""
+
+[outcomes.pass]
+condition = "gate_pass = 1"
+decision = "C3 fix confirmed. Gate passes. Close Phase 5 / Phase D Certify."
+reasoning = "Mean T over 5 seeds within 300±5 K confirms AM conservation corrects the T_rot deficit."
+is_residual = false
+
+[outcomes.fail]
+condition = "gate_pass = 0"
+decision = "C3 fix insufficient. Inspect T_trans and T_rot from q2_decomp. If T_rot still depressed, check B-step torque contribution (estimated ~0.09K/step at T=537K) or DOF counting error."
+reasoning = "If T_rot imbalance persists after AM correction, a different mechanism (B-step torque or DOF counting) is dominant."
+is_residual = true
+
+[result_schema]
+gate_pass = "int"
+gate_error_k = "float"
+q1_mean_t = "float"
+q1_std_t = "float"
+q2_decomp_T_total = "float"
+q2_decomp_T_trans = "float"
+q2_decomp_T_rot = "float"
+q3_ou_comparison_constrained_T = "float"
+q3_ou_comparison_unconstrained_T = "float"
+q3_ou_comparison_delta_K = "float"
+
+[metadata]
+campaign = "p5-c3-verify"
+phase = "Phase 5 C3 AM conservation fix verification"
+task_id = "260603_p5_settle_correctness"

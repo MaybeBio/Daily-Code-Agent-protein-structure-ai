@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+'''
+
+  !---------------------------------------------------------------------------!
+  !                                                                           !
+  !     MLatom: a Package for Atomistic Simulations with Machine Learning     !
+  !                             MLatom 3.27.0                                 !
+  !                                                                           !
+  !                           http://mlatom.com/                              !
+  !                                                                           !
+  !               Licensed under the Apache License, Version 2.0              !
+  !                     Copyright 2013-2026 Pavlo O. Dral                     !
+  !                           http://dr-dral.com/                             !
+  !                                                                           !
+  ! Licensed under the Apache License, Version 2.0 (the "License"); you may   !
+  ! not use this software except in compliance with the License. You may      !
+  ! obtain a copy of the License at                                           !
+  !                 http://www.apache.org/licenses/LICENSE-2.0                !
+  !                                                                           !
+  ! When using MLatom or its derivatives in scientific publications,          !
+  ! please cite it as:                                                        !
+  !                                                                           !
+  ! Pavlo O. Dral, Fuchun Ge, Yi-Fan Hou, Peikun Zheng, Yuxinxin Chen,        !
+  ! Mario Barbatti, Olexandr Isayev, Cheng Wang, Bao-Xin Xue,                 !
+  ! Max Pinheiro Jr, Yuming Su, Yiheng Dai, Yangtao Chen, Lina Zhang,         !
+  ! Shuang Zhang, Arif Ullah, Quanhao Zhang, Yanchi Ou.                       !
+  ! J. Chem. Theory Comput. 2024, 20, 1193-1213.                              !
+  !                                                                           !
+  ! Pavlo O. Dral, Fuchun Ge, Yi-Fan Hou, Yuxinxin Chen, Mikolaj Martyka,     !
+  ! Jakub Martinka, Peikun Zheng, Lina Zhang, Xin-Yu Tong, Bao-Xin Xue,       !
+  ! Quanhao Zhang,  Arif Ullah, Sebastian V. Pios, Vignesh B. Kumar,          !
+  ! Yanchi Ou, Max Pinheiro Jr, Yuming Su, Yiheng Dai, Yangtao Chen,          !
+  ! Shuang Zhang, Jinming Hu, Matheus O. Bispo                                !
+  ! MLatom: A Package for Atomistic Simulations with Machine Learning,        !
+  ! version 3.27.0, Xiamen University, Xiamen, China, 2013-2026.              !
+  !                                                                           !
+  ! The citations for MLatom's interfaces and features should also be         !
+  ! included. See header.py, ref.json and http://mlatom.com.                  !
+  !                                                                           !
+  ! Unless required by applicable law or agreed to in writing, software       !
+  ! distributed under the License is distributed on an "AS IS" BASIS,         !
+  ! WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  !
+  !                                                                           !
+  !---------------------------------------------------------------------------!
+
+'''
+
+import os, sys, time
+# import header
+# from mlatom.MLtasks import CLItasks
+# from mlatom.args_class import mlatom_args
+
+def run(argv = []):
+    import importlib.util
+    # ~POD, 2025.03.23
+    # the complicated import below is required to load the same instance of mlatom,
+    # where this script is located.
+
+    dir_path = os.path.dirname(os.path.abspath(__file__))
+    path2init = os.path.join(dir_path, '__init__.py')
+    dirname = os.path.basename(dir_path)
+    spec = importlib.util.spec_from_file_location(dirname, path2init)
+    mlatom_with_this_file = importlib.util.module_from_spec(spec)
+    sys.modules[dirname] = mlatom_with_this_file
+    spec.loader.exec_module(mlatom_with_this_file)
+    header = mlatom_with_this_file.header
+    CLItasks = mlatom_with_this_file.MLtasks.CLItasks
+    mlatom_args = mlatom_with_this_file.args_class.mlatom_args
+    
+    starttime = time.time()
+
+    # add print mlatom version and list location of these versions
+    for arg in sys.argv:
+        if arg in ['-v', '--version']: 
+            version = mlatom_with_this_file.__version__
+            print(f'Current mlatom version: {version}')
+            if 'unknown' not in version:
+                # best-effort check for a newer release; never block or crash
+                # the command if offline / behind a firewall / requests missing
+                try:
+                    import requests
+                    url = f"https://pypi.org/pypi/mlatom/json"
+                    response = requests.get(url, timeout=3)
+                    if response.status_code == 200:
+                        latest_version = response.json()["info"]['version']
+                        if latest_version != version:
+                            print(f'The latest mlatom version is {latest_version}, please upgrade your mlatom with `pip install --upgrade mlatom`')
+                    else:
+                        print('Fail to get the latest mlatom version from pypi')
+                except Exception:
+                    pass
+            return
+        elif arg in ['-l', '--list']:
+            # get all installed packages in site packages
+            print('Current mlatom installation:')
+            print(f"  {'version':<15} location")
+            print(f'* {mlatom_with_this_file.__version__:<15} {dir_path}')
+
+            print('\nAvailable mlatom installation:')
+            print(f"{'version':<15} location")
+
+            def get_version_from_init(initpath, prefix):
+                pp_version = None; f = open(initpath,'r').readlines()
+                for ll in f:
+                    if '__version__' in ll: 
+                        import re 
+                        pp_version = re.search(r'(["\'])(.*?)\1', ll).group(2)
+                if not pp_version: pp_version = 'unknown'
+                print(f'{pp_version:<15} {prefix}')
+
+
+            # check pythonpath
+            if 'PYTHONPATH' in os.environ: 
+                pythonpaths = os.environ['PYTHONPATH'].split(os.pathsep)
+                for pp in pythonpaths:
+                    if os.path.exists(os.path.join(pp, 'mlatom')):
+                        path2init = os.path.join(pp, 'mlatom/__init__.py')
+                    elif os.path.exists(os.path.join(pp, 'aitomic')):
+                        path2init = os.path.join(pp, 'aitomic/__init__.py')
+                    else: continue
+                    get_version_from_init(path2init, os.path.join(pp, 'mlatom'))
+
+            # check python package
+            import site
+            sitepackage_paths = site.getsitepackages()
+            for sp in sitepackage_paths:
+                if os.path.exists(os.path.join(sp, 'mlatom')): 
+                    path2init = os.path.join(sp, 'mlatom/__init__.py')
+                    get_version_from_init(path2init, os.path.join(sp, 'mlatom'))
+            return  
+    
+    print(_render_banner())
+    
+    print(' %s ' % ('='*78))
+    print(time.strftime(" MLatom started on %d.%m.%Y at %H:%M:%S", time.localtime()))
+    print('        with the following options:')
+    argsstr = '        '
+    for arg in sys.argv:
+        argsstr += arg + ' '
+    print(argsstr.rstrip())
+    if len(sys.argv[1:]) == 1:
+        if os.path.exists(sys.argv[1]):
+            print('\n        Input file content:')
+            print(' %s ' % ('_'*78))
+            with open(sys.argv[1], 'r') as finp:
+                for line in finp:
+                    print(line.rstrip())
+            print(' %s ' % ('_'*78))
+    args = mlatom_args()
+    if argv == []:
+        args.parse(sys.argv[1:])
+    else:
+        args.parse(argv)
+    print(' %s ' % ('='*78))
+    header.printHeader(args)
+    sys.stdout.flush()
+    
+    result = CLItasks(args).run()
+    
+    endtime = time.time()
+    wallclock = endtime - starttime
+    print(' %s ' % ('='*78))
+    print(' Wall-clock time: %.2f s (%.2f min, %.2f hours)\n' % (wallclock, wallclock / 60.0, wallclock / 3600.0))
+    print(time.strftime(" MLatom terminated on %d.%m.%Y at %H:%M:%S", time.localtime()))
+    print(' %s ' % ('='*78), flush=True)
+    
+    return result
+
+
+def _render_banner():
+    '''The startup banner: this module's docstring (the program/license block,
+    which mlatom/LICENSE is generated from by stamp_version.py) with the live
+    commit + build date, and an Aitomic Add-Ons line when present, inserted in
+    the box under the version. The banner differs from LICENSE only by those
+    run-time lines.'''
+    import re
+    from . import _version
+    commit, build_date = _version.commit_and_date()
+    addons = _version.aitomic_addons_version()
+
+    lines = (__doc__ or '').split('\n')
+    width = max((len(l) for l in lines), default=79)
+
+    def box(text):
+        return '  !' + text.center(width - 4) + '!'  # '  !' prefix + '!' suffix
+
+    rendered = []
+    for ln in lines:
+        rendered.append(ln)
+        if ln.startswith('  !') and re.search(r'MLatom [0-9]', ln):
+            rendered.append(box('commit %s, built %s' % (commit, build_date)))
+            if addons:
+                rendered.append(box('with Aitomic Add-Ons %s' % addons))
+    return '\n'.join(rendered)
+
+
+if __name__ == '__main__':
+    run()

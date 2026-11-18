@@ -1,0 +1,456 @@
+/*
+ *                    BioJava development code
+ *
+ * This code may be freely distributed and modified under the
+ * terms of the GNU Lesser General Public Licence.  This should
+ * be distributed with the code.  If you do not have a copy,
+ * see:
+ *
+ *      http://www.gnu.org/copyleft/lesser.html
+ *
+ * Copyright for this code is held jointly by the individual
+ * authors.  These should be listed in @author doc comments.
+ *
+ * For more information on the BioJava project and its aims,
+ * or to join the biojava-l mailing list, visit the home page
+ * at:
+ *
+ *      http://www.biojava.org/
+ *
+ */
+package org.biojava.nbio.genome.io.fastq;
+
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.StringReader;
+import java.net.URL;
+import java.nio.file.Files;
+
+
+/**
+ * Abstract unit test for implementations of FastqReader.
+ */
+abstract class AbstractFastqReaderTest {
+	/** Array of example files that should throw IOExceptions. */
+	static final String[] ERROR_EXAMPLES = new String[]
+		{
+			"error_diff_ids.fastq",
+			"error_double_qual.fastq",
+			"error_double_seq.fastq",
+			"error_long_qual.fastq",
+			"error_no_qual.fastq",
+			"error_qual_del.fastq",
+			"error_qual_escape.fastq",
+			"error_qual_null.fastq",
+			"error_qual_space.fastq",
+			"error_qual_tab.fastq",
+			"error_qual_unit_sep.fastq",
+			"error_qual_vtab.fastq",
+			"error_short_qual.fastq",
+			"error_spaces.fastq",
+			"error_tabs.fastq",
+			"error_trunc_at_plus.fastq",
+			"error_trunc_at_qual.fastq",
+			"error_trunc_at_seq.fastq",
+			"error_trunc_in_plus.fastq",
+			"error_trunc_in_qual.fastq",
+			"error_trunc_in_seq.fastq",
+			"error_trunc_in_title.fastq"
+		};
+
+	/**
+	 * Create and return a new FASTQ formatted sequence suitable for testing.
+	 *
+	 * @return a new FASTQ formatted sequence suitable for testing.
+	 */
+	public abstract Fastq createFastq();
+
+	/**
+	 * Create and return a new instance of an implementation of FastqReader to test.
+	 *
+	 * @return a new instance of an implementation of FastqReader to test
+	 */
+	public abstract FastqReader createFastqReader();
+
+	/**
+	 * Create and return a new instance of an implementation of FastqWriter to test round-tripping.
+	 *
+	 * @return a new instance of an implementation of FastqWriter to test round-tripping.
+	 */
+	public abstract FastqWriter createFastqWriter();
+
+	@Test
+	public void testCreateFastq()
+	{
+		Fastq fastq = createFastq();
+		Assertions.assertNotNull(fastq);
+	}
+
+	@Test
+	public void testCreateFastqReader()
+	{
+		FastqReader reader = createFastqReader();
+		Assertions.assertNotNull(reader);
+	}
+
+	@Test
+	public void testCreateFastqWriter()
+	{
+		FastqWriter writer = createFastqWriter();
+		Assertions.assertNotNull(writer);
+	}
+
+	@Test
+	public void testReadFile() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		try
+		{
+			reader.read((File) null);
+			Assertions.fail("read((File) null) expected IllegalArgumentException");
+		}
+		catch (IllegalArgumentException e)
+		{
+			// expected
+		}
+		try
+		{
+			File noSuchFile = new File("no such file");
+			reader.read(noSuchFile);
+			Assertions.fail("read(no such file) expected IOException");
+		}
+		catch (IOException e)
+		{
+			// expected
+		}
+	}
+
+	@Test
+	public void testReadEmptyFile() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		File empty = Files.createTempFile("abstractFastqReaderTest",null).toFile();
+		Iterable<Fastq> iterable = reader.read(empty);
+		Assertions.assertNotNull(iterable);
+		int count = 0;
+		for (Fastq f : iterable)
+		{
+			Assertions.assertNotNull(f);
+			count++;
+		}
+		Assertions.assertEquals(0, count);
+	}
+
+	@Test
+	public void testReadRoundTripSingleFile() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		File single = Files.createTempFile("abstractFastqReaderTest",null).toFile();
+		Fastq fastq = createFastq();
+		FastqWriter writer = createFastqWriter();
+		writer.write(single, fastq);
+		Iterable<Fastq> iterable = reader.read(single);
+		Assertions.assertNotNull(iterable);
+		int count = 0;
+		for (Fastq f : iterable)
+		{
+			Assertions.assertNotNull(f);
+			count++;
+		}
+		Assertions.assertEquals(1, count);
+	}
+
+	@Test
+	public void testReadRoundTripMultipleFile() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		File multiple = Files.createTempFile("abstractFastqReaderTest",null).toFile();
+		Fastq fastq0 = createFastq();
+		Fastq fastq1 = createFastq();
+		Fastq fastq2 = createFastq();
+		FastqWriter writer = createFastqWriter();
+		writer.write(multiple, fastq0, fastq1, fastq2);
+		Iterable<Fastq> iterable = reader.read(multiple);
+		Assertions.assertNotNull(iterable);
+		int count = 0;
+		for (Fastq f : iterable)
+		{
+			Assertions.assertNotNull(f);
+			count++;
+		}
+		Assertions.assertEquals(3, count);
+	}
+
+	@Test
+	public void testReadURL() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		try
+		{
+			reader.read((URL) null);
+			Assertions.fail("read((URL) null) expected IllegalArgumentException");
+		}
+		catch (IllegalArgumentException e)
+		{
+			// expected
+		}
+		try
+		{
+			URL noSuchURL = new URL("file:///no such url");
+			reader.read(noSuchURL);
+			Assertions.fail("read(no such URL) expected IOException");
+		}
+		catch (IOException e)
+		{
+			// expected
+		}
+	}
+
+	@Test
+	public void testReadEmptyURL() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		URL empty = getClass().getResource("empty.fastq");
+		Iterable<Fastq> iterable = reader.read(empty);
+		Assertions.assertNotNull(iterable);
+		int count = 0;
+		for (Fastq f : iterable)
+		{
+			Assertions.assertNotNull(f);
+			count++;
+		}
+		Assertions.assertEquals(0, count);
+	}
+
+	@Test
+	public void testReadInputStream() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		try
+		{
+			reader.read((InputStream) null);
+			Assertions.fail("read((InputStream) null) expected IllegalArgumentException");
+		}
+		catch (IllegalArgumentException e)
+		{
+			// expected
+		}
+	}
+
+	@Test
+	public void testReadEmptyInputStream() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		InputStream empty = getClass().getResourceAsStream("empty.fastq");
+		Iterable<Fastq> iterable = reader.read(empty);
+		Assertions.assertNotNull(iterable);
+		int count = 0;
+		for (Fastq f : iterable)
+		{
+			Assertions.assertNotNull(f);
+			count++;
+		}
+		Assertions.assertEquals(0, count);
+		empty.close();
+	}
+
+	@Test
+	public void testWrappedSequence() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		InputStream wrappedSequence = getClass().getResourceAsStream("wrapped-sequence.fastq");
+		Iterable<Fastq> iterable = reader.read(wrappedSequence);
+		Assertions.assertNotNull(iterable);
+		int count = 0;
+		for (Fastq f : iterable)
+		{
+			Assertions.assertNotNull(f);
+			Assertions.assertEquals("ACTG", f.getSequence());
+			count++;
+		}
+		Assertions.assertEquals(1, count);
+		wrappedSequence.close();
+	}
+
+	@Test
+	public void testWrappedQuality() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		InputStream wrappedQuality = getClass().getResourceAsStream("wrapped-quality.fastq");
+		Iterable<Fastq> iterable = reader.read(wrappedQuality);
+		Assertions.assertNotNull(iterable);
+		int count = 0;
+		for (Fastq f : iterable)
+		{
+			Assertions.assertNotNull(f);
+			Assertions.assertEquals("ZZZZ", f.getQuality());
+			count++;
+		}
+		Assertions.assertEquals(1, count);
+		wrappedQuality.close();
+	}
+
+	@Test
+	public void testMultipleWrappedQuality() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		InputStream wrappedQuality = getClass().getResourceAsStream("multiple-wrapped-quality.fastq");
+		Iterable<Fastq> iterable = reader.read(wrappedQuality);
+		Assertions.assertNotNull(iterable);
+		int count = 0;
+		for (Fastq f : iterable)
+		{
+			Assertions.assertNotNull(f);
+			Assertions.assertEquals("ZZZZ", f.getQuality());
+			count++;
+		}
+		Assertions.assertEquals(4, count);
+		wrappedQuality.close();
+	}
+
+	@Test
+	public void testErrorExamples() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		for (String errorExample : ERROR_EXAMPLES)
+		{
+			InputStream inputStream = getClass().getResourceAsStream(errorExample);
+			try
+			{
+				reader.read(inputStream);
+				Assertions.fail("error example " + errorExample + " expected IOException");
+			}
+			catch (IOException e)
+			{
+				// expected
+			}
+			finally
+			{
+				if (inputStream != null)
+				{
+					try
+					{
+						inputStream.close();
+					}
+					catch (IOException e)
+					{
+						// ignore
+					}
+				}
+			}
+		}
+	}
+
+	@Test
+	public void testParse() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		final String input = "";
+		reader.parse(new StringReader(input), new ParseListener() {
+						 @Override
+						 public void description(final String description) throws IOException {
+							 // empty
+						 }
+
+						 @Override
+						 public void sequence(final String sequence) throws IOException {
+							 // empty
+						 }
+
+						 @Override
+						 public void appendSequence(final String sequence) throws IOException {
+							 // empty
+						 }
+
+						 @Override
+						 public void repeatDescription(final String repeatDescription) throws IOException {
+							 // empty
+						 }
+
+						 @Override
+						 public void quality(final String quality) throws IOException {
+							 // empty
+						 }
+
+						 @Override
+						 public void appendQuality(final String quality) throws IOException {
+							 // empty
+						 }
+
+						 @Override
+						 public void complete() throws IOException {
+							 // empty
+						 }
+					 });
+	}
+
+	@Test
+	public void testParseNullReadable() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		try
+		{
+			reader.parse((Readable) null, new ParseListener() {
+							 @Override
+							 public void description(final String description) throws IOException {
+								 // empty
+							 }
+
+							 @Override
+							 public void sequence(final String sequence) throws IOException {
+								 // empty
+							 }
+
+							 @Override
+							 public void appendSequence(final String sequence) throws IOException {
+								 // empty
+							 }
+
+							 @Override
+							 public void repeatDescription(final String repeatDescription) throws IOException {
+								 // empty
+							 }
+
+							 @Override
+							 public void quality(final String quality) throws IOException {
+								 // empty
+							 }
+
+							 @Override
+							 public void appendQuality(final String quality) throws IOException {
+								 // empty
+							 }
+
+							 @Override
+							 public void complete() throws IOException {
+								 // empty
+							 }
+						 });
+			Assertions.fail("parse(null, ) expected IllegalArgumentException");
+		}
+		catch (IllegalArgumentException e)
+		{
+			// expected
+		}
+	}
+
+	@Test
+	public void testParseNullParseListener() throws Exception
+	{
+		FastqReader reader = createFastqReader();
+		final String input = "";
+		try
+		{
+			reader.parse(new StringReader(input), null);
+			Assertions.fail("parse(, null) expected IllegalArgumentException");
+		}
+		catch (IllegalArgumentException e)
+		{
+			// expected
+		}
+	}
+}

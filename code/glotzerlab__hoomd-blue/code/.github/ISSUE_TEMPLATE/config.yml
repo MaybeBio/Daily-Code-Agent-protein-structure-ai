@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: HOOMD-blue discussion board
+    url: https://github.com/glotzerlab/hoomd-blue/discussions/
+    about: Ask the HOOMD-blue user community for help.
+  - name: HOOMD-blue documentation
+    url: https://hoomd-blue.readthedocs.io/
+    about: User documentation.
