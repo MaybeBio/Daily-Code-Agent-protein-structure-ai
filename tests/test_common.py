@@ -13,3 +13,19 @@ def test_dump_json_creates_parents(tmp_path, monkeypatch):
     path = common.data_dir("daily", "x.json")
     common.dump_json(path, {"k": 1})
     assert json.load(open(path))["k"] == 1
+
+
+def test_dump_json_keeps_old_content_when_write_fails(tmp_path, monkeypatch):
+    """增量落盘可能被 SIGTERM 打断:写一半不能把上一版有效文件弄坏。"""
+    path = tmp_path / "x.json"
+    common.dump_json(str(path), {"v": 1})
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(common.json, "dump", boom)
+    try:
+        common.dump_json(str(path), {"v": 2})
+    except OSError:
+        pass
+    assert common.load_json(str(path)) == {"v": 1}
+    assert not (tmp_path / "x.json.tmp").exists()      # 临时文件要清理

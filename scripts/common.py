@@ -47,9 +47,19 @@ def load_json(path: str):
         return json.load(f)
 
 def dump_json(path: str, obj) -> None:
+    """原子落盘:score.py 会边跑边写,进程被杀时不能留下半截 JSON。
+
+    先写同目录 .tmp 再 os.replace,旧版本要么完整保留,要么被完整替换。
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+    tmp = f"{path}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 def today() -> str:
     tz = os.environ.get("TZ", "Asia/Shanghai")

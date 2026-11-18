@@ -59,6 +59,51 @@ def test_is_permanent_by_status(code, perm):
 def test_is_permanent_ignores_non_openai_error():
     assert agent._is_permanent(RuntimeError("x")) is False
 
+def _conn_error(cause=None):
+    err = openai.APIConnectionError(request=httpx.Request("POST", "http://x"))
+    if cause is not None:
+        err.__cause__ = cause
+    return err
+
+
+def test_retry_json_does_not_retry_connection_error(monkeypatch):
+    """连接层错误重试也连不上:交给全局熔断,单仓库立即失败,避免 60s 退避。"""
+    monkeypatch.setattr(agent.time, "sleep", lambda s: None)
+    client, calls = _client([_conn_error()])
+    with pytest.raises(openai.APIConnectionError):
+        agent._retry_json(client, "m", [], lambda o: o)
+    assert len(calls) == 1
+
+
+def test_breaker_opens_after_consecutive_connection_failures(monkeypatch):
+    monkeypatch.setattr(agent.time, "sleep", lambda s: None)
+    breaker = agent.CircuitBreaker(limit=2)
+    client, calls = _client([_conn_error(), _conn_error(), '{"ok": 1}'])
+    for _ in range(2):
+        with pytest.raises(openai.APIConnectionError):
+            agent._retry_json(client, "m", [], lambda o: o, breaker=breaker)
+    with pytest.raises(agent.LLMUnavailable):
+        agent._retry_json(client, "m", [], lambda o: o, breaker=breaker)
+    assert len(calls) == 2                         # 熔断后不再发请求
+
+
+def test_breaker_resets_after_success(monkeypatch):
+    monkeypatch.setattr(agent.time, "sleep", lambda s: None)
+    breaker = agent.CircuitBreaker(limit=2)
+    client, calls = _client([_conn_error(), '{"ok": 1}'])
+    with pytest.raises(openai.APIConnectionError):
+        agent._retry_json(client, "m", [], lambda o: o, breaker=breaker)
+    assert agent._retry_json(client, "m", [], lambda o: o, breaker=breaker) == {"ok": 1}
+    assert breaker.failures == 0                   # 恢复成功后计数清零
+
+
+def test_describe_error_includes_underlying_cause():
+    err = _conn_error(httpx.UnsupportedProtocol("missing protocol"))
+    text = agent.describe_error(err)
+    assert "APIConnectionError" in text
+    assert "UnsupportedProtocol" in text           # 日志里要能区分「地址写错」和「网络不通」
+
+
 def test_make_client_sets_request_timeout_and_disables_sdk_retries(monkeypatch):
     seen = {}
     def fake_openai(**kw):

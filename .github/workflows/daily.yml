@@ -15,26 +15,40 @@ env:
 jobs:
   run:
     runs-on: ubuntu-latest
-    # 分层查询后单日候选约 200~385 个,搜索 77 条约 5 分钟,打分视端点负载 20~60 分钟。
-    # 设 90:正常日 25~40 分钟,端点最慢时也能跑完;仍留 1.5 倍安全网,
-    # 撞到 90 说明真卡死了,让它失败留日志,而不是耗尽 GitHub 默认的 360 分钟。
+    # 实测单日候选 490~620 个,搜索 77 条约 7~8 分钟;打分由 config.yaml 的
+    # llm.max_seconds(50 分钟)自己封顶,ingest 步骤另有 75 分钟步骤超时兜底。
+    # job 设 90 是最后一道保险:正常 ~60 分钟,撞到 90 说明脚本连预算/超时都没生效。
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with: {python-version: '3.11'}
       - run: pip install ghresearcher -r requirements.txt
+      - name: llm doctor
+        # 只做诊断,不阻断。打印脱敏后的端点、DNS/TCP/HTTP 结果和错误底层原因,
+        # 端点不可达时能在日志第一屏看到是地址写错、DNS 还是网络不通。
+        continue-on-error: true
+        timeout-minutes: 3
+        run: python scripts/llm_doctor.py
+        env:
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_MODEL: ${{ vars.LLM_MODEL || secrets.LLM_MODEL }}
       - run: python scripts/daily.py --config config.yaml --issue-body /tmp/issue.md --issue-title /tmp/issue.title
       # 仅当 config.yaml 的 ingest.mode=daily 时才真正执行;weekly 模式下脚本直接退出。
       # 负责把「昨天」的搜索+打分增量做完,weekly 只聚合,避免一次打分几千个仓库超时。
       - name: daily ingest
         # 失败不阻断后面的 commit:当日 feed 仍要落库;缺失的 scored 由 weekly 聚合补跑。
         continue-on-error: true
+        # 必须小于 job 的 90 分钟:步骤超时会让 job 继续走 commit,而 job 超时会杀掉整个 job、
+        # commit 直接 skipped(11-17、11-16 两次就是这样丢掉整天数据的)。
+        # score.py 每 50 个仓库落盘一次,这里被杀也只损失未完成部分。
+        timeout-minutes: 75
         run: python scripts/ingest_daily.py --config config.yaml
         env:
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_MODEL: ${{ vars.LLM_MODEL || secrets.LLM_MODEL }}
       - name: commit
         run: |
           git config user.name "github-actions[bot]"

@@ -21,6 +21,14 @@ search_placeholder: 如 蛋白结构预测、蛋白互作、蛋白功能、Alpha
 llm:
   concurrency: 8
   min_score: 5
+  # 打分墙钟预算(秒)。到点后剩余仓库标记 [llm budget exhausted] 并立即落盘,
+  # 保证 ingest 步骤在 75 分钟步骤超时前自己结束,commit 一定跑得到。
+  # 端点正常时 500~600 个候选约 20~60 分钟;设 50 分钟留出余量。
+  max_seconds: 3000
+  # 连续连接失败达到此次数即熔断,剩余仓库直接跳过并标记 [llm unavailable]。
+  # 不熔断时每个仓库要白等 5 次退避(4+8+16+32=60s),500 个仓库就是 80 分钟,
+  # 正是 daily 撞满 timeout-minutes 的直接原因。
+  connect_fail_limit: 12
   # noagent 降级开关:false 时跳过 LLM(打分/Code Card)。issue 仍全量列仓库,
   # 但站点/归档/wiki 只留 watchlist 来源;配合 archive.repo_copy: readme 一起用。
   # api 欠费/不可用时手动切 false,重跑该周 action 即可。
