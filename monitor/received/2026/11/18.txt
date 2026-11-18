@@ -1,5 +1,10 @@
 Fetching events for target(s): alexholehouse, Junjie-Zhu, Zuricho...
 
+2026-11-18 20:00:34 | 🔀 copybara-service merged PR in google-deepmind/torax
+2026-11-18 19:45:56 | 🐛 copybara-service closed issue in google-deepmind/mujoco: 'Filament renderer (4.0.0): planar reflections are flipped vertically, and geometry behind the mirror is not clipped'
+2026-11-18 19:45:23 | 🍴 ch9nuk9 forked google-deepmind/mujoco
+2026-11-18 19:43:01 | ⭐️ Timmyy3000 starred google-deepmind/language_modeling_is_compression
+2026-11-18 19:42:18 | ⭐️ DamienBradleyDSP starred google-deepmind/language_modeling_is_compression
 2026-11-18 19:31:35 | ⭐️ anthonylau starred google-deepmind/code-verification
 2026-11-18 19:22:22 | 🔀 copybara-service opened PR in google-deepmind/torax
 2026-11-18 19:14:57 | ⭐️ canbesolved starred google-deepmind/mujoco
@@ -23,15 +28,14 @@ Fetching events for target(s): alexholehouse, Junjie-Zhu, Zuricho...
 2026-11-18 18:11:07 | ⭐️ tamirlevin-aleph starred google-deepmind/robotics-antigravity-plugin
 2026-11-18 17:55:03 | ⭐️ gloria-zhang1 starred google-deepmind/mujoco
 2026-11-18 17:39:27 | 🔹 rajasekharporeddy performed PullRequestReviewEvent on google-deepmind/optax
-2026-11-18 17:36:57 | ⭐️ IskanderSabirov starred google-deepmind/mujoco
-2026-11-18 17:29:33 | ⭐️ HyunSBong starred google-deepmind/alphaprotein-novo
-2026-11-18 17:20:15 | 🔹 jzleibo performed PullRequestReviewEvent on google-deepmind/concordia
-2026-11-18 17:16:13 | 🔀 0z5a opened PR in google-deepmind/multi_object_datasets
-2026-11-18 17:16:07 | 🍴 0z5a forked google-deepmind/multi_object_datasets
-2026-11-18 17:10:36 | ⭐️ surya-teja-99 starred google-deepmind/nanodo
-2026-11-18 17:09:23 | ⭐️ consumptionrainbow-pixel starred google-deepmind/concordia
+2026-11-18 10:39:10 | 🚀 alexholehouse pushed to holehouse-lab/PIMMS
+    - [75525ad] (expanded) Major udate for 1.0.8 ahead of merge to main
 2026-11-18 03:04:51 | 🔀 sobuelow merged PR in bindresearch/pkasso
 2026-11-18 03:02:10 | 🔀 sobuelow merged PR in bindresearch/unipkainfer
 2026-11-18 02:55:03 | 🔀 sobuelow opened PR in bindresearch/pkasso
 2026-11-18 02:29:38 | 🔀 sobuelow opened PR in bindresearch/unipkainfer
+2026-11-18 01:24:26 | 🔹 felixpernegger performed PullRequestReviewCommentEvent on google-deepmind/formal-conjectures
+2026-11-18 01:20:06 | 🔹 felixpernegger performed PullRequestReviewCommentEvent on google-deepmind/formal-conjectures
 2026-11-17 04:05:15 | ⭐️ aozalevsky starred KULL-Centre/CALVADOS
+2026-11-17 02:30:04 | 🔹 hadley performed DeleteEvent on r-lib/httr2
+2026-11-17 02:29:21 | 🔹 hadley performed DeleteEvent on r-lib/httr2

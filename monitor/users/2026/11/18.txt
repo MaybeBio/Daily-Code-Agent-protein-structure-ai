@@ -10,6 +10,8 @@ Fetching events for target(s): alexholehouse, HFChenLab, Junjie-Zhu, sirius777co
 2026-11-18 16:21:41 | 🔀 sokrypton opened PR in sokrypton/localfold
 2026-11-18 16:10:48 | 🐛 EDAPINENUT closed issue in EDAPINENUT/fewsteprl-sd35: 'Verify evals on Papers with Code'
 2026-11-18 16:10:27 | 🐛 EDAPINENUT closed issue in EDAPINENUT/fewsteprl-wan21: 'Verify evals on Papers with Code'
+2026-11-18 10:39:10 | 🚀 alexholehouse pushed to holehouse-lab/PIMMS
+    - [75525ad] (expanded) Major udate for 1.0.8 ahead of merge to main
 2026-11-18 06:19:19 | 🔀 sokrypton merged PR in sokrypton/localfold
 2026-11-18 06:19:15 | 🔀 sokrypton merged PR in sokrypton/localfold
 2026-11-18 06:15:53 | 🔀 sokrypton opened PR in sokrypton/localfold

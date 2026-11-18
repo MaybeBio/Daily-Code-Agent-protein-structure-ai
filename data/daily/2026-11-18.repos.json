@@ -2,11 +2,12 @@
   {
     "full_name": "google-deepmind/mujoco",
     "who": [
-      "IskanderSabirov",
       "canbesolved",
+      "ch9nuk9",
+      "copybara-service",
       "gloria-zhang1"
     ],
-    "event": "star",
+    "event": "mixed",
     "stars": 18273,
     "language": "C++",
     "description": "Multi-Joint dynamics with Contact. A general purpose physics simulator.",
@@ -57,18 +58,6 @@
     "url": "https://github.com/google-deepmind/mujoco_playground"
   },
   {
-    "full_name": "google-deepmind/concordia",
-    "who": [
-      "consumptionrainbow-pixel",
-      "jzleibo"
-    ],
-    "event": "mixed",
-    "stars": 1908,
-    "language": "Python",
-    "description": "A library for generative social simulation",
-    "url": "https://github.com/google-deepmind/concordia"
-  },
-  {
     "full_name": "google-deepmind/mujoco_warp",
     "who": [
       "adenzler-nvidia"
@@ -85,6 +74,7 @@
       "KitaKen1",
       "Xantante",
       "codrut3",
+      "felixpernegger",
       "mo271"
     ],
     "event": "mixed",
@@ -151,39 +141,6 @@
     "url": "https://github.com/Graylab/IgFold"
   },
   {
-    "full_name": "google-deepmind/alphaprotein-novo",
-    "who": [
-      "HyunSBong"
-    ],
-    "event": "star",
-    "stars": 323,
-    "language": "Python",
-    "description": "AlphaProtein Novo",
-    "url": "https://github.com/google-deepmind/alphaprotein-novo"
-  },
-  {
-    "full_name": "google-deepmind/nanodo",
-    "who": [
-      "surya-teja-99"
-    ],
-    "event": "star",
-    "stars": 310,
-    "language": "Python",
-    "description": "",
-    "url": "https://github.com/google-deepmind/nanodo"
-  },
-  {
-    "full_name": "google-deepmind/multi_object_datasets",
-    "who": [
-      "0z5a"
-    ],
-    "event": "mixed",
-    "stars": 289,
-    "language": "Python",
-    "description": "Multi-object image datasets with ground-truth segmentation masks and generative factors.",
-    "url": "https://github.com/google-deepmind/multi_object_datasets"
-  },
-  {
     "full_name": "google-deepmind/code-verification",
     "who": [
       "anthonylau"
@@ -193,6 +150,17 @@
     "language": "Lean",
     "description": "Verifying Signal's security at the machine-code level",
     "url": "https://github.com/google-deepmind/code-verification"
+  },
+  {
+    "full_name": "r-lib/httr2",
+    "who": [
+      "hadley"
+    ],
+    "event": "other",
+    "stars": 274,
+    "language": "R",
+    "description": "Make HTTP requests and process their responses. A modern reimagining of httr.",
+    "url": "https://github.com/r-lib/httr2"
   },
   {
     "full_name": "ai4protein/VenusFactory2",
@@ -215,6 +183,18 @@
     "language": "Rust",
     "description": "Fast indexing and search of discontinuous motifs in protein structures",
     "url": "https://github.com/steineggerlab/folddisco"
+  },
+  {
+    "full_name": "google-deepmind/language_modeling_is_compression",
+    "who": [
+      "DamienBradleyDSP",
+      "Timmyy3000"
+    ],
+    "event": "star",
+    "stars": 207,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/google-deepmind/language_modeling_is_compression"
   },
   {
     "full_name": "sokrypton/py2Dmol",
@@ -426,6 +406,17 @@
     "language": "Rust",
     "description": "",
     "url": "https://github.com/CladeTeam/OmicsWeave"
+  },
+  {
+    "full_name": "holehouse-lab/PIMMS",
+    "who": [
+      "alexholehouse"
+    ],
+    "event": "push",
+    "stars": 1,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/holehouse-lab/PIMMS"
   },
   {
     "full_name": "EDAPINENUT/contrast_gen",

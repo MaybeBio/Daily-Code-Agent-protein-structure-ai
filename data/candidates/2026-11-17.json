@@ -11,17 +11,18 @@
   {
     "full_name": "google-deepmind/mujoco",
     "who": [
-      "IskanderSabirov",
       "canbesolved",
+      "ch9nuk9",
+      "copybara-service",
       "gloria-zhang1"
     ],
-    "event": "star",
-    "stars": 18273,
+    "event": "mixed",
+    "stars": 18275,
     "language": "C++",
     "description": "Multi-Joint dynamics with Contact. A general purpose physics simulator.",
     "url": "https://github.com/google-deepmind/mujoco",
     "source": "watchlist",
-    "pushed_at": "2026-11-18T11:23:38Z"
+    "pushed_at": "2026-11-18T11:45:54Z"
   },
   {
     "full_name": "prefix-dev/pixi",
@@ -103,20 +104,6 @@
     "source": "search"
   },
   {
-    "full_name": "google-deepmind/concordia",
-    "who": [
-      "consumptionrainbow-pixel",
-      "jzleibo"
-    ],
-    "event": "mixed",
-    "stars": 1908,
-    "language": "Python",
-    "description": "A library for generative social simulation",
-    "url": "https://github.com/google-deepmind/concordia",
-    "source": "watchlist",
-    "pushed_at": "2026-11-09T14:14:36Z"
-  },
-  {
     "full_name": "google-deepmind/mujoco_warp",
     "who": [
       "adenzler-nvidia"
@@ -135,6 +122,7 @@
       "KitaKen1",
       "Xantante",
       "codrut3",
+      "felixpernegger",
       "mo271"
     ],
     "event": "mixed",
@@ -220,7 +208,7 @@
     "description": "TORAX: Tokamak transport simulation in JAX",
     "url": "https://github.com/google-deepmind/torax",
     "source": "watchlist",
-    "pushed_at": "2026-11-18T11:22:17Z"
+    "pushed_at": "2026-11-18T12:00:38Z"
   },
   {
     "full_name": "PKU-YuanGroup/OpenAI4S",
@@ -348,19 +336,6 @@
     "source": "search"
   },
   {
-    "full_name": "google-deepmind/alphaprotein-novo",
-    "who": [
-      "HyunSBong"
-    ],
-    "event": "star",
-    "stars": 323,
-    "language": "Python",
-    "description": "AlphaProtein Novo",
-    "url": "https://github.com/google-deepmind/alphaprotein-novo",
-    "source": "watchlist",
-    "pushed_at": "2026-10-06T11:23:42Z"
-  },
-  {
     "full_name": "Jianqiuer/Awesome6DPoseEstimation",
     "url": "https://github.com/Jianqiuer/Awesome6DPoseEstimation",
     "language": "Python",
@@ -370,19 +345,6 @@
     "source": "search"
   },
   {
-    "full_name": "google-deepmind/nanodo",
-    "who": [
-      "surya-teja-99"
-    ],
-    "event": "star",
-    "stars": 310,
-    "language": "Python",
-    "description": "",
-    "url": "https://github.com/google-deepmind/nanodo",
-    "source": "watchlist",
-    "pushed_at": "2024-07-15T06:26:49Z"
-  },
-  {
     "full_name": "general-molecular-simulations/so3lr",
     "url": "https://github.com/general-molecular-simulations/so3lr",
     "language": "Python",
@@ -390,19 +352,6 @@
     "description": "SO3LR Tauri: machine-learned force fields for reactive (bio)molecular simulations, from H to At",
     "pushed_at": "2026-11-17T15:09:18Z",
     "source": "search"
-  },
-  {
-    "full_name": "google-deepmind/multi_object_datasets",
-    "who": [
-      "0z5a"
-    ],
-    "event": "mixed",
-    "stars": 289,
-    "language": "Python",
-    "description": "Multi-object image datasets with ground-truth segmentation masks and generative factors.",
-    "url": "https://github.com/google-deepmind/multi_object_datasets",
-    "source": "watchlist",
-    "pushed_at": "2026-03-03T08:58:15Z"
   },
   {
     "full_name": "google-deepmind/code-verification",
@@ -416,6 +365,19 @@
     "url": "https://github.com/google-deepmind/code-verification",
     "source": "watchlist",
     "pushed_at": "2026-11-11T15:43:56Z"
+  },
+  {
+    "full_name": "r-lib/httr2",
+    "who": [
+      "hadley"
+    ],
+    "event": "other",
+    "stars": 274,
+    "language": "R",
+    "description": "Make HTTP requests and process their responses. A modern reimagining of httr.",
+    "url": "https://github.com/r-lib/httr2",
+    "source": "watchlist",
+    "pushed_at": "2026-11-17T13:38:18Z"
   },
   {
     "full_name": "espressomd/espresso",
@@ -460,6 +422,20 @@
     "url": "https://github.com/steineggerlab/folddisco",
     "source": "watchlist",
     "pushed_at": "2026-10-15T03:46:17Z"
+  },
+  {
+    "full_name": "google-deepmind/language_modeling_is_compression",
+    "who": [
+      "DamienBradleyDSP",
+      "Timmyy3000"
+    ],
+    "event": "star",
+    "stars": 207,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/google-deepmind/language_modeling_is_compression",
+    "source": "watchlist",
+    "pushed_at": "2024-08-28T12:52:32Z"
   },
   {
     "full_name": "COLA-Laboratory/GraphFLA",
@@ -1069,15 +1045,6 @@
     "pushed_at": "2023-09-15T05:18:32Z"
   },
   {
-    "full_name": "mmb-irb/MDDB-workflow",
-    "url": "https://github.com/mmb-irb/MDDB-workflow",
-    "language": "Python",
-    "stars": 12,
-    "description": "",
-    "pushed_at": "2026-11-17T16:02:53Z",
-    "source": "search"
-  },
-  {
     "full_name": "CCPBioSim/CodeEntropy",
     "url": "https://github.com/CCPBioSim/CodeEntropy",
     "language": "Python",
@@ -1566,6 +1533,19 @@
     "source": "search"
   },
   {
+    "full_name": "holehouse-lab/PIMMS",
+    "who": [
+      "alexholehouse"
+    ],
+    "event": "push",
+    "stars": 1,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/holehouse-lab/PIMMS",
+    "source": "watchlist",
+    "pushed_at": "2026-11-18T03:07:19Z"
+  },
+  {
     "full_name": "EDAPINENUT/contrast_gen",
     "who": [
       "EDAPINENUT"
@@ -1966,7 +1946,7 @@
     "description": "Uptime and backend-API monitoring of the BioComputing UP resources (DisProt, MobiDB, RepeatsDB, PED, RING, APICURON…), every 20 minutes on GitHub Actions",
     "url": "https://github.com/BioComputingUP/BioComp_resource_monitor",
     "source": "watchlist",
-    "pushed_at": "2026-11-18T11:35:27Z"
+    "pushed_at": "2026-11-18T11:55:31Z"
   },
   {
     "full_name": "BioComputingUP/dome-tracking",
@@ -2040,15 +2020,6 @@
     "stars": 0,
     "description": "",
     "pushed_at": "2026-11-17T14:53:25Z",
-    "source": "search"
-  },
-  {
-    "full_name": "ademajeuron8/Euron-Ademaj---AI-Based-Protein-Structure-Prediction-and-Optimization",
-    "url": "https://github.com/ademajeuron8/Euron-Ademaj---AI-Based-Protein-Structure-Prediction-and-Optimization",
-    "language": "Java",
-    "stars": 0,
-    "description": "Projekti ne lenden DAA - AI-Based Protein Structure Prediction and Optimization",
-    "pushed_at": "2026-11-17T11:41:28Z",
     "source": "search"
   },
   {
@@ -2763,15 +2734,6 @@
     "source": "search"
   },
   {
-    "full_name": "enhansome/enhansome-agentic-world-modeling",
-    "url": "https://github.com/enhansome/enhansome-agentic-world-modeling",
-    "language": "",
-    "stars": 0,
-    "description": "",
-    "pushed_at": "2026-11-17T11:59:25Z",
-    "source": "search"
-  },
-  {
     "full_name": "liuweisu/liuweisu",
     "url": "https://github.com/liuweisu/liuweisu",
     "language": "",
@@ -2823,15 +2785,6 @@
     "stars": 0,
     "description": "",
     "pushed_at": "2026-11-17T17:34:20Z",
-    "source": "search"
-  },
-  {
-    "full_name": "Caizhaohui/News-Rust-bioinformation",
-    "url": "https://github.com/Caizhaohui/News-Rust-bioinformation",
-    "language": "Rust",
-    "stars": 0,
-    "description": "Living catalog and weekly radar of Rust in bioinformatics",
-    "pushed_at": "2026-11-17T11:47:38Z",
     "source": "search"
   },
   {
@@ -3084,15 +3037,6 @@
     "stars": 0,
     "description": "",
     "pushed_at": "2026-11-17T10:02:29Z",
-    "source": "search"
-  },
-  {
-    "full_name": "Leo-T-Zang/Leo-T-Zang",
-    "url": "https://github.com/Leo-T-Zang/Leo-T-Zang",
-    "language": "",
-    "stars": 0,
-    "description": "Config files for my GitHub profile.",
-    "pushed_at": "2026-11-17T14:58:24Z",
     "source": "search"
   },
   {
@@ -3399,15 +3343,6 @@
     "stars": 0,
     "description": "",
     "pushed_at": "2026-11-17T13:39:04Z",
-    "source": "search"
-  },
-  {
-    "full_name": "ItsKodas/atomic-sandbox",
-    "url": "https://github.com/ItsKodas/atomic-sandbox",
-    "language": "Rust",
-    "stars": 0,
-    "description": "Interactive 3D atomic-scale physics sandbox: classical nuclei + real-space Kohn-Sham DFT electrons on the GPU, in Rust + wgpu",
-    "pushed_at": "2026-11-17T11:50:11Z",
     "source": "search"
   },
   {
