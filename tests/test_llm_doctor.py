@@ -40,22 +40,30 @@ def test_diagnose_reports_dns_failure_without_crashing(monkeypatch):
 
 def test_diagnose_notes_404_path_hint(monkeypatch):
     """404 说明主机可达但路径可能写错(base_url 通常应以 /v1 结尾)。"""
-    import httpx
+    import urllib.error
 
     class Sock:
         def close(self): pass
 
-    class Resp:
-        status_code = 404
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {}, None)
 
     monkeypatch.setattr(llm_doctor.socket, "getaddrinfo",
                         lambda *a, **k: [(2, 1, 6, "", ("1.2.3.4", 443))])
     monkeypatch.setattr(llm_doctor.socket, "create_connection", lambda *a, **k: Sock())
-    monkeypatch.setattr(httpx, "get", lambda *a, **k: Resp())
+    monkeypatch.setattr(llm_doctor.urllib.request, "urlopen", fake_urlopen)
     report = llm_doctor.diagnose({"LLM_BASE_URL": "https://api.example.com/v1",
                                   "LLM_API_KEY": "k"})
     http = next(r for r in report if r["check"] == "http")
+    assert "404" in http["detail"]
     assert "path" in http["detail"]
+
+
+def test_diagnose_warns_on_api_key_whitespace():
+    """本次事故:secret 末尾空格 → h11 LocalProtocolError: Illegal header value。"""
+    report = llm_doctor.diagnose({"LLM_BASE_URL": "sk-abc", "LLM_API_KEY": "sk-test \n"})
+    key = next(r for r in report if r["check"] == "api_key")
+    assert "whitespace" in key["detail"].lower()
 
 
 def test_main_returns_nonzero_on_failure(monkeypatch, capsys):

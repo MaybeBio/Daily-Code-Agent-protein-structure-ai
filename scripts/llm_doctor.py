@@ -6,6 +6,8 @@
 import os
 import socket
 import sys
+import urllib.error
+import urllib.request
 from urllib.parse import urlsplit
 
 
@@ -60,9 +62,15 @@ def diagnose(env: dict | None = None) -> list[dict]:
     report = [{"check": "base_url", "ok": ok, "detail": detail}]
 
     key = env.get("LLM_API_KEY") or ""
-    report.append({"check": "api_key",
-                   "ok": bool(key),
-                   "detail": f"set (len={len(key)})" if key else "missing"})
+    if not key:
+        detail = "missing"
+    elif key != key.strip():
+        # 实测事故:末尾空格/换行 → h11 LocalProtocolError: Illegal header value,
+        # 被 openai SDK 包装成 APIConnectionError,看起来像网络不通。
+        detail = f"set (len={len(key)}) but has leading/trailing whitespace"
+    else:
+        detail = f"set (len={len(key)})"
+    report.append({"check": "api_key", "ok": bool(key), "detail": detail})
     report.append({"check": "model",
                    "ok": True,
                    "detail": (env.get("LLM_MODEL") or "").strip() or "deepseek-chat (default)"})
@@ -88,16 +96,21 @@ def diagnose(env: dict | None = None) -> list[dict]:
         report.append({"check": "tcp", "ok": False, "detail": _cause_text(e)})
         return report
 
+    # 用标准库而不是 httpx:Actions 里 openai 依赖的是 httpx2,没有 httpx 模块。
+    url = base.rstrip("/") + "/models"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key.strip()}"})
     try:
-        import httpx
-        url = base.rstrip("/") + "/models"
-        r = httpx.get(url, headers={"Authorization": f"Bearer {key}"}, timeout=10)
-        detail = f"GET {redact(url)} -> {r.status_code}"
-        if r.status_code == 404:
-            detail += " (host reachable; check base_url path, usually ends with /v1)"
-        report.append({"check": "http", "ok": r.status_code < 500, "detail": detail})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            status = r.status
+    except urllib.error.HTTPError as e:
+        status = e.code                      # 401/404 也证明主机可达
     except Exception as e:
         report.append({"check": "http", "ok": False, "detail": _cause_text(e)})
+        return report
+    detail = f"GET {redact(url)} -> {status}"
+    if status == 404:
+        detail += " (host reachable; check base_url path, usually ends with /v1)"
+    report.append({"check": "http", "ok": status < 500, "detail": detail})
     return report
 
 

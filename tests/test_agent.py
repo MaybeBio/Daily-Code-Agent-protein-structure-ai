@@ -104,6 +104,17 @@ def test_describe_error_includes_underlying_cause():
     assert "UnsupportedProtocol" in text           # 日志里要能区分「地址写错」和「网络不通」
 
 
+def test_make_client_strips_secret_whitespace(monkeypatch):
+    """secret 末尾的空格/换行会让 httpx 抛 Illegal header value,必须剥掉。"""
+    seen = {}
+    monkeypatch.setattr(agent, "OpenAI", lambda **kw: seen.update(kw) or object())
+    monkeypatch.setenv("LLM_BASE_URL", "https://api.example.com/v1 \n")
+    monkeypatch.setenv("LLM_API_KEY", "sk-test \n")
+    agent.make_client()
+    assert seen["base_url"] == "https://api.example.com/v1"
+    assert seen["api_key"] == "sk-test"
+
+
 def test_make_client_sets_request_timeout_and_disables_sdk_retries(monkeypatch):
     seen = {}
     def fake_openai(**kw):

@@ -58,7 +58,10 @@ def load_prompts(path: str) -> dict:
         return yaml.safe_load(f)
 
 def make_client() -> OpenAI:
-    return OpenAI(base_url=os.environ["LLM_BASE_URL"], api_key=os.environ["LLM_API_KEY"],
+    # secret 末尾的空格/换行会让 httpx 抛 "Illegal header value",再被包装成
+    # APIConnectionError("Connection error.")——看起来像网络故障,实际一个 strip 就修好。
+    return OpenAI(base_url=os.environ["LLM_BASE_URL"].strip(),
+                  api_key=os.environ["LLM_API_KEY"].strip(),
                   timeout=REQUEST_TIMEOUT_SECONDS, max_retries=0)
 
 def model_name() -> str:
