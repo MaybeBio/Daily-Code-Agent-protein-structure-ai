@@ -1,0 +1,30 @@
+Fetching events for target(s): alexholehouse, HFChenLab, Junjie-Zhu, sirius777coder, Barakhsaana, Zuricho, Immortals-33, weitinging, ji-xiaoyue, Zirui-Fan, borrytod, xlab-BioAI, SII-ShenggengLin, xtanh, wangwrx, shaowenguang, mapleleaf6, tyang816, mingchen-li, code4luck, zy-zhou, riacd, terry-r123, bzho3923, Xinheng-He, lujiarui, ChenDdon, AspirinCode, bjing2016, prokia, Gonglab-THU, meneshail, xinshi-chen, amyxlu, LirongWu, OdinZhang, EDAPINENUT, QizhiPei, thematrixmaster, zaixizhang, pascalnotin, jsunn-y, Leo-T-Zang, WillHua127, wenjiegroup, Shenggan, yangnianzu0515, chao1224, blt2114, Oxer11, shichence, ChrisAllenMing, jchodera, jgreener64, HannesStark, Peldom, luost26, sokrypton, lmqfly...
+
+2026-11-19 04:21:03 | ⭐️ sokrypton starred RosettaCommons/tmol
+2026-11-18 21:04:20 | 🔹 Shenggan performed MemberEvent on zouzias/pypto-serving
+2026-11-18 18:26:56 | 💬 jgreener64 created issue 'TSS Multi GPU' in JuliaMolSim/Molly.jl
+2026-11-18 18:20:20 | 💬 jgreener64 created issue 'TSS Multi GPU' in JuliaMolSim/Molly.jl
+2026-11-18 17:06:42 | ⭐️ AspirinCode starred adrian-jasinski/pymolish
+2026-11-18 16:36:20 | ⭐️ Junjie-Zhu starred tiwarylab/mahler
+2026-11-18 16:10:48 | 🐛 EDAPINENUT closed issue in EDAPINENUT/fewsteprl-sd35: 'Verify evals on Papers with Code'
+2026-11-18 16:10:27 | 🐛 EDAPINENUT closed issue in EDAPINENUT/fewsteprl-wan21: 'Verify evals on Papers with Code'
+2026-11-18 11:07:20 | 🚀 alexholehouse pushed to holehouse-lab/PIMMS
+    - [510690a] (expanded) Update to kernels.md
+2026-11-18 10:39:10 | 🚀 alexholehouse pushed to holehouse-lab/PIMMS
+    - [75525ad] (expanded) Major udate for 1.0.8 ahead of merge to main
+2026-11-18 06:20:53 | 🔹 sokrypton performed DeleteEvent on sokrypton/localfold
+2026-11-18 06:20:53 | 🔹 sokrypton performed DeleteEvent on sokrypton/localfold
+2026-11-18 06:19:16 | 🚀 sokrypton pushed to sokrypton/localfold
+    - [878dca2] (expanded) Merge pull request #15 from sokrypton/bioemu2-ensemble-save
+2026-11-18 06:15:22 | 🆕 sokrypton created branch 'webgl-af2' at sokrypton/localfold
+2026-11-18 06:15:20 | 🚀 sokrypton pushed to sokrypton/localfold
+    - [cab4553] (expanded) fold-in-page.py: --bioemu2-samples=N, so the saved-ensemble path can be driven - 5 samples archived as five MODELs
+2026-11-18 05:16:03 | 🚀 sokrypton pushed to sokrypton/py2Dmol
+    - [bd7ef20] (expanded) A live add() in Python no longer walks the frames already there
+2026-11-18 05:03:22 | 🚀 sokrypton pushed to sokrypton/py2Dmol
+    - [49b5e18] (expanded) A long live stream costs the same per add() at frame 20,000 as at 500
+2026-11-18 03:07:35 | 🚀 sokrypton pushed to sokrypton/localfold
+    - [3a804e2] (expanded) py2Dmol at 6fe3daf: DNA base pairs show on a streamed fold, and the stack is back
+2026-11-18 03:04:02 | 🚀 sokrypton pushed to sokrypton/py2Dmol
+    - [6fe3daf] (expanded) A duplex streamed in frame by frame pairs like the same duplex loaded whole
+2026-11-18 02:14:52 | ⭐️ jsunn-y starred prefix-dev/pixi

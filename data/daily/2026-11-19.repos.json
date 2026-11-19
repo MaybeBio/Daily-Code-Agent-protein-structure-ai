@@ -1,0 +1,419 @@
+[
+  {
+    "full_name": "google-deepmind/mujoco",
+    "who": [
+      "ljh2026",
+      "magnusdtd",
+      "wrh2048470785"
+    ],
+    "event": "star",
+    "stars": 18294,
+    "language": "C++",
+    "description": "Multi-Joint dynamics with Contact. A general purpose physics simulator.",
+    "url": "https://github.com/google-deepmind/mujoco"
+  },
+  {
+    "full_name": "kepano/defuddle",
+    "who": [
+      "kepano"
+    ],
+    "event": "issue",
+    "stars": 10106,
+    "language": "TypeScript",
+    "description": "Get the main content of any page as Markdown.",
+    "url": "https://github.com/kepano/defuddle"
+  },
+  {
+    "full_name": "prefix-dev/pixi",
+    "who": [
+      "jsunn-y"
+    ],
+    "event": "star",
+    "stars": 7998,
+    "language": "Rust",
+    "description": "Powerful system-level package manager for Linux, macOS and Windows written in Rust – building on top of the Conda ecosystem.",
+    "url": "https://github.com/prefix-dev/pixi"
+  },
+  {
+    "full_name": "google-deepmind/weathernext",
+    "who": [
+      "b2nhbg9v4r-oss"
+    ],
+    "event": "mixed",
+    "stars": 7752,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/google-deepmind/weathernext"
+  },
+  {
+    "full_name": "obsidianmd/obsidian-clipper",
+    "who": [
+      "kepano"
+    ],
+    "event": "issue",
+    "stars": 5618,
+    "language": "TypeScript",
+    "description": "Highlight and capture the web in your favorite browser. The official Web Clipper extension for Obsidian.",
+    "url": "https://github.com/obsidianmd/obsidian-clipper"
+  },
+  {
+    "full_name": "aqlaboratory/openfold",
+    "who": [
+      "reem-aldhaheri"
+    ],
+    "event": "star",
+    "stars": 3458,
+    "language": "Python",
+    "description": "Trainable, memory-efficient, and GPU-friendly PyTorch reproduction of AlphaFold 2",
+    "url": "https://github.com/aqlaboratory/openfold"
+  },
+  {
+    "full_name": "google-deepmind/optax",
+    "who": [
+      "rajasekharporeddy"
+    ],
+    "event": "other",
+    "stars": 2368,
+    "language": "Python",
+    "description": "Optax is a gradient processing and optimization library for JAX.",
+    "url": "https://github.com/google-deepmind/optax"
+  },
+  {
+    "full_name": "google-deepmind/mujoco_warp",
+    "who": [
+      "adenzler-nvidia"
+    ],
+    "event": "other",
+    "stars": 1640,
+    "language": "Python",
+    "description": "GPU-optimized version of the MuJoCo physics simulator, designed for NVIDIA hardware.",
+    "url": "https://github.com/google-deepmind/mujoco_warp"
+  },
+  {
+    "full_name": "google-deepmind/formal-conjectures",
+    "who": [
+      "MichalKwiatkowskiUniBonn",
+      "felixpernegger",
+      "github-actions"
+    ],
+    "event": "mixed",
+    "stars": 1365,
+    "language": "Lean",
+    "description": "A collection of formalized statements of conjectures in Lean.",
+    "url": "https://github.com/google-deepmind/formal-conjectures"
+  },
+  {
+    "full_name": "google-deepmind/alphagenome_research",
+    "who": [
+      "newtwent"
+    ],
+    "event": "star",
+    "stars": 931,
+    "language": "Python",
+    "description": "Research code accompanying AlphaGenome ",
+    "url": "https://github.com/google-deepmind/alphagenome_research"
+  },
+  {
+    "full_name": "aqlaboratory/openfold-3",
+    "who": [
+      "eachanjohnson",
+      "heathcliff233",
+      "rchauhan9"
+    ],
+    "event": "mixed",
+    "stars": 925,
+    "language": "Python",
+    "description": "A fully open source biomolecular structure prediction model based on AlphaFold3",
+    "url": "https://github.com/aqlaboratory/openfold-3"
+  },
+  {
+    "full_name": "JuliaMolSim/Molly.jl",
+    "who": [
+      "jgreener64"
+    ],
+    "event": "issue",
+    "stars": 503,
+    "language": "Julia",
+    "description": "Molecular simulation in Julia",
+    "url": "https://github.com/JuliaMolSim/Molly.jl"
+  },
+  {
+    "full_name": "RConsortium/S7",
+    "who": [
+      "hadley"
+    ],
+    "event": "mixed",
+    "stars": 497,
+    "language": "R",
+    "description": "S7: a new OO system for R",
+    "url": "https://github.com/RConsortium/S7"
+  },
+  {
+    "full_name": "Graylab/IgFold",
+    "who": [
+      "aoifeEcho"
+    ],
+    "event": "star",
+    "stars": 441,
+    "language": "Python",
+    "description": "Fast, accurate antibody structure prediction from deep learning on massive set of natural antibodies",
+    "url": "https://github.com/Graylab/IgFold"
+  },
+  {
+    "full_name": "rstudio/pins-r",
+    "who": [
+      "hadley"
+    ],
+    "event": "other",
+    "stars": 337,
+    "language": "R",
+    "description": "Pin, discover, and share resources",
+    "url": "https://github.com/rstudio/pins-r"
+  },
+  {
+    "full_name": "ai4protein/VenusFactory2",
+    "who": [
+      "dependabot"
+    ],
+    "event": "other",
+    "stars": 253,
+    "language": "Python",
+    "description": "🏭 AI agent platform with skills for protein engineering, the noob-friendly AI tutorial tool for life science professionals. (ACL Demo2025, arXiv 2026)",
+    "url": "https://github.com/ai4protein/VenusFactory2"
+  },
+  {
+    "full_name": "google-deepmind/language_modeling_is_compression",
+    "who": [
+      "sweet00000"
+    ],
+    "event": "star",
+    "stars": 208,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/google-deepmind/language_modeling_is_compression"
+  },
+  {
+    "full_name": "Graylab/FLAb",
+    "who": [
+      "mizopl"
+    ],
+    "event": "mixed",
+    "stars": 205,
+    "language": "Python",
+    "description": "Fitness landscapes for antibodies",
+    "url": "https://github.com/Graylab/FLAb"
+  },
+  {
+    "full_name": "RosettaCommons/tmol",
+    "who": [
+      "sokrypton"
+    ],
+    "event": "star",
+    "stars": 142,
+    "language": "Python",
+    "description": "TMol - Rosetta on the GPU",
+    "url": "https://github.com/RosettaCommons/tmol"
+  },
+  {
+    "full_name": "sokrypton/py2Dmol",
+    "who": [
+      "sokrypton"
+    ],
+    "event": "push",
+    "stars": 115,
+    "language": "Jupyter Notebook",
+    "description": "",
+    "url": "https://github.com/sokrypton/py2Dmol"
+  },
+  {
+    "full_name": "idptools/starling",
+    "who": [
+      "sakana-yang"
+    ],
+    "event": "star",
+    "stars": 83,
+    "language": "Jupyter Notebook",
+    "description": "STARLING - conSTruction of intrinsicAlly disoRdered proteins ensembles efficientLy vIa multi-dimeNsional Generative models",
+    "url": "https://github.com/idptools/starling"
+  },
+  {
+    "full_name": "google-deepmind/robotics-antigravity-plugin",
+    "who": [
+      "hushuguo",
+      "joon-stack",
+      "rky0930",
+      "royalrexwang"
+    ],
+    "event": "star",
+    "stars": 72,
+    "language": "Python",
+    "description": "GDM Robotics Skills for agentic robotics workflows across simulation and real robots.",
+    "url": "https://github.com/google-deepmind/robotics-antigravity-plugin"
+  },
+  {
+    "full_name": "biomed-AI/PROTAC-RL",
+    "who": [
+      "mlpoiuhbn"
+    ],
+    "event": "star",
+    "stars": 71,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/biomed-AI/PROTAC-RL"
+  },
+  {
+    "full_name": "sokrypton/localfold",
+    "who": [
+      "sokrypton"
+    ],
+    "event": "mixed",
+    "stars": 53,
+    "language": "JavaScript",
+    "description": "",
+    "url": "https://github.com/sokrypton/localfold"
+  },
+  {
+    "full_name": "EDAPINENUT/fewsteprl-sd35",
+    "who": [
+      "EDAPINENUT"
+    ],
+    "event": "issue",
+    "stars": 44,
+    "language": "Python",
+    "description": "Open source repository for the paper \"Fine-tuning Few-step Diffusion Models with Reinforcement Learning\" on SD-3.5",
+    "url": "https://github.com/EDAPINENUT/fewsteprl-sd35"
+  },
+  {
+    "full_name": "EDAPINENUT/fewsteprl-wan21",
+    "who": [
+      "EDAPINENUT"
+    ],
+    "event": "issue",
+    "stars": 30,
+    "language": "Python",
+    "description": "Open source repository for the paper \"Fine-tuning Few-step Diffusion Models with Reinforcement Learning\" on Wan-2.1",
+    "url": "https://github.com/EDAPINENUT/fewsteprl-wan21"
+  },
+  {
+    "full_name": "idptools/parrot",
+    "who": [
+      "ryanemenecker"
+    ],
+    "event": "push",
+    "stars": 22,
+    "language": "Python",
+    "description": "Python package for protein sequence-based bidirectional recurrent neural network. Generalizable to a variety of protein bioinformatic applications.",
+    "url": "https://github.com/idptools/parrot"
+  },
+  {
+    "full_name": "bindresearch/pkasso",
+    "who": [
+      "sobuelow"
+    ],
+    "event": "mixed",
+    "stars": 20,
+    "language": "Python",
+    "description": "pKasso",
+    "url": "https://github.com/bindresearch/pkasso"
+  },
+  {
+    "full_name": "adrian-jasinski/pymolish",
+    "who": [
+      "AspirinCode"
+    ],
+    "event": "star",
+    "stars": 17,
+    "language": "Python",
+    "description": "PyMOLish - PyMOL Open Source plugin - command extension library",
+    "url": "https://github.com/adrian-jasinski/pymolish"
+  },
+  {
+    "full_name": "holehouse-lab/soursop",
+    "who": [
+      "Shi30"
+    ],
+    "event": "fork",
+    "stars": 13,
+    "language": "Jupyter Notebook",
+    "description": "SOURSOP is an analysis suite for molecular simulations of intrinsically disordered proteins",
+    "url": "https://github.com/holehouse-lab/soursop"
+  },
+  {
+    "full_name": "GENTEL-lab/La-Ribo",
+    "who": [
+      "amorehead",
+      "inoue0426"
+    ],
+    "event": "mixed",
+    "stars": 10,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/GENTEL-lab/La-Ribo"
+  },
+  {
+    "full_name": "tiwarylab/mahler",
+    "who": [
+      "Junjie-Zhu"
+    ],
+    "event": "star",
+    "stars": 9,
+    "language": "Python",
+    "description": "MAHLER: Metadynamics-Anchored Hybrid Learning for Engineering off-Rates",
+    "url": "https://github.com/tiwarylab/mahler"
+  },
+  {
+    "full_name": "GENTEL-lab/PhaseFlow",
+    "who": [
+      "wyqmath"
+    ],
+    "event": "star",
+    "stars": 6,
+    "language": "Python",
+    "description": "PhaseFlow: Multi-Scale Modeling and Design of Phase-Separating Proteins",
+    "url": "https://github.com/GENTEL-lab/PhaseFlow"
+  },
+  {
+    "full_name": "holehouse-lab/PIMMS",
+    "who": [
+      "alexholehouse"
+    ],
+    "event": "push",
+    "stars": 1,
+    "language": "Python",
+    "description": "",
+    "url": "https://github.com/holehouse-lab/PIMMS"
+  },
+  {
+    "full_name": "zouzias/pypto-serving",
+    "who": [
+      "Shenggan"
+    ],
+    "event": "other",
+    "stars": 0,
+    "language": "",
+    "description": "Provide LLM inference service based on PyPTO",
+    "url": "https://github.com/zouzias/pypto-serving"
+  },
+  {
+    "full_name": "BioComputingUP/BioComp_resource_monitor",
+    "who": [
+      "github-actions"
+    ],
+    "event": "push",
+    "stars": 0,
+    "language": "Python",
+    "description": "Uptime and backend-API monitoring of the BioComputing UP resources (DisProt, MobiDB, RepeatsDB, PED, RING, APICURON…), every 20 minutes on GitHub Actions",
+    "url": "https://github.com/BioComputingUP/BioComp_resource_monitor"
+  },
+  {
+    "full_name": "bindresearch/unipkainfer",
+    "who": [
+      "sobuelow"
+    ],
+    "event": "mixed",
+    "stars": 0,
+    "language": "Python",
+    "description": "Inference-only package of Uni-pKa, Uni-Mol, and a minimal Uni-Core runtime",
+    "url": "https://github.com/bindresearch/unipkainfer"
+  }
+]
