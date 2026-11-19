@@ -14,6 +14,18 @@ def _score_one(row, client, prompts, model, fetch, fetch_tree, breaker=None):
         return {"score": 0, "one_liner": "无 README/描述/目录树,跳过"}
     return agent.score_repo(client, model, prompts, text, breaker=breaker)
 
+def _wanted(row, cfg):
+    """该仓库是否参与打分:llm.score_sources = all(默认) | search | watchlist。
+
+    两者都命中的仓库 source 是 ["watchlist","search"],任一模式都会选中。
+    老数据没有 source 字段时保守处理为参与打分,避免静默丢仓库。
+    """
+    mode = str((cfg.get("llm") or {}).get("score_sources", "all") or "all").lower()
+    if mode in ("all", "any"):
+        return True
+    srcs = common.sources(row)
+    return (mode in srcs) if srcs else True
+
 def run(cfg, date, client=None, fetch=None, fetch_tree=None):
     fetch = fetch or gh.fetch_readme
     fetch_tree = fetch_tree or gh.fetch_tree
@@ -23,6 +35,14 @@ def run(cfg, date, client=None, fetch=None, fetch_tree=None):
     out_path = common.data_dir("scored", f"{date}.json")
     if not bool(llm_cfg.get("enabled", True)):
         # noagent 降级:不打分,score=None、one_liner 用描述兜底(供站点搜索摘要)。
+        out = [{**row, "score": None,
+                "one_liner": (row.get("description") or "").strip()}
+               for row in candidates]
+        common.dump_json(out_path, out)
+        return out
+    # 只给 score_sources 选中的仓库打分;其余保留 score=None(下游 threshold 排除)。
+    picked = [i for i, r in enumerate(candidates) if _wanted(r, cfg)]
+    if not picked:
         out = [{**row, "score": None,
                 "one_liner": (row.get("description") or "").strip()}
                for row in candidates]
@@ -38,8 +58,15 @@ def run(cfg, date, client=None, fetch=None, fetch_tree=None):
     breaker = agent.CircuitBreaker(int(llm_cfg.get(
         "connect_fail_limit", agent.DEFAULT_CONNECT_FAIL_LIMIT)))
 
-    out = [{**row, "score": None, "one_liner": "[llm pending]"} for row in candidates]
+    out = []
+    for row in candidates:
+        if _wanted(row, cfg):
+            out.append({**row, "score": None, "one_liner": "[llm pending]"})
+        else:
+            out.append({**row, "score": None,
+                        "one_liner": (row.get("description") or "").strip()})
     done, lock = 0, threading.Lock()
+    total = len(picked)
 
     def work(i, row):
         nonlocal done
@@ -61,13 +88,13 @@ def run(cfg, date, client=None, fetch=None, fetch_tree=None):
         with lock:
             out[i] = {**row, **res}
             done += 1
-            if done % 100 == 0 or done == len(candidates):
-                print(f"[score] {done}/{len(candidates)}", flush=True)
+            if done % 100 == 0 or done == total:
+                print(f"[score] {done}/{total}", flush=True)
             if done % SAVE_EVERY == 0:
                 common.dump_json(out_path, out)
 
     with ThreadPoolExecutor(max_workers=int(llm_cfg.get("concurrency", 8))) as ex:
-        futures = [ex.submit(work, i, row) for i, row in enumerate(candidates)]
+        futures = [ex.submit(work, i, candidates[i]) for i in picked]
         for f in futures:
             f.result()                   # work 内部已兜底,这里只传递真正的程序错误
     common.dump_json(out_path, out)
