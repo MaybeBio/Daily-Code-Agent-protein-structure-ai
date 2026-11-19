@@ -19,12 +19,14 @@ github_repo: MaybeBio/Daily-Code-Agent-protein-structure-ai
 github_branch: main
 search_placeholder: 如 蛋白结构预测、蛋白互作、蛋白功能、AlphaFold
 llm:
+  # 并发只决定同时等待的线程数;真正的吞吐由 agent.py 的全局 8 次/分钟限速封顶。
+  # 不要调很低:请求耗时 5~15s,线程太少反而喂不满限速。
   concurrency: 8
   min_score: 5
   # 打分墙钟预算(秒)。到点后剩余仓库标记 [llm budget exhausted] 并立即落盘,
-  # 保证 ingest 步骤在 75 分钟步骤超时前自己结束,commit 一定跑得到。
-  # 端点正常时 500~600 个候选约 20~60 分钟;设 50 分钟留出余量。
-  max_seconds: 3000
+  # 保证 ingest 步骤在 85 分钟步骤超时前自己结束,commit 一定跑得到。
+  # 限速 8 次/分钟下 65 分钟约可打 520 个;设 65 分钟覆盖最坏日(517)。
+  max_seconds: 3900
   # 连续连接失败达到此次数即熔断,剩余仓库直接跳过并标记 [llm unavailable]。
   # 不熔断时每个仓库要白等 5 次退避(4+8+16+32=60s),500 个仓库就是 80 分钟,
   # 正是 daily 撞满 timeout-minutes 的直接原因。
@@ -33,14 +35,16 @@ llm:
   # 但站点/归档/wiki 只留 watchlist 来源;配合 archive.repo_copy: readme 一起用。
   # api 欠费/不可用时手动切 false,重跑该周 action 即可。
   enabled: true
-  # 参与 LLM 打分的来源:all(默认)|search|watchlist。
-  # search 只打搜索命中的仓库,watchlist 只打关注流。
-  score_sources: all
+  # 参与 LLM 打分的来源:search(默认)|all|watchlist。
+  # search 只打搜索命中的仓库,避免给关注流噪声白花配额。
+  score_sources: search
 issue:
   # 周报 Issue 的显示范围:
   #   all  = 列出全部候选(默认)
   #   high = 只列 score >= llm.min_score 的仓库(与归档/Code Card 同口径)
-  show: all
+  # daily 模式聚合后一周有 2000+ 候选,all 会超过 GitHub 65536 字符上限,
+  # 这里用 high(实测 41 条 / ~8.5k 字符)。
+  show: high
 archive:
   # 高分仓库落盘方式:code=只保留代码语料(源码/构建配置/README/文档;数据、
   # 图片、权重、二进制、通用 txt/log/csv/json/xml 不留,普通源码>2 MB、文档/构建>1 MB 不留,README/ipynb 不设限),省略

@@ -16,9 +16,9 @@ jobs:
   run:
     runs-on: ubuntu-latest
     # 实测单日候选 490~620 个,搜索 77 条约 7~8 分钟;打分由 config.yaml 的
-    # llm.max_seconds(50 分钟)自己封顶,ingest 步骤另有 75 分钟步骤超时兜底。
-    # job 设 90 是最后一道保险:正常 ~60 分钟,撞到 90 说明脚本连预算/超时都没生效。
-    timeout-minutes: 90
+    # llm.max_seconds(65 分钟)自己封顶,ingest 步骤另有 85 分钟步骤超时兜底。
+    # job 设 110 是最后一道保险:65+8=73 分钟正常结束,撞到 110 说明预算/超时都没生效。
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -40,10 +40,10 @@ jobs:
       - name: daily ingest
         # 失败不阻断后面的 commit:当日 feed 仍要落库;缺失的 scored 由 weekly 聚合补跑。
         continue-on-error: true
-        # 必须小于 job 的 90 分钟:步骤超时会让 job 继续走 commit,而 job 超时会杀掉整个 job、
+        # 必须小于 job 的 110 分钟:步骤超时会让 job 继续走 commit,而 job 超时会杀掉整个 job、
         # commit 直接 skipped(11-17、11-16 两次就是这样丢掉整天数据的)。
         # score.py 每 50 个仓库落盘一次,这里被杀也只损失未完成部分。
-        timeout-minutes: 75
+        timeout-minutes: 85
         run: python scripts/ingest_daily.py --config config.yaml
         env:
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}

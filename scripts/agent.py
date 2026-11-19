@@ -67,6 +67,37 @@ def make_client() -> OpenAI:
 def model_name() -> str:
     return os.environ.get("LLM_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
 
+# 全局限速:所有线程共享同一个最小间隔。服务商实测限额约 10 次/分钟,
+# 取 7.5s/次(8 次/分钟)留余量。
+# 注意:真正的吞吐由这里封顶,并发数只决定「同时等待的线程数」。
+# 因此不要把 concurrency 调很低(请求通常 5~15s,太少线程喂不满 8 次/分钟);
+# 用 LLM_MIN_INTERVAL 可以覆盖间隔(秒),设为 0 关闭限速。
+MIN_REQUEST_INTERVAL_SECONDS = 7.5
+_rate_lock = threading.Lock()
+_next_slot = 0.0
+
+def _rate_limit():
+    """全局限速:按最小间隔给每次请求排一个时间槽,并发再高也不会同时打满限额。"""
+    interval = float(os.environ.get("LLM_MIN_INTERVAL", MIN_REQUEST_INTERVAL_SECONDS))
+    if interval <= 0:
+        return
+    global _next_slot
+    with _rate_lock:
+        now = time.monotonic()
+        wait = max(0.0, _next_slot - now)
+        _next_slot = max(now, _next_slot) + interval
+    if wait > 0:
+        time.sleep(wait)
+
+def _retry_after(err):
+    """429 响应里的 Retry-After(秒);没有就返回 None。"""
+    headers = getattr(getattr(err, "response", None), "headers", None)
+    raw = headers.get("retry-after") if headers else None
+    try:
+        return max(0.0, float(raw)) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
 # 4xx 是客户端错误(key 错/model 名错/请求格式错),再试也一样,立即放弃;
 # 429 限流、408 超时、5xx 服务端错都是瞬时,留给重试。
 def _is_permanent(err) -> bool:
@@ -74,16 +105,19 @@ def _is_permanent(err) -> bool:
             and 400 <= err.status_code < 500
             and err.status_code not in (408, 429))
 
-def _retry_json(client, model, msgs, parse, attempts=5, breaker=None):
-    """JSON 模式调 LLM:指数退避重试,叠加 jitter 打散高并发下的惊群。
+def _retry_json(client, model, msgs, parse, attempts=8, breaker=None):
+    """JSON 模式调 LLM:全局限速 + 指数退避,429 优先遵循 Retry-After。
 
-    429/5xx 仍按 5 次退避重试;连接层错误(APIConnectionError,含超时)不重试——
-    端点不可达时重试只会让每个仓库白等 60s,改由 breaker 全局熔断。
+    连接层错误(APIConnectionError,含超时)每个仓库最多试 3 次,再交给 breaker 熔断;
+    429/5xx 按 attempts(默认 8)退避重试。
     """
+    conn_attempts = min(3, attempts)
+    conn_fail = 0
     for attempt in range(attempts):
         if breaker is not None:
             breaker.check()
         try:
+            _rate_limit()
             r = client.chat.completions.create(model=model, messages=msgs, temperature=0.0,
                                                response_format={"type": "json_object"})
             result = parse(json.loads(r.choices[0].message.content))
@@ -94,12 +128,19 @@ def _retry_json(client, model, msgs, parse, attempts=5, breaker=None):
             if _is_permanent(e):
                 raise
             if isinstance(e, APIConnectionError):
-                if breaker is not None:
-                    breaker.failure()
-                raise               # 单仓库不再退避重试,交给全局熔断
+                conn_fail += 1
+                if conn_fail >= conn_attempts or attempt == attempts - 1:
+                    if breaker is not None:
+                        breaker.failure()
+                    raise
+                time.sleep(min(2 ** conn_fail, 30) + random.random())
+                continue
             if attempt == attempts - 1:
                 raise
-            time.sleep(2 ** (attempt + 2) + random.random())
+            delay = _retry_after(e)
+            if delay is None:
+                delay = min(2 ** (attempt + 2), 60) + random.random()
+            time.sleep(delay)
 
 def score_repo(client, model, prompts, readme, breaker=None) -> dict:
     p = prompts["score"]

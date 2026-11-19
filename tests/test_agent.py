@@ -21,9 +21,11 @@ def _client(seq):
         completions=types.SimpleNamespace(create=create)))
     return client, calls
 
-def _status(code):
+def _status(code, headers=None):
     return openai.APIStatusError("e", body=None,
-                                 response=httpx.Response(code, request=httpx.Request("POST", "http://x")))
+                                 response=httpx.Response(
+                                     code, headers=headers or {},
+                                     request=httpx.Request("POST", "http://x")))
 
 def test_retry_json_retries_transient_then_succeeds(monkeypatch):
     monkeypatch.setattr(agent.time, "sleep", lambda s: None)
@@ -33,10 +35,10 @@ def test_retry_json_retries_transient_then_succeeds(monkeypatch):
 
 def test_retry_json_gives_up_after_attempts(monkeypatch):
     monkeypatch.setattr(agent.time, "sleep", lambda s: None)
-    client, calls = _client([RuntimeError("net")] * 5)
+    client, calls = _client([RuntimeError("net")] * 8)
     with pytest.raises(RuntimeError):
         agent._retry_json(client, "m", [], lambda o: o)
-    assert len(calls) == 5                                  # 5 次尝试
+    assert len(calls) == 8                                  # 默认 8 次尝试
 
 def test_retry_json_short_circuits_permanent(monkeypatch):
     monkeypatch.setattr(agent.time, "sleep", lambda s: None)
@@ -66,31 +68,31 @@ def _conn_error(cause=None):
     return err
 
 
-def test_retry_json_does_not_retry_connection_error(monkeypatch):
-    """连接层错误重试也连不上:交给全局熔断,单仓库立即失败,避免 60s 退避。"""
+def test_retry_json_retries_connection_then_gives_up(monkeypatch):
+    """连接层错误每个仓库最多试 3 次,再交给全局熔断。"""
     monkeypatch.setattr(agent.time, "sleep", lambda s: None)
-    client, calls = _client([_conn_error()])
+    client, calls = _client([_conn_error()] * 5)
     with pytest.raises(openai.APIConnectionError):
         agent._retry_json(client, "m", [], lambda o: o)
-    assert len(calls) == 1
+    assert len(calls) == 3
 
 
 def test_breaker_opens_after_consecutive_connection_failures(monkeypatch):
     monkeypatch.setattr(agent.time, "sleep", lambda s: None)
     breaker = agent.CircuitBreaker(limit=2)
-    client, calls = _client([_conn_error(), _conn_error(), '{"ok": 1}'])
+    client, calls = _client([_conn_error()] * 6)   # 每次调用最多 3 次连接重试
     for _ in range(2):
         with pytest.raises(openai.APIConnectionError):
             agent._retry_json(client, "m", [], lambda o: o, breaker=breaker)
     with pytest.raises(agent.LLMUnavailable):
         agent._retry_json(client, "m", [], lambda o: o, breaker=breaker)
-    assert len(calls) == 2                         # 熔断后不再发请求
+    assert len(calls) == 6                         # 熔断后不再发请求
 
 
 def test_breaker_resets_after_success(monkeypatch):
     monkeypatch.setattr(agent.time, "sleep", lambda s: None)
     breaker = agent.CircuitBreaker(limit=2)
-    client, calls = _client([_conn_error(), '{"ok": 1}'])
+    client, calls = _client([_conn_error()] * 3 + ['{"ok": 1}'])
     with pytest.raises(openai.APIConnectionError):
         agent._retry_json(client, "m", [], lambda o: o, breaker=breaker)
     assert agent._retry_json(client, "m", [], lambda o: o, breaker=breaker) == {"ok": 1}
@@ -127,3 +129,30 @@ def test_make_client_sets_request_timeout_and_disables_sdk_retries(monkeypatch):
     # 不设的话 SDK 默认 600s/请求 + 2 次自动重试,卡住的请求会拖垮整步
     assert seen["timeout"] == agent.REQUEST_TIMEOUT_SECONDS
     assert seen["max_retries"] == 0
+
+
+def test_retry_json_honors_retry_after(monkeypatch):
+    slept = []
+    monkeypatch.setattr(agent, "_rate_limit", lambda: None)
+    monkeypatch.setattr(agent.time, "sleep", lambda s: slept.append(round(s, 3)))
+    client, calls = _client([_status(429, {"retry-after": "17"}), '{"ok": 1}'])
+    assert agent._retry_json(client, "m", [], lambda o: o) == {"ok": 1}
+    assert slept == [17.0]
+
+
+def test_rate_limit_spaces_requests(monkeypatch):
+    monkeypatch.setattr(agent, "_next_slot", 0.0)
+    monkeypatch.setenv("LLM_MIN_INTERVAL", "7.5")
+    clock = {"t": 100.0}
+    slept = []
+
+    def fake_sleep(s):
+        slept.append(round(s, 3))
+        clock["t"] += s
+
+    monkeypatch.setattr(agent.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(agent.time, "sleep", fake_sleep)
+    agent._rate_limit()
+    clock["t"] = 101.0
+    agent._rate_limit()
+    assert slept == [6.5]

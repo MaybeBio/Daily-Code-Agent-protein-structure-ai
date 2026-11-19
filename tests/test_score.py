@@ -110,7 +110,7 @@ def test_connection_failures_open_breaker_and_skip_rest(monkeypatch, tmp_path):
 
     rows = score.run({"llm": {"concurrency": 1, "connect_fail_limit": 3}},
                      "2026-10-04", client=Client(), fetch=lambda fn: "readme")
-    assert len(calls) == 3                         # 3 次失败后熔断
+    assert len(calls) == 9                         # 3 个仓库 × 每个 3 次连接重试后熔断
     assert all(r["score"] is None for r in rows)
     assert rows[3]["one_liner"] == "[llm unavailable]"
     saved = score.common.load_json(
@@ -213,8 +213,16 @@ def test_run_scores_only_search_when_configured(monkeypatch, tmp_path):
     assert [r["full_name"] for r in rows] == ["s/1", "w/2", "b/3"]
 
 
-def test_run_scores_all_by_default(monkeypatch, tmp_path):
+def test_run_default_is_search(monkeypatch, tmp_path):
     by, seen, _ = _run_sources(monkeypatch, tmp_path)
+    assert by["s/1"]["score"] == 8
+    assert by["b/3"]["score"] == 8       # 含 search
+    assert by["w/2"]["score"] is None    # 默认不打量仅 watchlist 的
+    assert len(seen) == 2
+
+
+def test_run_scores_all_when_configured(monkeypatch, tmp_path):
+    by, seen, _ = _run_sources(monkeypatch, tmp_path, "all")
     assert all(by[n]["score"] == 8 for n in ("s/1", "w/2", "b/3"))
     assert len(seen) == 3
 

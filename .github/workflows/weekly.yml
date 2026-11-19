@@ -14,9 +14,10 @@ jobs:
   run:
     runs-on: ubuntu-latest
     # daily 模式下 weekly 只做 聚合→归档→卡片→issue;聚合会补跑缺失日
-    # (每天由 llm.max_seconds 封顶 50 分钟 + 搜索 8 分钟,max_backfill_days=2),
-    # 再加归档 30~40 分钟。weekly 步骤本身 165 分钟超时,留 15 分钟给 issue/commit。
-    timeout-minutes: 180
+    # (每天由 llm.max_seconds 封顶 65 分钟 + 搜索 8 分钟,max_backfill_days=2 →
+    # 最坏 2×73=146 分钟),再加归档 30~40 分钟。weekly 步骤 200 分钟超时,
+    # job 215 给 setup/issue/commit 留余量。
+    timeout-minutes: 215
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -35,9 +36,9 @@ jobs:
       - name: weekly
         # 步骤超时而不是让 job 超时:job 被杀会跳过下面的 open issue / commit,
         # 把本次聚合和归档结果全部丢掉。补跑日已按 max_seconds 封顶,
-        # 正常在 180 分钟内;这里留 15 分钟给后续步骤。
+        # 最坏 2×73+40 ≈ 186 分钟;步骤 200 留余量给 issue/commit。
         # 下面两步用 if: always() 保证失败/超时后仍落库,同时保留红色失败信号。
-        timeout-minutes: 165
+        timeout-minutes: 200
         run: bash scripts/run_weekly.sh
         env:
           LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
